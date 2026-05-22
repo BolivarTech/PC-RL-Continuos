@@ -779,7 +779,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             upper_bound,
         )?;
 
-        // v4.0.0 hardening — the critic consumes latent_concat: the raw state
+        // v4.0.1 hardening — the critic consumes latent_concat: the raw state
         // concatenated with every actor hidden-layer activation. Enforce the
         // derived-size invariant at construction so a wrong critic.input_size
         // fails here as a recoverable ConfigValidation error, instead of as a
