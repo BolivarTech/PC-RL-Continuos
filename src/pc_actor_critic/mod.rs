@@ -779,6 +779,27 @@ impl<L: LinAlg> PcActorCritic<L> {
             upper_bound,
         )?;
 
+        // v4.0.0 hardening — the critic consumes latent_concat: the raw state
+        // concatenated with every actor hidden-layer activation. Enforce the
+        // derived-size invariant at construction so a wrong critic.input_size
+        // fails here as a recoverable ConfigValidation error, instead of as a
+        // lazy panic in MlpCritic::forward on the first critic forward pass.
+        let expected_critic_input = config.actor.input_size
+            + config
+                .actor
+                .hidden_layers
+                .iter()
+                .map(|l| l.size)
+                .sum::<usize>();
+        if config.critic.input_size != expected_critic_input {
+            return Err(PcError::ConfigValidation(format!(
+                "critic.input_size ({}) must equal actor.input_size + sum(actor \
+                 hidden layer sizes) = {} (the critic consumes latent_concat: the \
+                 raw state concatenated with every actor hidden activation).",
+                config.critic.input_size, expected_critic_input
+            )));
+        }
+
         Ok(())
     }
 
@@ -4882,6 +4903,44 @@ mod tests {
         assert!(PcActorCritic::new(CpuLinAlg::new(), config, 42)
             .map(|_: PcActorCritic| ())
             .is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_mismatched_critic_input_size() {
+        // The critic consumes latent_concat = raw state ++ every actor hidden
+        // activation, so critic.input_size MUST equal
+        // actor.input_size + Σ(actor hidden layer sizes). default_config()
+        // satisfies this (9 + 18 = 27). Corrupt it and `new()` must reject at
+        // construction with a ConfigValidation error that names the offending
+        // field — instead of the historic lazy panic in MlpCritic::forward on
+        // the first critic forward pass.
+        let mut config = default_config();
+        config.critic.input_size = 999; // correct value is 9 + 18 = 27
+        let err = PcActorCritic::new(CpuLinAlg::new(), config, 42)
+            .map(|_: PcActorCritic| ())
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("critic.input_size"),
+            "error must name critic.input_size, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_new_accepts_correct_critic_input_size() {
+        // Guard against over-restriction: the derived correct value
+        // (actor.input_size + Σ hidden = 9 + 18 = 27) must still construct Ok.
+        let config = default_config();
+        assert_eq!(
+            config.critic.input_size, 27,
+            "fixture sanity: critic input must be 9 + 18"
+        );
+        assert!(
+            PcActorCritic::new(CpuLinAlg::new(), config, 42)
+                .map(|_: PcActorCritic| ())
+                .is_ok(),
+            "correct critic.input_size must construct successfully"
+        );
     }
 
     #[test]
@@ -9611,6 +9670,10 @@ mod tests {
         let mut agent = make_agent();
         let mut new_config = default_config();
         new_config.actor.hidden_layers[0].size = 27;
+        // Keep the new config internally consistent (latent_concat grows with the
+        // actor hidden size: 9 + 27 = 36) so it passes the critic.input_size
+        // invariant check and reaches the topology-match check this test targets.
+        new_config.critic.input_size = 9 + 27;
         let result = agent.apply_config(new_config);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());

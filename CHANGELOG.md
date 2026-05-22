@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.0.1] - 2026-05-22
+
+### Fixed
+
+- **`critic.input_size` is now validated at construction.**
+  `PcActorCritic::new` (and `apply_config`) reject a config whose
+  `critic.input_size` does not equal
+  `actor.input_size + Σ(actor hidden layer sizes)` — the length of the
+  `latent_concat` vector the critic consumes — returning
+  `PcError::ConfigValidation` that names the offending field. Previously the
+  mismatch was accepted at construction and surfaced only later as a panic in
+  `MlpCritic::forward` on the first critic forward pass. This converts a
+  recoverable configuration mistake from an uncatchable runtime panic into an
+  early `Result::Err`. Reported by the downstream PC-Pendulum continuous-mode
+  validation harness.
+
 ## [4.0.0] - 2026-04-25
 
 ### Breaking changes
