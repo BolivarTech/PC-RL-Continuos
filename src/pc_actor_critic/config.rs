@@ -836,4 +836,31 @@ mod tests {
             other => panic!("expected ConfigValidation, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_policy_entropy_coeff_default_is_active() {
+        // Default-on: the serde default helper returns a positive value so a
+        // config file omitting the field gets the fix ACTIVE (decision A).
+        assert!(
+            default_policy_entropy_coeff() > 0.0,
+            "default_policy_entropy_coeff() must be > 0 (fix active by default), got {}",
+            default_policy_entropy_coeff()
+        );
+        // A continuous config JSON missing the field deserializes to the default.
+        let json = r#"{
+            "actor": {"input_size":3,"hidden_layers":[{"size":8,"activation":"Tanh"}],
+                "output_size":1,"output_activation":"Linear","alpha":0.1,"tol":0.01,
+                "min_steps":1,"max_steps":5,"lr_weights":0.01,"synchronous":true,
+                "temperature":1.0,"local_lambda":1.0,"residual":false,"rezero_init":0.001},
+            "critic": {"input_size":11,"hidden_layers":[{"size":16,"activation":"Tanh"}],
+                "output_activation":"Linear","lr":0.005},
+            "gamma":0.97,"action_space":"Continuous","policy_sigma":0.3
+        }"#;
+        let cfg: PcActorCriticConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            cfg.policy_entropy_coeff > 0.0,
+            "deserialized config missing the field must default to > 0, got {}",
+            cfg.policy_entropy_coeff
+        );
+    }
 }
