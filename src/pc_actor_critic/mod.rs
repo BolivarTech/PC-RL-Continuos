@@ -14452,6 +14452,320 @@ mod tests {
         );
     }
 
+    /// STEP 0 white-box diagnostic (v4.2.0) — disambiguate WHY the
+    /// DETERMINISTIC continuous policy μ fails to converge while the
+    /// stochastic policy solves (B10: stochastic solves Pendulum, det 0/10).
+    /// Investigative only (`#[ignore]`); selects the v4.2.0 fix (H-A/H-B/H-C).
+    ///
+    /// Probe: a sign-conditional SATURATED-optimum task — reward
+    /// `tanh(a_raw)·sign(x)`, maximised when the action saturates with the
+    /// sign of x. The optimum sits at the squash boundary (|a*|→1), mirroring
+    /// Pendulum's "needs max torque". A healthy deterministic policy drives
+    /// μ_raw(x>0)→large+ and μ_raw(x<0)→large−.
+    ///
+    /// Decision (design doc §4): |μ_raw| runaway/wander in saturation +
+    /// stochastic≫deterministic → H-A; |μ_raw| bounded but det off-optimum,
+    /// noise carries perf → H-B; advantage uncorrelated with Δμ → H-C.
+    #[test]
+    #[ignore = "step-0 diagnostic (v4.2.0); run: cargo test -- --ignored diagnose_deterministic_mu_convergence --nocapture"]
+    fn diagnose_deterministic_mu_convergence() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        fn cfg_1d(sigma: f64, gae: Option<f64>) -> PcActorCriticConfig {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 1;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 8,
+                activation: Activation::Tanh,
+            }];
+            c.critic.input_size = 1 + 8;
+            c.actor.lr_weights = 0.01;
+            c.critic.lr = 0.01;
+            c.gamma = 0.97;
+            c.gae_lambda = gae;
+            c.policy_sigma = sigma;
+            c
+        }
+
+        let sigma = 0.3;
+        let episodes = 4000usize;
+        let steps = 8usize;
+        let log_every = (episodes / 20).max(1);
+
+        println!("\n=== STEP 0 DIAGNOSTIC: deterministic-μ convergence (v4.2.0) ===");
+        println!("probe: reward = tanh(a_raw)·sign(x), saturated sign-conditional optimum");
+        println!("σ={sigma}, gae=None, {episodes} eps × {steps} steps");
+        println!("want: μ(+1)→large+, μ(-1)→large−, deterministic eval ≈ stochastic ≈ +1\n");
+
+        let draw_x = |rng: &mut StdRng| -> f64 {
+            let s = if rng.gen::<bool>() { 1.0 } else { -1.0 };
+            s * rng.gen_range(0.3_f64..1.0)
+        };
+
+        for seed in [42u64, 43, 44] {
+            let mut agent =
+                PcActorCritic::new(CpuLinAlg::new(), cfg_1d(sigma, None), seed).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed ^ 0xD1A6);
+
+            let mut traj: Vec<(usize, f64, f64)> = Vec::new();
+            let mut td_abs_sum = 0.0;
+            let mut td_n = 0usize;
+
+            for ep in 0..episodes {
+                let mut x = draw_x(&mut rng);
+                let mut r = 0.0;
+                for _ in 0..steps {
+                    let a = agent.step_continuous(&[x], r, false).unwrap();
+                    r = a[0] * x.signum();
+                    if ep >= episodes * 9 / 10 {
+                        td_abs_sum += agent.last_td_error.abs();
+                        td_n += 1;
+                    }
+                    x = draw_x(&mut rng);
+                }
+                let _ = agent.step_continuous(&[x], r, true).unwrap();
+
+                if ep % log_every == 0 || ep == episodes - 1 {
+                    let mp = agent
+                        .act_continuous(&[1.0], crate::pc_actor::SelectionMode::Play)
+                        .unwrap()
+                        .1
+                        .y_conv[0];
+                    let mn = agent
+                        .act_continuous(&[-1.0], crate::pc_actor::SelectionMode::Play)
+                        .unwrap()
+                        .1
+                        .y_conv[0];
+                    traj.push((ep, mp, mn));
+                }
+            }
+
+            // eval: deterministic vs stochastic mean reward (max = +1)
+            let n_eval = 600;
+            let mut det = 0.0;
+            let mut sto = 0.0;
+            for _ in 0..n_eval {
+                let x = draw_x(&mut rng);
+                let a_det = agent
+                    .act_continuous(&[x], crate::pc_actor::SelectionMode::Play)
+                    .unwrap()
+                    .0[0];
+                det += a_det * x.signum();
+                let a_sto = agent
+                    .act_continuous(&[x], crate::pc_actor::SelectionMode::Training)
+                    .unwrap()
+                    .0[0];
+                sto += a_sto * x.signum();
+            }
+            det /= n_eval as f64;
+            sto /= n_eval as f64;
+            let gap = sto - det;
+
+            let max_abs_mu = traj
+                .iter()
+                .map(|&(_, p, n)| p.abs().max(n.abs()))
+                .fold(0.0_f64, f64::max);
+            let (_, mp_f, mn_f) = *traj.last().unwrap();
+
+            println!("seed {seed}:");
+            println!("  μ_raw trajectory  [ep: μ(+1) / μ(-1)]:");
+            for &(ep, p, n) in traj.iter().step_by(2) {
+                println!("    ep {ep:5}:  {p:+8.3} / {n:+8.3}");
+            }
+            println!(
+                "    final     :  μ(+1)={mp_f:+.3}  μ(-1)={mn_f:+.3}  max|μ_raw|={max_abs_mu:.3}"
+            );
+            println!(
+                "  eval (mean reward, max +1):  deterministic={det:+.3}  stochastic={sto:+.3}  gap={gap:+.3}"
+            );
+            let td_mean = if td_n > 0 {
+                td_abs_sum / td_n as f64
+            } else {
+                0.0
+            };
+            println!("  mean|td_error| (last 10%): {td_mean:.4}\n");
+        }
+
+        println!("Interpretation: apply the §4 decision tree in the doc-comment above.\n");
+    }
+
+    /// STEP 0 deepening (v4.2.0) — reproduce the stochastic≫deterministic GAP
+    /// in-library on a minimal UNSTABLE task (Pendulum-v1 swing-up, the B10
+    /// task) and test whether σ-annealing (Option A) closes it or Option C
+    /// (SAC reparam) is required. Investigative only (`#[ignore]`).
+    ///
+    /// The deterministic failure needs an unstable equilibrium where the greedy
+    /// policy stalls while exploration noise escapes — the static sign-task
+    /// (see `diagnose_deterministic_mu_convergence`) cannot show it.
+    #[test]
+    #[ignore = "step-0 diagnostic (v4.2.0); run: cargo test -- --ignored diagnose_pendulum_deterministic_gap --nocapture"]
+    fn diagnose_pendulum_deterministic_gap() {
+        use crate::pc_actor::SelectionMode;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        #[derive(Clone, Copy)]
+        struct Pend {
+            th: f64,
+            thdot: f64,
+        }
+        impl Pend {
+            fn reset(rng: &mut StdRng) -> Self {
+                // start near the bottom (th=π) → swing-up required (hardest).
+                Pend {
+                    th: std::f64::consts::PI + rng.gen_range(-0.15..0.15),
+                    thdot: rng.gen_range(-0.2..0.2),
+                }
+            }
+            fn obs(&self) -> [f64; 3] {
+                [self.th.cos(), self.th.sin(), self.thdot / 8.0]
+            }
+            // `a` = squashed action ∈ (−1, 1); torque = 2·a. Returns reward = −cost.
+            fn step(&mut self, a: f64) -> f64 {
+                let (g, m, l, dt) = (10.0_f64, 1.0_f64, 1.0_f64, 0.05_f64);
+                let u = (a * 2.0).clamp(-2.0, 2.0);
+                let two_pi = 2.0 * std::f64::consts::PI;
+                let norm =
+                    ((self.th + std::f64::consts::PI).rem_euclid(two_pi)) - std::f64::consts::PI;
+                let cost = norm * norm + 0.1 * self.thdot * self.thdot + 0.001 * u * u;
+                let mut newthdot = self.thdot
+                    + (3.0 * g / (2.0 * l) * self.th.sin() + 3.0 / (m * l * l) * u) * dt;
+                newthdot = newthdot.clamp(-8.0, 8.0);
+                self.th += newthdot * dt;
+                self.thdot = newthdot;
+                -cost
+            }
+        }
+
+        fn cfg() -> PcActorCriticConfig {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 3;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 16,
+                activation: Activation::Tanh,
+            }];
+            c.actor.output_size = 1;
+            c.critic.input_size = 3 + 16;
+            c.critic.hidden_layers = vec![LayerDef {
+                size: 32,
+                activation: Activation::Tanh,
+            }];
+            c.actor.lr_weights = 0.005;
+            c.critic.lr = 0.01;
+            c.gamma = 0.97;
+            c.gae_lambda = Some(0.95);
+            c.policy_sigma = 0.3;
+            c
+        }
+
+        let episodes = 500usize;
+        let horizon = 200usize;
+        let n_eval = 10usize;
+
+        // probe observations to watch |μ_raw| commitment over training.
+        let probes = [
+            [-1.0_f64, 0.0, 0.0], // bottom
+            [0.0, 1.0, 0.0],      // horizontal
+            [0.98, 0.20, 0.0],    // near top
+        ];
+
+        println!("\n=== STEP 0 DEEPENING: Pendulum swing-up det-vs-stoch gap (v4.2.0) ===");
+        println!("minimal Pendulum-v1 (start near bottom), {episodes} eps × {horizon} steps");
+        println!("conditions: fixed σ=0.3  vs  σ annealed 0.5→0.05 (Option A)");
+        println!("return scale: random ≈ −1200..−1500, solved ≈ −150..−400\n");
+
+        for &anneal in &[false, true] {
+            println!(
+                "---- condition: {} ----",
+                if anneal {
+                    "σ-ANNEALED (Option A)"
+                } else {
+                    "FIXED σ=0.3"
+                }
+            );
+            for seed in [42u64, 43, 44] {
+                let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg(), seed).unwrap();
+                let mut rng = StdRng::seed_from_u64(seed ^ 0x9111);
+
+                let mut mu_log: Vec<(usize, f64)> = Vec::new();
+                // running reward normalization (Welford), the documented harness
+                // technique that relieves GRAD_CLIP; persists across episodes.
+                let (mut r_mean, mut r_m2, mut r_count) = (0.0_f64, 0.0_f64, 0u64);
+                for ep in 0..episodes {
+                    if anneal {
+                        let frac = ep as f64 / episodes as f64;
+                        agent.config.policy_sigma = 0.5 + (0.05 - 0.5) * frac;
+                    }
+                    let mut env = Pend::reset(&mut rng);
+                    let mut prev_rc = 0.0;
+                    for _ in 0..horizon {
+                        let obs = env.obs();
+                        let a = agent.step_continuous(&obs, prev_rc, false).unwrap();
+                        let r = env.step(a[0]);
+                        r_count += 1;
+                        let delta = r - r_mean;
+                        r_mean += delta / r_count as f64;
+                        r_m2 += delta * (r - r_mean);
+                        let std = (r_m2 / r_count as f64).sqrt().max(1e-3);
+                        prev_rc = (r - r_mean) / std;
+                    }
+                    let obs = env.obs();
+                    let _ = agent.step_continuous(&obs, prev_rc, true).unwrap();
+
+                    if ep % (episodes / 10).max(1) == 0 || ep == episodes - 1 {
+                        let mut s = 0.0;
+                        for p in &probes {
+                            s += agent
+                                .act_continuous(p, SelectionMode::Play)
+                                .unwrap()
+                                .1
+                                .y_conv[0]
+                                .abs();
+                        }
+                        mu_log.push((ep, s / probes.len() as f64));
+                    }
+                }
+
+                // eval det vs stoch from identical start states (max comparability).
+                let mut det_sum = 0.0;
+                let mut sto_sum = 0.0;
+                for i in 0..n_eval {
+                    let mut ev_rng = StdRng::seed_from_u64(seed ^ 0xE7A1 ^ i as u64);
+                    let start = Pend::reset(&mut ev_rng);
+                    let mut e1 = start;
+                    let mut e2 = start;
+                    for _ in 0..horizon {
+                        let a = agent
+                            .act_continuous(&e1.obs(), SelectionMode::Play)
+                            .unwrap()
+                            .0[0];
+                        det_sum += e1.step(a);
+                        let a2 = agent
+                            .act_continuous(&e2.obs(), SelectionMode::Training)
+                            .unwrap()
+                            .0[0];
+                        sto_sum += e2.step(a2);
+                    }
+                }
+                let det = det_sum / n_eval as f64;
+                let sto = sto_sum / n_eval as f64;
+                let mu_first = mu_log.first().unwrap().1;
+                let mu_last = mu_log.last().unwrap().1;
+                println!(
+                    "  seed {seed}: det={det:+8.1}  stoch={sto:+8.1}  gap={:+8.1}   mean|μ_raw| {mu_first:.2}→{mu_last:.2}",
+                    sto - det
+                );
+            }
+            println!();
+        }
+
+        println!(
+            "Read: FIXED σ should show stoch≫det (reproduces B10). If ANNEALED closes the gap"
+        );
+        println!(
+            "(det→stoch), Option A suffices; if det stays ≪ stoch, Option C (SAC reparam) needed.\n"
+        );
+    }
+
     #[test]
     fn test_continuous_nonfinite_sigma_does_not_corrupt_weights() {
         let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
