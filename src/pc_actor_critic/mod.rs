@@ -3120,6 +3120,12 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///   default sentinel `-1.0` preserves v2.2.0 behavior (clamp to
     ///   `scale_floor`).
     pub(crate) fn effective_actor_scale_for_mode(&self, surprise: f64, mode: LearnMode) -> f64 {
+        // v4.1.0: continuous mode bypasses surprise/td_error → LR modulation
+        // (the variance-band throttle hard-locks continuous policy learning).
+        // Use the base learning rate (scale 1.0). Discrete unchanged.
+        if self.config.action_space == ActionSpace::Continuous {
+            return 1.0;
+        }
         // Runtime-mutation NaN/Inf escape guard. `config.scale_floor_replay`
         // is `pub`, so a consumer can bypass `validate_config` by writing
         // a non-finite value after construction. This debug_assert catches
@@ -3190,6 +3196,12 @@ impl<L: LinAlg> PcActorCritic<L> {
         td_error_abs: f64,
         mode: LearnMode,
     ) -> f64 {
+        // v4.1.0: continuous mode bypasses surprise/td_error → LR modulation
+        // (the variance-band throttle hard-locks continuous policy learning).
+        // Use the base learning rate (scale 1.0). Discrete unchanged.
+        if self.config.action_space == ActionSpace::Continuous {
+            return 1.0;
+        }
         // Runtime-mutation NaN/Inf escape guard, mirror of the actor-side
         // guard. `config.critic_floor_replay` is `pub`, so a consumer can
         // bypass `validate_config` by writing a non-finite value after
@@ -14334,5 +14346,31 @@ mod tests {
             tanh_deriv_at_5 < 1e-3,
             "demonstrates the saturation trap Linear avoids"
         );
+    }
+
+    // v4.1.0: continuous mode must bypass surprise→LR modulation and always
+    // return 1.0, regardless of surprise / td_error magnitude.
+    #[test]
+    fn test_continuous_actor_scale_is_constant() {
+        let agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 1).unwrap();
+        for s in [0.0, 0.01, 0.5, 5.0] {
+            let sc = agent.effective_actor_scale_for_mode(s, LearnMode::Online);
+            assert!(
+                (sc - 1.0).abs() < 1e-12,
+                "continuous actor scale must be 1.0, got {sc}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_continuous_critic_scale_is_constant() {
+        let agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 1).unwrap();
+        for td in [0.0, 0.01, 0.5, 5.0] {
+            let sc = agent.effective_critic_scale_for_mode(td, LearnMode::Online);
+            assert!(
+                (sc - 1.0).abs() < 1e-12,
+                "continuous critic scale must be 1.0, got {sc}"
+            );
+        }
     }
 }
