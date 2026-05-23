@@ -333,6 +333,38 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
     g
 }
 
+/// v4.2.0 — per-component DESCENT-delta contribution of the entropy regularizer
+/// for the tanh-squashed Gaussian policy.
+///
+/// The squashed-Gaussian differential entropy carries the Jacobian term
+/// `−Σ log(1 − tanh²(a_raw))`, whose `μ`-gradient is `E_ε[−2 tanh(a_raw)]`
+/// (single-sample estimate `−2 tanh(a_raw)`). Maximizing `+α·H` by gradient
+/// ascent corresponds, under the descent rule `θ ← θ − lr·delta`, to a delta
+/// contribution `+2α·tanh(a_raw_j)` per output component. This is a restoring
+/// force toward `μ_raw = 0` that does NOT vanish at the squash boundary, so it
+/// bounds the `μ_raw` runaway (H-A). `α = 0` ⇒ all-zero (v4.1.0 no-op).
+///
+/// Applied LOCAL per-step (not accumulated in the GAE trace; see B12). The
+/// per-step Vec alloc is `output_size` f64s — negligible and consistent with
+/// the existing per-step `grad_direction` alloc in the continuous arm.
+///
+/// # Arguments
+///
+/// * `alpha` — entropy regularization coefficient. `0.0` is a true no-op.
+/// * `a_raw` — pre-squash action sample `μ_raw + σ·ε` for each output component.
+///
+/// # Returns
+///
+/// A `Vec<f64>` of the same length as `a_raw` where each element is
+/// `2 * alpha * tanh(a_raw[j])`.
+#[allow(dead_code)] // wired into learn_continuous_inner in a later task
+fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
+    if alpha == 0.0 {
+        return vec![0.0; a_raw.len()];
+    }
+    a_raw.iter().map(|&ar| 2.0 * alpha * ar.tanh()).collect()
+}
+
 impl<L: LinAlg> PcActorCritic<L> {
     /// Returns the eligibility trace length: output_size when GAE enabled, 0 otherwise.
     fn gae_trace_len(config: &PcActorCriticConfig) -> usize {
@@ -14837,20 +14869,39 @@ mod tests {
         // pulls μ_raw toward 0 — a restoring force that does NOT vanish at
         // saturation (contrast: the score-function advantage term vanishes).
         let d = squashed_entropy_delta(0.1, &[5.0]);
-        assert!((d[0] - 0.2 * (5.0_f64).tanh()).abs() < 1e-12, "got {}", d[0]);
-        assert!(d[0] > 0.19, "positive saturated μ_raw → positive delta, got {}", d[0]);
+        assert!(
+            (d[0] - 0.2 * (5.0_f64).tanh()).abs() < 1e-12,
+            "got {}",
+            d[0]
+        );
+        assert!(
+            d[0] > 0.19,
+            "positive saturated μ_raw → positive delta, got {}",
+            d[0]
+        );
 
         let d_neg = squashed_entropy_delta(0.1, &[-5.0]);
-        assert!(d_neg[0] < -0.19, "negative saturated μ_raw → negative delta, got {}", d_neg[0]);
+        assert!(
+            d_neg[0] < -0.19,
+            "negative saturated μ_raw → negative delta, got {}",
+            d_neg[0]
+        );
 
         // non-vanishing at deep saturation (the H-A-relevant property)
         let d_deep = squashed_entropy_delta(0.1, &[20.0]);
-        assert!(d_deep[0].abs() > 0.19, "must not vanish at saturation, got {}", d_deep[0]);
+        assert!(
+            d_deep[0].abs() > 0.19,
+            "must not vanish at saturation, got {}",
+            d_deep[0]
+        );
     }
 
     #[test]
     fn test_squashed_entropy_delta_alpha_zero_is_noop() {
         // α = 0 → exactly zero contribution → bit-identical to v4.1.0.
-        assert_eq!(squashed_entropy_delta(0.0, &[5.0, -3.0, 0.0]), vec![0.0, 0.0, 0.0]);
+        assert_eq!(
+            squashed_entropy_delta(0.0, &[5.0, -3.0, 0.0]),
+            vec![0.0, 0.0, 0.0]
+        );
     }
 }
