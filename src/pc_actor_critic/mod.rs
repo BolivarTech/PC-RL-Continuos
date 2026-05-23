@@ -735,15 +735,8 @@ impl<L: LinAlg> PcActorCritic<L> {
             // Gaussian → entropy gradient is constant). Brainstorm Q3 /
             // spec §4.3: NO rejection here.
 
-            // GAE eligibility traces are discrete-shape; no continuous arm.
-            if config.gae_lambda.is_some() {
-                return Err(PcError::ConfigValidation(format!(
-                    "gae_lambda ({:?}) is not supported in continuous action space \
-                     (eligibility trace is discrete-shape). Set to None or use \
-                     ActionSpace::Discrete.",
-                    config.gae_lambda
-                )));
-            }
+            // GAE(λ) IS supported in continuous as of v4.1.0 — no rejection here.
+
             // TD(n) flush is not yet implemented for continuous mode in v4.0.0.
             if config.td_steps != 0 {
                 return Err(PcError::ConfigValidation(format!(
@@ -751,6 +744,17 @@ impl<L: LinAlg> PcActorCritic<L> {
                      in v4.0.0. Set to 0 or use ActionSpace::Discrete. Continuous \
                      TD(n) is tracked for v4.x.",
                     config.td_steps
+                )));
+            }
+            // v4.1.0: actions are tanh-squashed internally, so the actor must
+            // output the UNBOUNDED pre-squash mean. A bounded output activation
+            // re-introduces the vanishing-gradient trap.
+            if config.actor.output_activation != crate::activation::Activation::Linear {
+                return Err(PcError::ConfigValidation(format!(
+                    "continuous action space requires actor.output_activation == Linear \
+                     (the policy mean μ is unbounded; actions are tanh-squashed internally). \
+                     Got {:?}.",
+                    config.actor.output_activation
                 )));
             }
             // replay_learn hard-rejects Continuous transitions; buffer would be
@@ -14201,30 +14205,71 @@ mod tests {
         }
     }
 
+    // ── v4.1.0 continuous validation rules ───────────────────────────────
+
+    /// Shared fixture for v4.1.0 continuous-mode validation tests.
+    ///
+    /// Produces a minimal valid continuous config: 3-input actor with one
+    /// 8-unit hidden layer, Linear output; matching critic; policy_sigma=0.3.
+    fn continuous_base_config() -> PcActorCriticConfig {
+        let mut c = default_config();
+        c.actor.input_size = 3;
+        c.actor.hidden_layers = vec![LayerDef {
+            size: 8,
+            activation: Activation::Tanh,
+        }];
+        c.actor.output_size = 1;
+        c.actor.output_activation = Activation::Linear;
+        c.critic.input_size = 3 + 8;
+        c.critic.hidden_layers = vec![LayerDef {
+            size: 16,
+            activation: Activation::Tanh,
+        }];
+        c.critic.output_activation = Activation::Linear;
+        c.action_space = ActionSpace::Continuous;
+        c.policy_sigma = 0.3;
+        c
+    }
+
     #[test]
-    fn test_continuous_gae_lambda_decay() {
-        // W1 validation lock: gae_lambda + Continuous is rejected at
-        // construction. GAE eligibility traces are discrete-shape; the
-        // continuous arm has no trace accumulation path in v4.0.0.
-        // Previously this test looped and accepted either Ok or a runtime
-        // ConfigValidation — now validation fires at new() so the loop
-        // never runs.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        cfg.gae_lambda = Some(0.95);
-        let result = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
-        match result {
-            Err(PcError::ConfigValidation(msg)) => {
-                assert!(
-                    msg.contains("gae_lambda") && msg.contains("continuous"),
-                    "error message should mention gae_lambda and continuous, got: {msg}"
-                );
-            }
-            Ok(_) => panic!("expected ConfigValidation for gae_lambda + Continuous, got Ok"),
-            Err(other) => panic!("expected ConfigValidation, got: {other:?}"),
-        }
+    fn test_continuous_requires_linear_output() {
+        // v4.1.0: Continuous actors must use Linear output — actions are
+        // tanh-squashed internally, so a bounded activation reintroduces
+        // the vanishing-gradient trap.
+        let mut c = continuous_base_config();
+        c.actor.output_activation = Activation::Tanh;
+        let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
+            .map(|_: PcActorCritic| ())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("output_activation"),
+            "error must mention output_activation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_allows_gae_lambda() {
+        // v4.1.0: GAE(λ) is now supported in continuous mode.
+        let mut c = continuous_base_config();
+        c.gae_lambda = Some(0.95);
+        assert!(
+            PcActorCritic::new(CpuLinAlg::new(), c, 1)
+                .map(|_: PcActorCritic| ())
+                .is_ok(),
+            "continuous + gae_lambda=0.95 must construct without error"
+        );
+    }
+
+    #[test]
+    fn test_continuous_still_rejects_replay() {
+        // Replay is still unsupported in continuous mode in v4.1.0.
+        let mut c = continuous_base_config();
+        c.replay_training_capacity = 8;
+        assert!(
+            PcActorCritic::new(CpuLinAlg::new(), c, 1)
+                .map(|_: PcActorCritic| ())
+                .is_err(),
+            "continuous + replay_training_capacity=8 must be rejected"
+        );
     }
 }
