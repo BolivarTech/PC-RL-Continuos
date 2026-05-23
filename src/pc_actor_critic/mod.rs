@@ -14830,4 +14830,27 @@ mod tests {
             "weights must stay finite under sigma=0"
         );
     }
+
+    #[test]
+    fn test_squashed_entropy_delta_is_bounded_restoring_force() {
+        // descent-delta contribution = +2α·tanh(a_raw); with θ←θ−lr·delta this
+        // pulls μ_raw toward 0 — a restoring force that does NOT vanish at
+        // saturation (contrast: the score-function advantage term vanishes).
+        let d = squashed_entropy_delta(0.1, &[5.0]);
+        assert!((d[0] - 0.2 * (5.0_f64).tanh()).abs() < 1e-12, "got {}", d[0]);
+        assert!(d[0] > 0.19, "positive saturated μ_raw → positive delta, got {}", d[0]);
+
+        let d_neg = squashed_entropy_delta(0.1, &[-5.0]);
+        assert!(d_neg[0] < -0.19, "negative saturated μ_raw → negative delta, got {}", d_neg[0]);
+
+        // non-vanishing at deep saturation (the H-A-relevant property)
+        let d_deep = squashed_entropy_delta(0.1, &[20.0]);
+        assert!(d_deep[0].abs() > 0.19, "must not vanish at saturation, got {}", d_deep[0]);
+    }
+
+    #[test]
+    fn test_squashed_entropy_delta_alpha_zero_is_noop() {
+        // α = 0 → exactly zero contribution → bit-identical to v4.1.0.
+        assert_eq!(squashed_entropy_delta(0.0, &[5.0, -3.0, 0.0]), vec![0.0, 0.0, 0.0]);
+    }
 }
