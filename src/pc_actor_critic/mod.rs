@@ -14863,6 +14863,140 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Task 4 (v4.2.0): continuous entropy gradient wiring tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_continuous_entropy_pulls_mu_down_vs_alpha_zero() {
+        fn agent_with_alpha(alpha: f64) -> PcActorCritic {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 1;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 4,
+                activation: Activation::Tanh,
+            }];
+            c.critic.input_size = 1 + 4;
+            c.policy_entropy_coeff = alpha;
+            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 7).unwrap();
+            let last = a.actor.layers.len() - 1;
+            for b in a.actor.layers[last].bias.iter_mut() {
+                *b += 6.0;
+            }
+            a
+        }
+        let mu = |ag: &mut PcActorCritic| {
+            ag.act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
+                .unwrap()
+                .1
+                .y_conv[0]
+        };
+        let mut a0 = agent_with_alpha(0.0);
+        let mut a1 = agent_with_alpha(0.2);
+        let _ = a0.step_continuous(&[0.5], 0.0, false).unwrap();
+        let _ = a0.step_continuous(&[0.5], 1.0, false).unwrap();
+        let _ = a1.step_continuous(&[0.5], 0.0, false).unwrap();
+        let _ = a1.step_continuous(&[0.5], 1.0, false).unwrap();
+        assert!(
+            mu(&mut a1) < mu(&mut a0),
+            "entropy (α>0) must pull μ_raw lower than α=0: a1={}, a0={}",
+            mu(&mut a1),
+            mu(&mut a0)
+        );
+    }
+
+    #[test]
+    fn test_continuous_entropy_excluded_from_gae_trace() {
+        fn trace_after(alpha: f64) -> Vec<f64> {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 1;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 4,
+                activation: Activation::Tanh,
+            }];
+            c.critic.input_size = 1 + 4;
+            c.gae_lambda = Some(0.95);
+            c.policy_entropy_coeff = alpha;
+            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 9).unwrap();
+            let last = a.actor.layers.len() - 1;
+            for b in a.actor.layers[last].bias.iter_mut() {
+                *b += 6.0;
+            }
+            let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            a.actor_trace.clone()
+        }
+        assert_eq!(
+            trace_after(0.0),
+            trace_after(0.5),
+            "entropy must NOT enter the GAE eligibility trace"
+        );
+    }
+
+    #[test]
+    fn test_continuous_y_conv_is_pre_squash_mu_raw() {
+        let mut c = continuous_base_config();
+        c.actor.input_size = 1;
+        c.actor.hidden_layers = vec![LayerDef {
+            size: 4,
+            activation: Activation::Tanh,
+        }];
+        c.critic.input_size = 1 + 4;
+        let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 1).unwrap();
+        let last = a.actor.layers.len() - 1;
+        for b in a.actor.layers[last].bias.iter_mut() {
+            *b += 6.0;
+        }
+        let y = a
+            .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
+            .unwrap()
+            .1
+            .y_conv[0];
+        assert!(
+            y.abs() > 1.0,
+            "y_conv must be the unbounded pre-squash μ_raw (|y|>1 possible), got {y}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_entropy_survives_saturated_trace() {
+        fn drift(alpha: f64) -> f64 {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 1;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 4,
+                activation: Activation::Tanh,
+            }];
+            c.critic.input_size = 1 + 4;
+            c.gae_lambda = Some(0.95);
+            c.policy_entropy_coeff = alpha;
+            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 5).unwrap();
+            let last = a.actor.layers.len() - 1;
+            for b in a.actor.layers[last].bias.iter_mut() {
+                *b += 8.0;
+            }
+            let before = a
+                .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
+                .unwrap()
+                .1
+                .y_conv[0];
+            let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 50.0, false).unwrap();
+            let after = a
+                .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
+                .unwrap()
+                .1
+                .y_conv[0];
+            before - after
+        }
+        assert!(
+            drift(0.3) > drift(0.0),
+            "entropy must survive GRAD_CLIP: α>0 drift {} must exceed α=0 drift {}",
+            drift(0.3),
+            drift(0.0)
+        );
+    }
+
     #[test]
     fn test_squashed_entropy_delta_is_bounded_restoring_force() {
         // descent-delta contribution = +2α·tanh(a_raw); with θ←θ−lr·delta this
