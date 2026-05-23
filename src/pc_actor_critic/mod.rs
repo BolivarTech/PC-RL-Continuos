@@ -717,6 +717,16 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.policy_sigma, config.policy_sigma
                 )));
             }
+            // v4.2.0 — continuous entropy temperature must be non-negative and
+            // finite. α = 0 is the v4.1.0-compatibility no-op; α > 0 enables the
+            // entropy regularizer that bounds μ_raw (closes H-A).
+            if !config.policy_entropy_coeff.is_finite() || config.policy_entropy_coeff < 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "policy_entropy_coeff ({}) must be >= 0.0 and finite when \
+                     action_space == Continuous.",
+                    config.policy_entropy_coeff
+                )));
+            }
             // KL distillation is undefined for raw continuous output.
             if config.distillation_lambda_polyak > 0.0 {
                 return Err(PcError::ConfigValidation(format!(
@@ -733,9 +743,8 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.distillation_lambda_frozen
                 )));
             }
-            // entropy_coeff > 0 is silently inert in continuous (fixed-σ
-            // Gaussian → entropy gradient is constant). Brainstorm Q3 /
-            // spec §4.3: NO rejection here.
+            // Discrete `entropy_coeff` stays silently inert in continuous; the
+            // continuous entropy temperature is `policy_entropy_coeff` (v4.2.0).
 
             // GAE(λ) IS supported in continuous as of v4.1.0 — no rejection here.
 
