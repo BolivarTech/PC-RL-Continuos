@@ -2150,15 +2150,10 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // distinction is fully captured by the delta vector built
                 // here.
                 //
-                // GAE eligibility traces are intentionally NOT applied in
-                // the Continuous path: the trace formulation `actor_trace`
-                // is sized and seeded for the discrete one-hot gradient,
-                // and the public continuous API (Phase 4) does not yet
-                // expose GAE for continuous control. If gae_lambda is set
-                // alongside ActionSpace::Continuous, we fall through to
-                // the standard TD path; config validation forbids the
-                // Continuous + GAE combination at construction time when
-                // it is unsupported.
+                // GAE eligibility traces mirror the discrete arm (v4.1.0):
+                // `actor_trace` is sized `output_size` (= continuous action
+                // dims) when `gae_lambda.is_some()`, so it indexes safely
+                // for the Gaussian gradient direction below.
                 let mu = &y_conv_vec; // y_conv is the post-activation μ(s).
                 let sigma = self.config.policy_sigma;
                 let sigma_sq = sigma * sigma;
@@ -2175,18 +2170,45 @@ impl<L: LinAlg> PcActorCritic<L> {
                     mu.len()
                 );
 
-                // Descent-direction delta:
-                //   delta_j = td_error · (μ_j − a_taken_j) / σ²
+                // Per-dim descent gradient direction WITHOUT td_error scaling:
+                //   grad_direction_j = (μ_j − a_taken_j) / σ²
                 //
                 // Sanity: with td_error > 0 and a_taken > μ, delta < 0,
                 // so the bias update b_j ← b_j − lr·δ pushes μ_j UP —
                 // pulling the mean toward the rewarded action, which
                 // matches the Phase 4.1 gradient-direction test contract
                 // ("if a > μ and advantage > 0, μ moves up").
-                let mut delta = vec![0.0; mu.len()];
+                let mut grad_direction = vec![0.0; mu.len()];
                 for j in 0..mu.len() {
-                    delta[j] = td_error * (mu[j] - a_taken[j]) / sigma_sq;
+                    grad_direction[j] = (mu[j] - a_taken[j]) / sigma_sq;
                 }
+
+                // Effective delta. Mirrors the discrete GAE arm:
+                //   - GAE + Online: online-only decay the trace by γλ, add
+                //     the gradient direction, clamp to ±GRAD_CLIP, then scale
+                //     by td_error (standard GAE eligibility update).
+                //   - GAE + Replay: fall back to plain TD(0) so off-policy
+                //     updates do not pollute the on-policy trace.
+                //   - No GAE: plain TD(0).
+                let delta: Vec<f64> = if let Some(lambda) = self.config.gae_lambda {
+                    if is_online {
+                        let gamma_lambda = self.config.gamma * lambda;
+                        for v in &mut self.actor_trace {
+                            *v *= gamma_lambda;
+                        }
+                        for (j, &g) in grad_direction.iter().enumerate() {
+                            self.actor_trace[j] += g;
+                        }
+                        for v in &mut self.actor_trace {
+                            *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+                        }
+                        self.actor_trace.iter().map(|&t| td_error * t).collect()
+                    } else {
+                        grad_direction.iter().map(|&g| td_error * g).collect()
+                    }
+                } else {
+                    grad_direction.iter().map(|&g| td_error * g).collect()
+                };
 
                 // Entropy regularization: SKIPPED for fixed-σ Gaussian.
                 // H(N(μ,σ²I)) = 0.5·k·(1 + ln(2πσ²)) is independent of θ
@@ -14279,6 +14301,35 @@ mod tests {
                 .is_ok(),
             "continuous + gae_lambda=0.95 must construct without error"
         );
+    }
+
+    #[test]
+    fn test_continuous_gae_trace_accumulates() {
+        let mut cfg = continuous_base_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 11).unwrap();
+        let s = [0.3, 0.2, 0.1];
+        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
+        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
+        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
+        let n: f64 = agent.actor_trace.iter().map(|t| t * t).sum::<f64>().sqrt();
+        assert!(
+            n > 0.0,
+            "continuous GAE trace must be non-zero after learning"
+        );
+    }
+
+    #[test]
+    fn test_continuous_gae_trace_resets_on_terminal() {
+        let mut cfg = continuous_base_config();
+        cfg.gae_lambda = Some(0.95);
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 11).unwrap();
+        let s = [0.3, 0.2, 0.1];
+        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
+        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
+        let _ = agent.step_continuous(&s, 1.0, true).unwrap();
+        let n: f64 = agent.actor_trace.iter().map(|t| t * t).sum::<f64>().sqrt();
+        assert!(n < 1e-12, "trace must reset on terminal, got {n}");
     }
 
     #[test]
