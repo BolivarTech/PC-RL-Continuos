@@ -14260,6 +14260,44 @@ mod tests {
         );
     }
 
+    // ── v4.2.0 policy_entropy_coeff validation ───────────────────────────
+
+    #[test]
+    fn test_continuous_rejects_negative_entropy_coeff() {
+        let mut c = continuous_base_config();
+        c.policy_entropy_coeff = -0.1;
+        let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
+            .map(|_: PcActorCritic| ())
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("policy_entropy_coeff"),
+            "error must name policy_entropy_coeff, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_rejects_nonfinite_entropy_coeff() {
+        let mut c = continuous_base_config();
+        c.policy_entropy_coeff = f64::NAN;
+        assert!(PcActorCritic::new(CpuLinAlg::new(), c, 1)
+            .map(|_: PcActorCritic| ())
+            .is_err());
+    }
+
+    #[test]
+    fn test_continuous_accepts_zero_and_positive_entropy_coeff() {
+        for a in [0.0, 0.1, 1.0] {
+            let mut c = continuous_base_config();
+            c.policy_entropy_coeff = a;
+            assert!(
+                PcActorCritic::new(CpuLinAlg::new(), c, 1)
+                    .map(|_: PcActorCritic| ())
+                    .is_ok(),
+                "α={a} must construct"
+            );
+        }
+    }
+
     #[test]
     fn test_continuous_action_is_squashed_to_unit_interval() {
         let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 7).unwrap();
