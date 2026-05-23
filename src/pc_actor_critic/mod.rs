@@ -4378,6 +4378,7 @@ mod tests {
             critic_floor_replay: -1.0,
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
+            policy_entropy_coeff: 0.0,
         }
     }
 
@@ -4892,6 +4893,7 @@ mod tests {
             critic_floor_replay: -1.0,
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
+            policy_entropy_coeff: 0.0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -6150,6 +6152,7 @@ mod tests {
             critic_floor_replay: -1.0,
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
+            policy_entropy_coeff: 0.0,
         }
     }
 
@@ -14627,8 +14630,8 @@ mod tests {
                 let norm =
                     ((self.th + std::f64::consts::PI).rem_euclid(two_pi)) - std::f64::consts::PI;
                 let cost = norm * norm + 0.1 * self.thdot * self.thdot + 0.001 * u * u;
-                let mut newthdot = self.thdot
-                    + (3.0 * g / (2.0 * l) * self.th.sin() + 3.0 / (m * l * l) * u) * dt;
+                let mut newthdot =
+                    self.thdot + (3.0 * g / (2.0 * l) * self.th.sin() + 3.0 / (m * l * l) * u) * dt;
                 newthdot = newthdot.clamp(-8.0, 8.0);
                 self.th += newthdot * dt;
                 self.thdot = newthdot;

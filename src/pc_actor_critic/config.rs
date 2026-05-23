@@ -85,6 +85,18 @@ fn default_entropy_coeff() -> f64 {
     0.01
 }
 
+/// Default continuous-policy entropy temperature `α` (v4.2.0).
+///
+/// Default-ON: a positive value so deserialized configs get the
+/// deterministic-convergence fix without opt-in (spec decision A). The exact
+/// value is operational — the smallest that keeps `μ_raw` bounded in B1 with
+/// margin (tuned in Task 6; starting point 0.1, search range 0.05–0.5).
+/// `α = 0` reproduces v4.1.0 continuous behavior exactly. Distinct from the
+/// DISCRETE `entropy_coeff` (different estimator); see that field's doc.
+fn default_policy_entropy_coeff() -> f64 {
+    0.1
+}
+
 /// Default scale floor for surprise-to-learning-rate mapping.
 fn default_scale_floor() -> f64 {
     0.0
@@ -615,6 +627,15 @@ pub struct PcActorCriticConfig {
     /// Default 0.1.
     #[serde(default = "default_policy_sigma")]
     pub policy_sigma: f64,
+    /// v4.2.0 — continuous-policy entropy temperature `α`. Ignored when
+    /// `action_space == Discrete` (discrete uses the separate `entropy_coeff`
+    /// with a different, softmax-based estimator — do NOT conflate). Scales the
+    /// tanh-squashed Gaussian entropy regularizer whose `μ`-gradient bounds
+    /// `μ_raw` at the squash boundary (closes H-A). Read on every learning
+    /// step and runtime-mutable like `policy_sigma`; annealing is caller-side.
+    /// Must be `>= 0.0 && finite`. Default-on (`> 0`); `0.0` = v4.1.0 behavior.
+    #[serde(default = "default_policy_entropy_coeff")]
+    pub policy_entropy_coeff: f64,
 }
 
 #[cfg(test)]
@@ -704,6 +725,7 @@ mod tests {
             critic_floor_replay: -1.0,
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
+            policy_entropy_coeff: 0.0,
         }
     }
 

@@ -542,6 +542,7 @@ mod tests {
             critic_floor_replay: -1.0,
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
+            policy_entropy_coeff: 0.0,
         }
     }
 
