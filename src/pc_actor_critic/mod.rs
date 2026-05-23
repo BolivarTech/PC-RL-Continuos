@@ -2157,6 +2157,26 @@ impl<L: LinAlg> PcActorCritic<L> {
                 let mu = &y_conv_vec; // y_conv is the post-activation μ(s).
                 let sigma = self.config.policy_sigma;
                 let sigma_sq = sigma * sigma;
+
+                // Defense-in-depth: if policy_sigma was mutated to a non-finite
+                // or non-positive value after construction, division by σ² would
+                // produce NaN/Inf that bypasses GRAD_CLIP and corrupts weights.
+                // Skip the actor gradient update for this step only; critic and
+                // bookkeeping proceed normally so loss/td_error remain valid.
+                if !sigma_sq.is_finite() || sigma_sq <= 0.0 {
+                    return Ok(self.apply_actor_update_and_bookkeeping(
+                        &vec![0.0; mu.len()],
+                        step.infer,
+                        step.state,
+                        &y_conv_vec,
+                        &[],
+                        0,
+                        td_error,
+                        loss,
+                        step.mode,
+                    ));
+                }
+
                 debug_assert!(
                     sigma_sq.is_finite() && sigma_sq > 0.0,
                     "policy_sigma must produce finite positive sigma_sq, got {sigma_sq} \
@@ -14422,6 +14442,21 @@ mod tests {
         assert!(
             gae_learn >= 4,
             "GAE must learn delayed credit on >=4/5 seeds, got {gae_learn}"
+        );
+    }
+
+    #[test]
+    fn test_continuous_nonfinite_sigma_does_not_corrupt_weights() {
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
+        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 0.0, false).unwrap();
+        agent.config.policy_sigma = 0.0; // illegal post-construction mutation
+                                         // must not panic / NaN-corrupt
+        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 1.0, false);
+        // No bulk matrix→Vec accessor on LinAlg; read CpuLinAlg's concrete field.
+        let w = &agent.actor.layers[0].weights.data;
+        assert!(
+            w.iter().all(|x| x.is_finite()),
+            "weights must stay finite under sigma=0"
         );
     }
 }
