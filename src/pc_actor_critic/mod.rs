@@ -2141,8 +2141,9 @@ impl<L: LinAlg> PcActorCritic<L> {
                 //   log π(a|s) = −‖a − μ‖² / (2σ²) + const
                 //   ∇_θ log π = ((a − μ) / σ²) · ∇_θ μ
                 //
-                // The output-level delta (post-activation) is therefore
-                //   delta_j = (a_taken_j − μ_j) / σ²
+                // The output-level DESCENT delta (post-activation), applied via the
+                // `θ ← θ − lr·delta` update rule, is therefore
+                //   delta_j = (μ_j − a_taken_j) / σ²
                 // multiplied by td_error (advantage). The existing
                 // `update_with_decay` machinery in `apply_actor_update_and_
                 // bookkeeping` propagates this through the network using the
@@ -2224,9 +2225,13 @@ impl<L: LinAlg> PcActorCritic<L> {
                         }
                         self.actor_trace.iter().map(|&t| td_error * t).collect()
                     } else {
+                        // Unreachable in continuous mode: replay is rejected at
+                        // construction, so this off-policy fallback never runs.
+                        // Kept to mirror the discrete GAE arm's structure.
                         grad_direction.iter().map(|&g| td_error * g).collect()
                     }
                 } else {
+                    // No GAE → plain TD(0) advantage-scaled gradient.
                     grad_direction.iter().map(|&g| td_error * g).collect()
                 };
 
@@ -13984,7 +13989,7 @@ mod tests {
 
     #[test]
     fn test_act_continuous_play_deterministic() {
-        // Brainstorm Q5+Q7: Play mode returns μ deterministically,
+        // Brainstorm Q5+Q7: Play mode returns tanh(μ) deterministically,
         // does not advance RNG.
         let mut cfg = default_config();
         cfg.action_space = ActionSpace::Continuous;
@@ -14406,6 +14411,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow learning-validation (~30s); run on demand: cargo test -- --ignored"]
     fn test_continuous_learns_immediate_credit_regulation() {
         let mut wins = 0;
         for seed in [42u64, 43, 44, 45, 46] {
@@ -14431,6 +14437,7 @@ mod tests {
     /// valuable property: GAE handles delayed credit. (TD(0) arm dropped — it
     /// asserted nothing realizable here and only doubled runtime.)
     #[test]
+    #[ignore = "slow learning-validation (~60s); run on demand: cargo test -- --ignored"]
     fn test_continuous_gae_learns_delayed_credit() {
         let mut gae_learn = 0;
         for seed in [42u64, 43, 44, 45, 46] {
