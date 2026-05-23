@@ -14308,4 +14308,31 @@ mod tests {
         );
         assert!(a[0] > -1.0 && a[0] < 1.0);
     }
+
+    #[test]
+    fn test_continuous_gradient_does_not_vanish_at_large_mu() {
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 3).unwrap();
+        let s = [1.0, 0.0, 0.0];
+        let n = agent.actor.layers.len() - 1;
+        agent.actor.layers[n].bias = agent.backend.vec_from_slice(&[5.0]); // large |μ_raw|
+
+        let mu_before = agent.backend.vec_to_vec(&agent.actor.infer(&s).y_conv)[0];
+        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
+        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
+        let mu_after = agent.backend.vec_to_vec(&agent.actor.infer(&s).y_conv)[0];
+
+        let moved = (mu_after - mu_before).abs();
+        assert!(
+            moved > 1e-4,
+            "Linear μ_raw must move (no vanishing): Δ={moved}"
+        );
+
+        // Contrast: a Tanh output layer at the same pre-activation (~5) would scale
+        // the gradient by (1 − tanh²(5)) ≈ 1.8e-4 → effectively frozen.
+        let tanh_deriv_at_5 = 1.0 - (5.0_f64).tanh().powi(2);
+        assert!(
+            tanh_deriv_at_5 < 1e-3,
+            "demonstrates the saturation trap Linear avoids"
+        );
+    }
 }
