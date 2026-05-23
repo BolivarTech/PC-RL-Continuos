@@ -232,9 +232,11 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// step path.
     action_prev: Option<usize>,
     /// Previous continuous action vector taken (transient, not serialized).
-    /// Holds the sampled `a = μ + σ·ε` from the prior `step_continuous`
-    /// call so the next call can build the Gaussian-policy gradient
-    /// `(μ − a)/σ²`. Mutually exclusive with [`Self::action_prev`].
+    /// Holds the pre-squash `a_raw = μ_raw + σ·ε` from the prior
+    /// `step_continuous` call so the next call can build the Gaussian-policy
+    /// gradient `(μ − a_raw)/σ²`. The returned/executed action is
+    /// `tanh(a_raw)`, but the gradient must use the unbounded `a_raw`.
+    /// Mutually exclusive with [`Self::action_prev`].
     action_prev_continuous: Option<Vec<f64>>,
     /// Previous inference result (transient, not serialized).
     infer_prev: Option<InferResult<L>>,
@@ -2546,8 +2548,10 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// # Returns
     ///
-    /// The sampled action vector `a = μ(s) + σ·ε` of length
-    /// `config.actor.output_size`.
+    /// The tanh-squashed action vector `a = tanh(μ(s) + σ·ε) ∈ (−1, 1)` of
+    /// length `config.actor.output_size`. The pre-squash value `a_raw =
+    /// μ(s) + σ·ε` is stored internally so that the next call's Gaussian-policy
+    /// gradient `(μ − a_raw)/σ²` remains correct.
     ///
     /// # Determinism
     ///
@@ -2585,8 +2589,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         let current_infer = self.actor.infer(state);
 
         // 2. Learn from the previous transition if buffered. Continuous
-        //    step_continuous is TD(0) only at Phase 4.1; TD(n) and GAE
-        //    paths for the continuous gradient land in Phase 4.3.
+        //    step_continuous uses TD(0), or GAE(λ) when `gae_lambda = Some`.
         if let (Some(prev_state), Some(prev_action), Some(prev_infer)) = (
             self.state_prev.take(),
             self.action_prev_continuous.take(),
@@ -2647,8 +2650,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         // 4. Stash (state, action, infer) for the next call's bootstrap.
+        //    `action` is a_raw = μ_raw + σ·ε (Linear output, unbounded).
+        //    Store a_raw for the next-step gradient; return the tanh-squashed
+        //    action for execution so the environment sees values in (−1, 1).
+        let squashed: Vec<f64> = action.iter().map(|&ar| ar.tanh()).collect();
+
         self.state_prev = Some(self.backend.vec_from_slice(state));
-        self.action_prev_continuous = Some(action.clone());
+        self.action_prev_continuous = Some(action); // a_raw (pre-squash) — gradient uses this
         self.infer_prev = Some(current_infer);
         // `valid_actions_prev` is discrete-only; clear so a future
         // accidental `step_masked` call after a config swap does not
@@ -2668,15 +2676,16 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
         }
 
-        Ok(action)
+        Ok(squashed)
     }
 
     /// v4.0.0 — same as [`step_continuous`](Self::step_continuous) but returns
-    /// the device-native action vector. Forward-compat hook for future
-    /// `GpuLinAlg` backends. On `CpuLinAlg` (where `Vector = Vec<f64>`), this
-    /// is bit-equivalent to `step_continuous` plus a `vec_from_slice`
-    /// round-trip; future `GpuLinAlg` can override to be zero-copy
-    /// device-side.
+    /// the device-native action vector. The returned value is the tanh-squashed
+    /// action `tanh(μ_raw + σ·ε) ∈ (−1, 1)`, identical to `step_continuous`.
+    /// Forward-compat hook for future `GpuLinAlg` backends. On `CpuLinAlg`
+    /// (where `Vector = Vec<f64>`), this is bit-equivalent to `step_continuous`
+    /// plus a `vec_from_slice` round-trip; future `GpuLinAlg` can override to
+    /// be zero-copy device-side.
     ///
     /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
     ///
@@ -2701,8 +2710,8 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// | `mode` | Action returned | Side-effect on RNG |
     /// |---|---|---|
-    /// | `SelectionMode::Play` | Deterministic `μ(s)` — no noise | None (RNG not advanced) |
-    /// | `SelectionMode::Training` | `μ(s) + σ·ε`, `ε ~ N(0, I)` via Box-Muller | One draw per output dimension |
+    /// | `SelectionMode::Play` | Deterministic `tanh(μ(s))` — no noise | None (RNG not advanced) |
+    /// | `SelectionMode::Training` | `tanh(μ(s) + σ·ε)`, `ε ~ N(0, I)` via Box-Muller | One draw per output dimension |
     ///
     /// `σ = config.policy_sigma`.
     ///
@@ -2757,11 +2766,11 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         let action = match mode {
             crate::pc_actor::SelectionMode::Play => {
-                // Play: deterministic μ, no RNG advance.
-                mu
+                // Play: deterministic tanh(μ_raw), no RNG advance.
+                mu.iter().map(|&m| m.tanh()).collect::<Vec<f64>>()
             }
             crate::pc_actor::SelectionMode::Training => {
-                // Training: μ + σ·ε, RNG advances. Box-Muller per dim.
+                // Training: tanh(μ_raw + σ·ε), RNG advances. Box-Muller per dim.
                 use rand::Rng;
                 let sigma = self.config.policy_sigma;
                 mu.iter()
@@ -2769,7 +2778,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                         let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
                         let u2: f64 = self.rng.gen_range(0.0..1.0);
                         let eps = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        m + sigma * eps
+                        (m + sigma * eps).tanh()
                     })
                     .collect::<Vec<f64>>()
             }
@@ -14271,5 +14280,32 @@ mod tests {
                 .is_err(),
             "continuous + replay_training_capacity=8 must be rejected"
         );
+    }
+
+    #[test]
+    fn test_continuous_action_is_squashed_to_unit_interval() {
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 7).unwrap();
+        for _ in 0..200 {
+            let a = agent
+                .step_continuous(&[0.5, -0.3, 0.1], 0.0, false)
+                .unwrap();
+            assert_eq!(a.len(), 1);
+            assert!(a[0] > -1.0 && a[0] < 1.0, "action {} not in (-1,1)", a[0]);
+        }
+    }
+
+    #[test]
+    fn test_act_continuous_play_returns_tanh_of_mean() {
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 7).unwrap();
+        let s = [0.2, 0.4, -0.1];
+        let (a, infer) = agent
+            .act_continuous(&s, crate::pc_actor::SelectionMode::Play)
+            .unwrap();
+        let mu_raw = agent.backend.vec_to_vec(&infer.y_conv)[0];
+        assert!(
+            (a[0] - mu_raw.tanh()).abs() < 1e-12,
+            "Play must return tanh(μ_raw)"
+        );
+        assert!(a[0] > -1.0 && a[0] < 1.0);
     }
 }
