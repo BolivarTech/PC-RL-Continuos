@@ -1,12 +1,12 @@
 # PC-Pendulum — Experiment Specification
 
-**Project:** Standalone Rust binary that consumes `pc-rl-core v4.0.0` to train and evaluate a Predictive Coding agent on the Pendulum-v1 swing-up task.
+**Project:** Standalone Rust binary that consumes `pc-rl-core v4.1.0` to train and evaluate a Predictive Coding agent on the Pendulum-v1 swing-up task.
 
 **Status:** Spec — implementation pending. Standalone repository (separate from `pc-rl-core`), following the PC-TicTacToe pattern.
 
 **Target repository name:** `PC-Pendulum` (suggested) on `github.com/BolivarTech/`.
 
-**Purpose:** Empirical validation that v4.0.0's continuous action mode actually trains a working policy on a canonical RL benchmark. Without this validation, v4.0.0 is "code that passes synthetic tests" but unproven against real dynamics.
+**Purpose:** Empirical validation that v4.1.0's continuous action mode actually trains a working policy on a canonical RL benchmark. Without this validation, v4.1.0 is "code that passes synthetic tests" but unproven against real dynamics.
 
 ---
 
@@ -18,7 +18,7 @@ Train a Predictive Coding actor-critic agent to **swing up and balance** an inve
 2. PC inference + continuous output deliver competitive performance vs. a pure feedforward continuous baseline.
 3. Surprise-driven learning rate modulation (M1) behaves sensibly on a continuous-reward task.
 
-This is the canonical "hello world" of continuous control. If `pc-rl-core` v4.0.0 cannot solve Pendulum, the implementation has bugs not caught by synthetic tests.
+This is the canonical "hello world" of continuous control. If `pc-rl-core` v4.1.0 cannot solve Pendulum, the implementation has bugs not caught by synthetic tests.
 
 ---
 
@@ -42,7 +42,7 @@ A single rigid rod of length `L` and mass `m` rotates around a fixed pivot in a 
 | Component | Form | Range | Notes |
 |---|---|---|---|
 | State `s` | `[cos(θ), sin(θ), θ_dot]` | All ∈ ℝ | Angle encoded as cos/sin to avoid wraparound |
-| Action `a` | scalar torque `u` | `[-2.0, 2.0]` N·m | Clipped post-sample |
+| Action `a` | scalar torque `u` | `[-2.0, 2.0]` N·m | Library returns tanh-squashed `[-1,1]`; consumer scales by 2.0 |
 | Reward `r` | `−(θ² + 0.1·θ_dot² + 0.001·u²)` | ≤ 0 | Quadratic cost on angle, velocity, action |
 
 **Conventions:**
@@ -83,9 +83,9 @@ This is intentional. Pendulum-v1 has no failure state; the agent simply accumula
 | Random policy | ~−1500 | N/A |
 | REINFORCE vanilla | ~−500 | 500-1000 |
 | DDPG / TD3 / SAC (replay) | ~−150 | 50-100 |
-| **PC-RL-Core v4.0.0 target** | **~−250 to −350** | **300-500** |
+| **PC-RL-Core v4.1.0 target** | **~−250 to −350** | **300-500** |
 
-Without replay (rejected in v4.0.0 continuous), expect performance below DDPG but well above random. The point is **convergence**, not SOTA.
+Without replay (rejected in continuous mode), expect performance below DDPG but well above random. The point is **convergence**, not SOTA.
 
 ---
 
@@ -111,7 +111,7 @@ fn build_config() -> PcActorCriticConfig {
                 LayerDef { size: 32, activation: Activation::Tanh },
             ],
             output_size: 1,                         // single torque value
-            output_activation: Activation::Tanh,    // → [-1, 1]; scaled to [-2, 2] post-sample
+            output_activation: Activation::Linear,  // unbounded μ_raw; library squashes via tanh internally
             alpha: 0.03,
             tol: 0.01,
             min_steps: 1,
@@ -136,13 +136,15 @@ fn build_config() -> PcActorCriticConfig {
         action_space: ActionSpace::Continuous,
         policy_sigma: 0.3,                          // exploration std-dev
 
-        // === Required to be off in continuous (v4.0.0 validation rejects otherwise) ===
+        // === Required to be off in continuous (validation rejects otherwise) ===
         distillation_lambda_polyak: 0.0,
         distillation_lambda_frozen: 0.0,
         replay_training_capacity: 0,
         replay_recent_capacity: 0,
-        gae_lambda: None,
         td_steps: 0,
+
+        // === GAE eligibility trace (v4.1.0 continuous support) ===
+        gae_lambda: Some(0.95),
 
         // === Continuous Learning machinery (M1 active) ===
         gamma: 0.99,
@@ -177,12 +179,13 @@ fn build_config() -> PcActorCriticConfig {
 
 ### 3.2 Action mapping
 
-The actor output is `Tanh`-bounded to `[-1, 1]`. Scale to physical torque range:
+`step_continuous` / `act_continuous` return tanh-squashed actions in `[-1, 1]`
+(the actor uses `output_activation = Linear`; the library squashes internally).
+Scale affinely to the physical torque range — no clamp needed:
 
 ```rust
-let (raw_action, _) = agent.act_continuous(&state, mode)?;
-let torque = raw_action[0] * 2.0;        // [-1, 1] → [-2, 2]
-let torque = torque.clamp(-2.0, 2.0);    // defensive
+let (action, _) = agent.act_continuous(&state, mode)?;
+let torque = action[0] * 2.0;    // [-1, 1] → [-2, 2]; tanh guarantees the bound
 ```
 
 ### 3.3 Training loop sketch
@@ -194,9 +197,9 @@ for episode in 0..NUM_EPISODES {
 
     for step in 0..200 {
         let state = env.observation();
-        let raw = agent
+        let action = agent
             .step_continuous(&state, last_reward, false)?;
-        let torque = (raw[0] * 2.0).clamp(-2.0, 2.0);
+        let torque = action[0] * 2.0;  // tanh-squashed in [-1,1] → [-2,2]; no clamp needed
 
         let (next_state, reward, _done) = env.step(torque);
         episode_reward += reward;
@@ -247,7 +250,7 @@ for episode in 0..NUM_EPISODES {
 **Tests:**
 - `test_agent_constructs` — `build_agent()` returns Ok
 - `test_agent_step_continuous_returns_finite_action` — single step, action vector contains finite floats
-- `test_agent_action_in_range` — over 100 random states, sampled action ∈ [-1, 1] (Tanh bound)
+- `test_agent_action_in_range` — over 100 random states, sampled action ∈ [-1, 1] (tanh-squashed by the library)
 
 ### Phase 3 — Training loop
 
@@ -491,4 +494,4 @@ Other candidates were considered and rejected for first-experiment status:
 | Reach (planar arm) | Requires custom env with no standard baseline |
 | Pure CartPole-discrete | Wrong test (already covered by TicTacToe) |
 
-Pendulum-v1 is the **lowest-friction** path to "v4.0.0 continuous works on real dynamics". If it fails, the bugs are surfaced early. If it succeeds, there's confidence to invest in more ambitious continuous benchmarks.
+Pendulum-v1 is the **lowest-friction** path to "v4.1.0 continuous works on real dynamics". If it fails, the bugs are surfaced early. If it succeeds, there's confidence to invest in more ambitious continuous benchmarks.

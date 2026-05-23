@@ -1,5 +1,22 @@
 # Changelog
 
+## [4.1.0] - 2026-05-23
+
+### Added / Changed (continuous action mode)
+- Continuous mode now learns continuous control. The actor outputs an unbounded mean
+  (`output_activation` must be `Linear`); actions are tanh-squashed to `[-1,1]`
+  internally — `step_continuous`/`act_continuous` now return squashed actions.
+- GAE(λ) is supported in continuous mode (`gae_lambda = Some(λ)`) — an eligibility trace
+  over the Gaussian gradient direction provides multi-step credit assignment.
+- Continuous mode uses a constant learning rate (the surprise→LR modulation is bypassed;
+  it throttled continuous policy learning).
+- Runtime guard: a non-finite or non-positive `policy_sigma` no longer corrupts weights.
+
+### Breaking (continuous mode only; discrete unchanged)
+- `step_continuous`/`act_continuous` return tanh-squashed actions in `[-1,1]` (was
+  raw/unbounded). Map affinely to your range; no clamp needed.
+- Continuous construction now requires `actor.output_activation == Linear`.
+
 ## [4.0.1] - 2026-05-22
 
 ### Fixed

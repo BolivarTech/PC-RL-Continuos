@@ -1,6 +1,6 @@
 [package]
 name = "pc-rl-core"
-version = "4.0.1"
+version = "4.1.0"
 edition = "2021"
 authors = ["Julian Bolivar"]
 description = "Predictive Coding Actor-Critic reinforcement learning framework — pure Rust, zero ML dependencies"

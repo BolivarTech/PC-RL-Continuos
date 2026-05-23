@@ -1,7 +1,7 @@
-# Continuous Action Space — Test Harness Handoff Guide (v4.0.0)
+# Continuous Action Space — Test Harness Handoff Guide (v4.1.0)
 
 **Audience:** The agent/developer who will build the **downstream consumer
-binary** (e.g. `PC-Pendulum`) that validates `pc-rl-core` v4.0.0's continuous
+binary** (e.g. `PC-Pendulum`) that validates `pc-rl-core` v4.1.0's continuous
 action mode against real dynamics.
 
 **Purpose:** Give that agent the *exact, code-verified* public API contract of
@@ -10,7 +10,7 @@ two experiment specs describe *what* to run; this guide pins down *how to call
 the library*.
 
 **Source of truth:** All signatures, field names, defaults, and validation
-rules below were read directly from the v4.0.0 source (`src/lib.rs`,
+rules below were read directly from the v4.1.0 source (`src/lib.rs`,
 `src/pc_actor_critic/{mod.rs,config.rs}`, `src/serializer.rs`). If anything here
 disagrees with `docs/experiment_pendulum_v1_spec.md`, **this guide wins** —
 the spec predates the final API and contains a few simplifications that won't
@@ -32,7 +32,7 @@ up and balance it upright**, then hold it there.
   N·m (1-D). **Reward** `−(θ² + 0.1·θ̇² + 0.001·u²)` (≤ 0; best per-step = 0 at
   upright, still, zero torque).
 - Episodes are a fixed 200 steps, no termination.
-- **Why this experiment matters:** v4.0.0 ships the continuous Gaussian-policy
+- **Why this experiment matters:** v4.1.0 ships the continuous Gaussian-policy
   *code* and passes synthetic gradient tests, but it has **never been run
   against real dynamics**. Pendulum-v1 is the lowest-friction proof that the
   policy gradient `δ = td_error · (μ − a)/σ²` actually trains a working policy.
@@ -122,10 +122,11 @@ reward earned from the *previous* action. On the first step of an episode pass
 let action = agent.step_continuous(&state, last_reward, done)?;
 ```
 
-> ⚠️ **The returned action is NOT bounded.** It is `μ + σ·ε`. Even if your
-> `output_activation = Tanh` makes `μ ∈ [−1, 1]`, the added Gaussian noise can
-> push the sample outside that range. **You must scale and clamp it yourself**
-> before handing it to the environment (see §6).
+> **The returned action is tanh-squashed to `[−1, 1]`.** Internally the actor
+> outputs an unbounded mean `μ_raw` (`output_activation` must be `Linear`),
+> samples `a_raw = μ_raw + σ·ε`, then returns `tanh(a_raw)` — bounded by
+> construction. **No clamp is needed.** Map affinely to your physical range
+> (see §6).
 
 There is also `step_continuous_raw_device(&mut self, …) -> Result<L::Vector, …>`
 — identical flow but returns the backend-native vector. On `CpuLinAlg`,
@@ -151,8 +152,8 @@ let (action, infer) = agent.act_continuous(&state, SelectionMode::Play)?;
 // infer.surprise_score, infer.y_conv, etc. available for metrics.
 ```
 
-> Note `Play` mode returns raw `μ` with **no clamp** either — apply the same
-> scale/clamp from §6 in evaluation as in training.
+> Note `Play` mode returns `tanh(μ_raw)` — already in `[−1, 1]`. Apply the
+> same affine map from §6 in evaluation as in training; no clamp needed.
 
 ### 3.4 Persistence — serializer free functions
 
@@ -196,7 +197,7 @@ to override; serde supplies the rest.
 [actor]
 input_size = 3
 output_size = 1
-output_activation = "tanh"
+output_activation = "linear"   # MUST be linear — library squashes internally via tanh
 alpha = 0.03
 tol = 0.01
 min_steps = 1
@@ -218,6 +219,7 @@ hidden_layers = [{ size = 64, activation = "tanh" }]
 # --- continuous mode knobs ---
 action_space = "Continuous"
 policy_sigma = 0.3
+gae_lambda = 0.95          # GAE eligibility trace for multi-step credit assignment
 
 # --- override any other default as needed ---
 gamma = 0.99
@@ -261,32 +263,33 @@ When `action_space == ActionSpace::Continuous`, `new()` returns
 | `policy_sigma` | **must be `> 0.0` and finite** | it's the Gaussian σ; `/σ²` in the gradient |
 | `distillation_lambda_polyak` | **must be `0.0`** | KL distillation undefined for raw continuous output |
 | `distillation_lambda_frozen` | **must be `0.0`** | same reason |
-| `gae_lambda` | **must be `None`** | eligibility trace is discrete-shaped (no continuous arm in v4.0.0) |
-| `td_steps` | **must be `0`** | continuous TD(n) not implemented in v4.0.0 |
+| `gae_lambda` | `None` (TD(0)) **or** `Some(λ)` where `0 < λ < 1` | GAE eligibility trace supported in v4.1.0; `Some(0.95)` recommended |
+| `td_steps` | **must be `0`** | continuous TD(n) not implemented |
 | `replay_training_capacity` | **must be `0`** | `replay_learn` rejects continuous transitions → buffer would be write-only |
 | `replay_recent_capacity` | **must be `0`** | same reason |
 | `entropy_coeff` | any value **allowed but inert** | fixed-σ Gaussian ⇒ entropy gradient is constant; no effect, not rejected |
 
-So a first continuous run uses **TD(0) only, no replay, no distillation, no
-GAE/TD(n)**. (These are tracked for v4.x.) The two experiment specs already set
-all of the above correctly.
+Continuous mode uses a **constant learning rate** — the surprise→LR modulation
+(M1) is bypassed for continuous policy learning. No replay, no distillation, no
+TD(n). The two experiment specs already set all of the above correctly.
 
 ---
 
-## 6. Action scaling & clamping (your responsibility)
+## 6. Action scaling (affine map — no clamp needed)
 
-The library returns the *raw* sampled action. Map it to the environment's
-physical range yourself. For Pendulum (`output_size = 1`, `output_activation =
-Tanh`, torque range `[−2, 2]`):
+`step_continuous` and `act_continuous` return tanh-squashed actions in
+`[−1, 1]`. Map affinely to the environment's physical range. For Pendulum
+(`output_size = 1`, torque range `[−2, 2]`):
 
 ```rust
-let raw = agent.step_continuous(&state, last_reward, done)?;   // μ + σ·ε
-let torque = (raw[0] * 2.0).clamp(-2.0, 2.0);                  // [-1,1]·2 → clamp
+let action = agent.step_continuous(&state, last_reward, done)?;   // tanh(a_raw) ∈ [-1,1]
+let torque = action[0] * 2.0;                                      // [-1,1] → [-2,2]
 let (next_state, reward, done) = env.step(torque);
 ```
 
-For an N-D action space, scale each component to its own range and clamp
-component-wise. Apply the **same** mapping in `act_continuous` evaluation.
+No clamp is required — tanh already bounds the output. For an N-D action
+space, scale each component to its own range with `action[i] * range_i`.
+Apply the **same** mapping in `act_continuous` evaluation.
 
 ---
 
@@ -299,13 +302,15 @@ the final API. When you implement, apply these fixes:
    no `Default` impl — use Path A (TOML+serde) or a full literal (§4).
 2. **Construction.** Use `PcActorCritic::new(CpuLinAlg::new(), cfg, seed)?`. The
    seed is the 3rd arg of `new`, not a separate setter.
-3. **`step_continuous` returns the sampled action**, not bounded — clamp it (§6).
+3. **`step_continuous` and `act_continuous` return tanh-squashed actions in
+   `[−1, 1]`** — no clamp needed. Use `Activation::Linear` for the actor
+   `output_activation` (NOT Tanh). Map affinely to the physical range (§6).
 4. **`critic.input_size = actor.input_size + Σ hidden sizes`** (the spec's
    `3 + 32` is right *because* its actor has one 32-unit layer; recompute if you
    change topology).
 5. Field/type names in §3–§5 of *this* guide are the authoritative spellings
    (`ActionSpace::Continuous`, `SelectionMode::Play`/`Training`, `LayerDef`,
-   `Activation::Tanh`, etc.).
+   `Activation::Linear`, etc.).
 
 ---
 
@@ -332,10 +337,11 @@ fn continuous_smoke() {
     for step in 0..200 {
         let state = vec![0.5_f64.cos(), 0.5_f64.sin(), 0.1]; // dummy 3-D obs
         let done = step == 199;
-        let raw = agent.step_continuous(&state, last_reward, done).unwrap();
-        assert_eq!(raw.len(), 1);
-        assert!(raw[0].is_finite(), "action must be finite");
-        let torque = (raw[0] * 2.0).clamp(-2.0, 2.0);
+        let action = agent.step_continuous(&state, last_reward, done).unwrap();
+        assert_eq!(action.len(), 1);
+        assert!(action[0].is_finite(), "action must be finite");
+        assert!((-1.0..=1.0).contains(&action[0]), "tanh-squashed action must be in [-1,1]");
+        let torque = action[0] * 2.0;  // affine map to [-2,2]; no clamp needed
         assert!((-2.0..=2.0).contains(&torque));
         last_reward = -0.1; // dummy
     }
@@ -362,17 +368,58 @@ If this passes, the API wiring is correct and you can build the real
 - **Works:** multi-seed mean reward (final 100 eps) ≥ 3× better than random
   (~−1500); ≥ 5/10 seeds reach > −400; no NaN/Inf/panics; reproducible under
   fixed seed; surprise score decreases over training.
-- **Reveals a v4.0.0 bug (report back to this repo):** all seeds stuck at
+- **Reveals a v4.1.0 bug (report back to this repo):** all seeds stuck at
   ~−1500 (gradient-sign/numerical issue); most seeds NaN; reward improves then
   catastrophically collapses. Include seed, `pc-rl-core` commit SHA, and the
   metrics CSV in the bug report.
 
 ---
 
+## 10. GRAD_CLIP / σ saturation and the Pendulum PASS bar
+
+The continuous-mode gradient update per output dimension is:
+
+```
+delta = td_error · (μ_raw − a_raw) / σ²  =  −td_error · ε / σ
+```
+
+With small `policy_sigma` (e.g. 0.1) and Pendulum-scale `td_error` values
+(which can be in the tens early in training), the per-element delta can
+routinely saturate `GRAD_CLIP = 5.0` — the global weight-update clip used
+across the crate. When most updates are at the clip boundary, the effective
+gradient direction is preserved but the magnitude is uniformly compressed,
+slowing learning.
+
+**If the in-library smoke tests pass but the Pendulum harness PASS bar (≥ 5/10
+seeds reach mean reward > −400) is missed**, the saturation levers are (in
+order of impact):
+
+1. **Raise `policy_sigma`** — smaller `1/σ²` factor reduces delta magnitude
+   directly. Try 0.3–0.5 before other changes.
+2. **Lower `lr_weights`** — dampens the weight step post-clip.
+3. **More episodes** — slower convergence is still convergence; budget
+   300–500 episodes before concluding non-convergence.
+4. **Center / normalize rewards before passing to `step_continuous`** — if
+   `td_error` magnitudes are chronically large, dividing rewards by a running
+   std-dev (e.g. over the last 100 episode sums) brings them into a range
+   where GRAD_CLIP rarely bites. This is a harness-side normalization; the
+   library itself does not normalize inputs.
+
+**Merge gate:** the in-library unit and integration tests (716 tests, including
+the continuous smoke and gradient-sign tests) are the merge gate for
+`pc-rl-core`. The Pendulum harness result is the **external validation** check
+and lives in a separate `PC-Pendulum` repository. Failing the Pendulum PASS bar
+does not block a library release but should be investigated before the result is
+cited as empirical evidence that the continuous mode works on real dynamics.
+
+---
+
 **TL;DR for the implementing agent:** add `pc-rl-core = "4"`; build a
-`PcActorCriticConfig` with `action_space = "Continuous"` and `policy_sigma > 0`
-(TOML+serde is easiest); `PcActorCritic::new(CpuLinAlg::new(), cfg, seed)?`;
-loop `step_continuous(&state, prev_reward, done)?` and **scale+clamp** the
-returned action; evaluate with `act_continuous(&state, SelectionMode::Play)?`;
-checkpoint with `save_agent`/`load_agent`. Keep replay/GAE/TD(n)/distillation
-off (rejected in continuous v4.0.0). Get §8 green first.
+`PcActorCriticConfig` with `action_space = "Continuous"`, `policy_sigma > 0`,
+`output_activation = "linear"`, and `gae_lambda = 0.95` (TOML+serde is
+easiest); `PcActorCritic::new(CpuLinAlg::new(), cfg, seed)?`; loop
+`step_continuous(&state, prev_reward, done)?` and **scale affinely** (e.g.
+`action[0] * 2.0`) — no clamp needed, the library returns tanh-squashed actions
+in `[−1, 1]`; evaluate with `act_continuous(&state, SelectionMode::Play)?`;
+checkpoint with `save_agent`/`load_agent`. Keep replay/TD(n)/distillation off.
+Get §8 green first.
