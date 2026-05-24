@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mlp_critic::MlpCriticConfig;
 use crate::pc_actor::PcActorConfig;
+use crate::q_critic::QCriticConfig;
 
 /// Tolerance for detecting the `-1.0` sentinel value in the replay
 /// floor fields (`scale_floor_replay`, `critic_floor_replay`) after
@@ -244,6 +245,25 @@ pub fn default_polyak_tau() -> f64 {
     0.005
 }
 
+/// Default SAC target entropy. `None` ⇒ the caller uses `−action_dim` as the
+/// heuristic (standard SAC). Pre-v6 JSON files omitting this field deserialize
+/// to `None` and behave as before (serde `Option` default).
+fn default_target_entropy() -> Option<f64> {
+    None
+}
+
+/// Default SAC temperature learning rate. Standard value used across the SAC
+/// literature; controls how quickly `log α` adapts to the entropy target.
+fn default_alpha_lr() -> f64 {
+    0.001
+}
+
+/// Default initial log temperature for SAC automatic temperature tuning.
+/// `α₀ = exp(0.0) = 1.0`; the auto-tuner adjusts from this starting point.
+fn default_log_alpha_init() -> f64 {
+    0.0
+}
+
 /// Default positive-reward-only filter flag for the replay buffer.
 fn default_replay_positive_only() -> bool {
     true
@@ -349,6 +369,10 @@ fn default_critic_floor_replay() -> f64 {
 ///     action_space: ActionSpace::Discrete,
 ///     policy_sigma: 0.1,
 ///     policy_entropy_coeff: 0.0,
+///     q_critic: None,
+///     target_entropy: None,
+///     log_alpha_init: 0.0,
+///     alpha_lr: 0.001,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,6 +663,28 @@ pub struct PcActorCriticConfig {
     /// range (≈0.05–0.5) over-regularize (`μ_raw` collapses toward 0); keep α small.
     #[serde(default = "default_policy_entropy_coeff")]
     pub policy_entropy_coeff: f64,
+    /// v6.0.0 — SAC action-value critic config. `Some` required when
+    /// `action_space == Continuous` and SAC is used; `None` (default) for
+    /// discrete mode and pre-v6 JSON files that omit this field.
+    #[serde(default)]
+    pub q_critic: Option<QCriticConfig>,
+    /// v6.0.0 — SAC target entropy H_target. `None` (default) signals
+    /// "use −action_dim" as the standard SAC heuristic. A finite value
+    /// overrides the heuristic. Pre-v6 JSON files omitting this field
+    /// deserialize to `None`.
+    #[serde(default = "default_target_entropy")]
+    pub target_entropy: Option<f64>,
+    /// v6.0.0 — initial log temperature for SAC automatic temperature tuning.
+    /// `α₀ = exp(log_alpha_init)`. Default `0.0` (α₀ = 1.0). Pre-v6 JSON
+    /// files omitting this field deserialize to `0.0` (no behavior change
+    /// when SAC is not used).
+    #[serde(default = "default_log_alpha_init")]
+    pub log_alpha_init: f64,
+    /// v6.0.0 — learning rate for the SAC temperature parameter `α`.
+    /// Controls how quickly `log α` adapts to the entropy target. Default
+    /// `0.001`. Pre-v6 JSON files omitting this field deserialize to `0.001`.
+    #[serde(default = "default_alpha_lr")]
+    pub alpha_lr: f64,
 }
 
 #[cfg(test)]
@@ -729,6 +775,10 @@ mod tests {
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
             policy_entropy_coeff: 0.0,
+            q_critic: None,
+            target_entropy: None,
+            log_alpha_init: 0.0,
+            alpha_lr: 0.001,
         }
     }
 

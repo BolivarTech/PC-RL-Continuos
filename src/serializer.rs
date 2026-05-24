@@ -543,6 +543,10 @@ mod tests {
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
             policy_entropy_coeff: 0.0,
+            q_critic: None,
+            target_entropy: None,
+            log_alpha_init: 0.0,
+            alpha_lr: 0.001,
         }
     }
 

@@ -53,6 +53,14 @@ mod control;
 /// to disable the cooldown entirely.
 pub const DEFAULT_ROLLBACK_HARD_COOLDOWN: u64 = 100;
 
+/// Minimum value for the actor's log standard deviation in learned-σ SAC mode
+/// (v6.0.0). Clamps `log σ` from below so `σ` never collapses to zero.
+pub const LOG_SIG_MIN: f64 = -5.0;
+
+/// Maximum value for the actor's log standard deviation in learned-σ SAC mode
+/// (v6.0.0). Clamps `log σ` from above so `σ` stays in a numerically safe range.
+pub const LOG_SIG_MAX: f64 = 2.0;
+
 /// Maximum magnitude of the TD error used for replay-phase critic/actor
 /// updates. Values outside `[-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR]`
 /// are clamped to the boundary (MAGI R5 W5). Exposed as `pub(crate)` so
@@ -4448,6 +4456,10 @@ mod tests {
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
             policy_entropy_coeff: 0.0,
+            q_critic: None,
+            target_entropy: None,
+            log_alpha_init: 0.0,
+            alpha_lr: 0.001,
         }
     }
 
@@ -4963,6 +4975,10 @@ mod tests {
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
             policy_entropy_coeff: 0.0,
+            q_critic: None,
+            target_entropy: None,
+            log_alpha_init: 0.0,
+            alpha_lr: 0.001,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -6222,6 +6238,10 @@ mod tests {
             action_space: ActionSpace::Discrete,
             policy_sigma: 0.1,
             policy_entropy_coeff: 0.0,
+            q_critic: None,
+            target_entropy: None,
+            log_alpha_init: 0.0,
+            alpha_lr: 0.001,
         }
     }
 
