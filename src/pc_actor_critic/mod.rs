@@ -15099,4 +15099,75 @@ mod tests {
             vec![0.0, 0.0, 0.0]
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Task 5 (v4.2.0): runtime mutability of policy_entropy_coeff (B6)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_continuous_entropy_coeff_is_read_per_step() {
+        // Verify that mutating `agent.config.policy_entropy_coeff` between
+        // steps takes effect on the very next learning step (B6).
+        //
+        // Design:
+        // • 1-input agent; bias += 3.0 (below WEIGHT_CLIP=5.0) so μ_raw ≈ 3
+        //   (tanh(μ_raw) ≈ 0.995).  The entropy restoring force at this
+        //   saturation point is near-maximum (≈ 2α).
+        // • policy_sigma = 1.0: keeps the score-function gradient within
+        //   GRAD_CLIP so the entropy additive term is not erased by clipping.
+        // • Both runs share seed 11 and are identical for steps 1-2
+        //   (α = 0.0 in both).  At step 3 the "bump" run sets α = 0.5; the
+        //   control stays at α = 0.0.  Steps 3-6 use a moderate positive
+        //   reward (1.0) so the entropy restoring force is relevant.
+        // • With positive μ_raw the entropy delta (+2α·tanh(a_raw) > 0)
+        //   causes the weight update (θ ← θ − lr·delta) to pull μ_raw DOWN.
+        //   The control (no entropy) is not subject to this pull, so after
+        //   the bump the control's μ_raw ends strictly higher.
+        // • Assertion: mu_bump < mu_control (entropy proved to be read
+        //   per-step, not cached at construction time).
+        fn run(mutate_alpha_at_step_3: bool) -> f64 {
+            let mut c = continuous_base_config();
+            c.actor.input_size = 1;
+            c.actor.hidden_layers = vec![LayerDef {
+                size: 4,
+                activation: Activation::Tanh,
+            }];
+            c.critic.input_size = 1 + 4;
+            // Large sigma keeps the score-function gradient within GRAD_CLIP
+            // so the entropy contribution is additive and not erased.
+            c.policy_sigma = 1.0;
+            c.policy_entropy_coeff = 0.0;
+            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 11).unwrap();
+            let last = a.actor.layers.len() - 1;
+            // Moderate bias bump: μ_raw ≈ 3, well below WEIGHT_CLIP (5.0).
+            // Keeps the entropy restoring force near-maximum while avoiding
+            // the WEIGHT_CLIP pitfall that erases the entropy difference.
+            for b in a.actor.layers[last].bias.iter_mut() {
+                *b += 3.0;
+            }
+            // Steps 1-2: identical in both runs (α = 0.0).
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            // Mid-stream mutation at step 3.
+            if mutate_alpha_at_step_3 {
+                a.config.policy_entropy_coeff = 0.5;
+            }
+            // Steps 3-6: diverge only if entropy is read per-step.
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            a.act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
+                .unwrap()
+                .1
+                .y_conv[0]
+        }
+        let mu_bump = run(true);
+        let mu_control = run(false);
+        assert!(
+            mu_bump < mu_control,
+            "mid-stream α=0.5 must pull μ_raw down vs α=0 control: \
+             mu_bump={mu_bump:.6} must be < mu_control={mu_control:.6}"
+        );
+    }
 }
