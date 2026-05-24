@@ -14986,22 +14986,27 @@ mod tests {
 
     #[test]
     fn test_continuous_entropy_survives_saturated_trace() {
-        // Verify that entropy's restoring force is additive on top of the
-        // GAE trace contribution, producing a measurably larger downward drift
-        // in μ_raw compared to α = 0. The "saturated trace" aspect is that
-        // the trace has been accumulated over multiple steps and the combined
-        // delta (trace + entropy) still fits within layer.backward's GRAD_CLIP,
-        // so both terms contribute: drift(α > 0) > drift(α = 0).
+        // C4 regression: layer.backward clips grad=delta*deriv to ±GRAD_CLIP=5.0.
+        // For a Linear output layer deriv=1, so the clip applies directly to
+        // delta. When the advantage part (td_error * GAE-trace) already saturates
+        // ±GRAD_CLIP, the entropy term (≤2α) appended afterward is erased by the
+        // clip — the restoring force disappears exactly in the saturated regime.
         //
-        // Design constraints:
-        // • policy_sigma = 1.0: score-function gradient ≈ −eps (bounded), so
-        //   the trace accumulation stays well below GRAD_CLIP = 5.0 over two
-        //   steps, leaving room for entropy to add its contribution.
-        // • bias += 3.5 (below WEIGHT_CLIP = 5.0): backward clip does not fire.
-        // • reward = 1.0 (moderate): td_error ≈ 1.0 so that td_error * trace
-        //   stays within GRAD_CLIP and entropy remains additively effective.
-        //   (A very large reward would push the combined delta past GRAD_CLIP
-        //   for both α = 0 and α = 0.3, erasing the entropy difference.)
+        // This test reproduces the saturation condition and asserts that entropy
+        // still produces a measurably larger downward drift than α=0 after the
+        // fix (GRAD_CLIP headroom reserved before the entropy add).
+        //
+        // Design:
+        // • bias += 3.0 (below WEIGHT_CLIP=5.0): actor output μ_raw starts at ≈3
+        //   so tanh(μ_raw) ≈ 0.995 — squash boundary, entropy term near maximum.
+        // • policy_sigma = 0.3: score-function gradient g = (μ_raw − a_raw)/σ²
+        //   is large (σ small), so the GAE trace quickly reaches GRAD_CLIP=5.0.
+        // • reward = 50.0: td_error >> 1 → td_error * trace >> GRAD_CLIP,
+        //   ensuring the advantage delta saturates layer.backward's clip.
+        // • Two steps: step 1 accumulates the trace; step 2 fires the large
+        //   td_error. On current code (no headroom reserved) the clip erases the
+        //   entropy, so drift(0.3) ≈ drift(0.0) and the assertion fails (Red).
+        //   After the fix (headroom reserved) drift(0.3) > drift(0.0) (Green).
         fn drift(alpha: f64) -> f64 {
             let mut c = continuous_base_config();
             c.actor.input_size = 1;
@@ -15012,23 +15017,25 @@ mod tests {
             c.critic.input_size = 1 + 4;
             c.gae_lambda = Some(0.95);
             c.policy_entropy_coeff = alpha;
-            // Large sigma keeps score-function delta well within GRAD_CLIP
-            // so entropy's additive contribution is not erased by the clip.
-            c.policy_sigma = 1.0;
+            // Small sigma → large score-function gradient → trace saturates GRAD_CLIP.
+            c.policy_sigma = 0.3;
             let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 5).unwrap();
             let last = a.actor.layers.len() - 1;
-            // bias += 3.5 keeps total bias below WEIGHT_CLIP so the backward
-            // clip does not fire and entropy's contribution is observable.
+            // Bias into saturation band: μ_raw ≈ 3 → tanh(μ_raw) ≈ 0.995.
+            // Entropy delta ≈ 2α*0.995 ≈ 0.597 for α=0.3 — near maximum.
             for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 3.5;
+                *b += 3.0;
             }
             let before = a
                 .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
                 .unwrap()
                 .1
                 .y_conv[0];
+            // Step 1: zero reward — accumulate GAE trace without firing a large update.
             let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
+            // Step 2: large reward → td_error >> 1 → td_error*trace >> GRAD_CLIP.
+            // On current code this saturates layer.backward's clip and erases entropy.
+            let _ = a.step_continuous(&[0.5], 50.0, false).unwrap();
             let after = a
                 .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
                 .unwrap()
@@ -15036,11 +15043,12 @@ mod tests {
                 .y_conv[0];
             before - after
         }
+        let d0 = drift(0.0);
+        let d3 = drift(0.3);
         assert!(
-            drift(0.3) > drift(0.0),
-            "entropy must add restoring force on top of GAE trace: α>0 drift {} must exceed α=0 drift {}",
-            drift(0.3),
-            drift(0.0)
+            d3 > d0 + 1e-6,
+            "entropy (α=0.3) must survive GRAD_CLIP saturation and add measurable \
+             downward drift: α=0.3 drift={d3:.6} must exceed α=0 drift={d0:.6} by >1e-6"
         );
     }
 
