@@ -2284,10 +2284,12 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // exceeds ±GRAD_CLIP, and layer.backward clips grad=delta·deriv to
                 // ±GRAD_CLIP — which would erase the small entropy term. Reserve
                 // headroom: clip the advantage to ±(GRAD_CLIP − 2α) FIRST, then add
-                // the entropy (|entropy_j| ≤ 2α), so |delta_j| ≤ GRAD_CLIP and the
-                // Linear-output grad is not truncated. α = 0 ⇒ headroom = GRAD_CLIP
-                // and entropy = 0 → advantage clamped to ±GRAD_CLIP, identical to
-                // v4.1.0 (layer.backward, deriv=1, would clamp to the same value).
+                // the entropy (|entropy_j| ≤ 2α). For the operational α range
+                // (0.05–0.5, i.e. α ≤ GRAD_CLIP·0.45 ≈ 2.25), GRAD_CLIP − 2α > 0
+                // and |delta_j| ≤ GRAD_CLIP. For α > 2.25 (outside documented range)
+                // the .max(GRAD_CLIP·0.1) floor keeps the headroom non-zero but the
+                // combined delta may exceed GRAD_CLIP — an unrealistic regime.
+                // α = 0 ⇒ headroom = GRAD_CLIP, entropy = 0 → identical to v4.1.0.
                 let alpha = self.config.policy_entropy_coeff;
                 let entropy = squashed_entropy_delta(alpha, a_taken);
                 let headroom =
