@@ -14517,6 +14517,32 @@ mod tests {
         assert!(squashed_log_prob(&mu, &log_sigma, &a_raw).is_finite());
     }
 
+    // ── T9: Automatic temperature α tests ────────────────────────────
+
+    #[test]
+    fn test_alpha_increases_when_entropy_below_target() {
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let before = agent.alpha_for_test();
+        agent.sac_temperature_update(5.0); // logp_mean=5 → entropy=−5 < H_target(−1) → α rises
+        assert!(agent.alpha_for_test() > before, "alpha should rise when entropy below target");
+    }
+
+    #[test]
+    fn test_alpha_decreases_when_entropy_above_target() {
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let before = agent.alpha_for_test();
+        agent.sac_temperature_update(-5.0); // logp_mean=−5 → entropy=5 > H_target(−1) → α falls
+        assert!(agent.alpha_for_test() < before, "alpha should fall when entropy above target");
+    }
+
+    #[test]
+    fn test_alpha_stays_positive_and_finite() {
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        for _ in 0..1000 { agent.sac_temperature_update(100.0); }
+        let a = agent.alpha_for_test();
+        assert!(a.is_finite() && a > 0.0, "alpha must stay finite and positive, got {a}");
+    }
+
     // ── T8: Twin Q critics + Polyak target tests ──────────────────────
 
     #[test]
