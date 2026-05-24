@@ -338,6 +338,11 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// Polyak-averaged soft target copy of `q2` (v6.0.0). See [`Self::q1_target`].
     #[allow(dead_code)] // wired in T10-T13
     pub(crate) q2_target: Option<crate::q_critic::QCritic<L>>,
+    /// Monotonic counter of SAC critic update steps skipped due to non-finite
+    /// intermediate values (non-finite actions, log-prob, Q-values, or Bellman
+    /// target). Each skipped transition increments this by one; the counter
+    /// never resets. Exposed for diagnostics.
+    pub(crate) sac_skipped_critic_updates: u64,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -1689,6 +1694,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q2,
             q1_target,
             q2_target,
+            sac_skipped_critic_updates: 0,
         })
     }
 
@@ -1817,6 +1823,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q2: None,
             q1_target: None,
             q2_target: None,
+            sac_skipped_critic_updates: 0,
         })
     }
 
@@ -1880,6 +1887,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q2: None,
             q1_target: None,
             q2_target: None,
+            sac_skipped_critic_updates: 0,
         }
     }
 
@@ -4707,6 +4715,32 @@ impl<L: LinAlg> PcActorCritic<L> {
             .as_ref()
             .expect("q1_target_probe: q1_target must be Some")
             .forward(state, action)
+    }
+
+    // ── T10 test shims ────────────────────────────────────────────────────────
+
+    /// Forward the LIVE Q-critic `q1` at `(state, action)` (test helper only).
+    ///
+    /// Returns the scalar Q-value from the live (trainable) critic.
+    /// Panics when `q1` is absent.
+    #[cfg(test)]
+    pub(crate) fn q1_for_test(&self, state: &[f64], action: &[f64]) -> f64 {
+        self.q1
+            .as_ref()
+            .expect("q1_for_test: q1 must be Some")
+            .forward(state, action)
+    }
+
+    /// Compute the soft-Bellman target `y` for a single transition (test helper only).
+    ///
+    /// Delegates to `sac_bellman_target` and returns `f64::NAN` when the
+    /// transition is skipped (non-finite intermediate values).
+    #[cfg(test)]
+    pub(crate) fn sac_bellman_target_for_test(
+        &mut self,
+        t: &crate::pc_actor_critic::replay::ReplayTransition,
+    ) -> f64 {
+        self.sac_bellman_target(t).unwrap_or(f64::NAN)
     }
 }
 
@@ -14604,6 +14638,62 @@ mod tests {
         assert!(
             (after - before).abs() > 1e-9,
             "target must move toward live after polyak; before={before}, after={after}"
+        );
+    }
+
+    // ── T10: SAC soft-Bellman critic update ───────────────────────────────────
+
+    #[test]
+    fn test_sac_critic_target_is_finite_single_transition() {
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
+                .unwrap();
+        let t = crate::pc_actor_critic::replay::ReplayTransition {
+            state: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            action: crate::pc_actor_critic::replay::Action::Continuous(vec![0.4]),
+            reward: 1.0,
+            next_state: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            done: false,
+            valid_actions: None,
+        };
+        let y = agent.sac_bellman_target_for_test(&t);
+        assert!(y.is_finite(), "Bellman target must be finite, got {y}");
+    }
+
+    #[test]
+    #[ignore = "slow learning guard (B2)"]
+    fn test_sac_critic_learns_to_rank_actions() {
+        // On a trivial 1-state task with reward = -(tanh(a_raw) - 0.7)^2 stored
+        // in transitions, after many sac_critic_update calls the trained Q must
+        // rank a=0.7 above a=-0.7.
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 7)
+                .unwrap();
+        let s = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let make = |a_raw: f64, r: f64| crate::pc_actor_critic::replay::ReplayTransition {
+            state: s.clone(),
+            action: crate::pc_actor_critic::replay::Action::Continuous(vec![a_raw]),
+            reward: r,
+            next_state: s.clone(),
+            done: true,
+            valid_actions: None,
+        };
+        // Build a batch covering a range of actions with reward = -(tanh(a_raw) - 0.7)^2.
+        let batch: Vec<_> = (0..64)
+            .map(|i| {
+                let a_raw = -3.0 + (i as f64) * (6.0 / 63.0);
+                let r = -((a_raw.tanh() - 0.7).powi(2));
+                make(a_raw, r)
+            })
+            .collect();
+        for _ in 0..300 {
+            agent.sac_critic_update(&batch);
+        }
+        let q_good = agent.q1_for_test(&s, &[0.7]);
+        let q_bad = agent.q1_for_test(&s, &[-0.7]);
+        assert!(
+            q_good > q_bad,
+            "Q should rank good action above bad: {q_good} vs {q_bad}"
         );
     }
 }
