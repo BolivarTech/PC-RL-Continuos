@@ -642,6 +642,24 @@ impl<L: LinAlg> PcActorCritic<L> {
         (actor_decay_factors, critic_decay_factors, layer_error_ema)
     }
 
+    /// Returns the effective `positive_only` flag for the replay buffer.
+    ///
+    /// Continuous SAC must retain ALL transitions regardless of reward sign
+    /// (Pendulum-v1 rewards are always ≤ 0; a positive-only filter would leave the
+    /// buffer permanently empty and block learning).  Forces `false` for
+    /// `ActionSpace::Continuous`; honours `config.replay_positive_only` unchanged
+    /// for discrete agents.
+    ///
+    /// Shared by `new()` and `apply_config()` so the override is guaranteed in
+    /// both construction paths.
+    fn effective_positive_only(config: &PcActorCriticConfig) -> bool {
+        if config.action_space == ActionSpace::Continuous {
+            false
+        } else {
+            config.replay_positive_only
+        }
+    }
+
     /// Builds an optional `HysteresisState` from config parameters.
     ///
     /// Returns `Some(fresh Plastic state)` when enabled, `None` when disabled.
@@ -980,7 +998,12 @@ impl<L: LinAlg> PcActorCritic<L> {
         // If the batch is larger than the buffer it can never be filled → silent
         // no-learning.  Reject early so the misconfiguration is surfaced at
         // construction rather than discovered at the first sac_learn_step call.
-        if config.replay_training_capacity > 0
+        //
+        // Scoped to continuous SAC only: discrete replay semantics differ
+        // (the buffer is optional, and discrete agents with batch > capacity
+        // are valid pre-v6 configurations that must remain constructable).
+        if config.action_space == ActionSpace::Continuous
+            && config.replay_training_capacity > 0
             && config.replay_batch_size > config.replay_training_capacity
         {
             return Err(PcError::ConfigValidation(format!(
@@ -994,6 +1017,20 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // v6.0.0 — canonical SAC continuous-mode rules (replaces v4/v5 on-policy rules).
         if config.action_space == ActionSpace::Continuous {
+            // Hysteresis machinery is bypassed entirely in the SAC continuous
+            // learning path; enabling it would silently do nothing and mislead
+            // the caller.  Reject early so the misconfiguration is surfaced at
+            // construction rather than discovered as a no-op at runtime.
+            if config.actor_hysteresis || config.critic_hysteresis {
+                return Err(PcError::ConfigValidation(
+                    "actor_hysteresis/critic_hysteresis are not supported in continuous SAC \
+                     mode (v6.0.0); the SAC learning path bypasses hysteresis machinery. \
+                     Set actor_hysteresis=false and critic_hysteresis=false, or use \
+                     ActionSpace::Discrete."
+                        .to_string(),
+                ));
+            }
+
             // policy_sigma is IGNORED by SAC (σ is learned from the dual-head actor)
             // but the field must remain finite to pass the general f64 check.
             if !config.policy_sigma.is_finite() {
@@ -1546,27 +1583,36 @@ impl<L: LinAlg> PcActorCritic<L> {
         //       the only safe path — changing capacity mid-flight
         //       would leak FIFO ordering semantics between old and
         //       new sizes.
+        //
+        // NOTE: use `effective_positive_only` (same override as `new()`) so that
+        // a continuous SAC agent rebuilt via apply_config never re-introduces the
+        // positive_only=true filter that would discard all Pendulum-v1 transitions.
         let old_training_cap = self.config.replay_training_capacity;
         let new_training_cap = config.replay_training_capacity;
+        let effective_po = Self::effective_positive_only(&config);
         let replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer> =
             if old_training_cap == 0 && new_training_cap > 0 {
                 Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
                     config.replay_training_capacity,
                     config.replay_recent_capacity,
-                    config.replay_positive_only,
+                    effective_po,
                     config.action_space,
                 ))
             } else if old_training_cap > 0 && new_training_cap == 0 {
                 None
             } else if old_training_cap > 0 && new_training_cap > 0 {
+                // Compare against the effective flag (same override) so a
+                // continuous→continuous reconfigure with positive_only toggled
+                // still triggers a fresh buffer rather than silently preserving
+                // an old one with the wrong filter.
                 let capacities_changed = old_training_cap != new_training_cap
                     || self.config.replay_recent_capacity != config.replay_recent_capacity
-                    || self.config.replay_positive_only != config.replay_positive_only;
+                    || Self::effective_positive_only(&self.config) != effective_po;
                 if capacities_changed {
                     Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
                         config.replay_training_capacity,
                         config.replay_recent_capacity,
-                        config.replay_positive_only,
+                        effective_po,
                         config.action_space,
                     ))
                 } else {
@@ -1670,20 +1716,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         let new_trace_len = Self::gae_trace_len(&config);
         let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&config, &actor);
         let replay_buffer = if config.replay_training_capacity > 0 {
-            // SAC (continuous) is an off-policy algorithm and must retain ALL
-            // transitions regardless of sign — Pendulum-v1 rewards are always
-            // ≤ 0, so positive_only=true would leave the buffer permanently
-            // empty and prevent any learning.  Force false for continuous SAC;
-            // discrete agents honour config.replay_positive_only unchanged.
-            let positive_only = if config.action_space == ActionSpace::Continuous {
-                false
-            } else {
-                config.replay_positive_only
-            };
+            // Use `effective_positive_only` (shared with apply_config) so both
+            // construction paths apply the same SAC override: continuous SAC
+            // forces false regardless of config.replay_positive_only.
             Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
                 config.replay_training_capacity,
                 config.replay_recent_capacity,
-                positive_only,
+                Self::effective_positive_only(&config),
                 config.action_space,
             ))
         } else {
@@ -13572,6 +13611,102 @@ mod tests {
         );
     }
 
+    // ── Fix 1 (apply_config regression) ─────────────────────────────────
+
+    /// `apply_config` must preserve `positive_only=false` for continuous SAC
+    /// even when the new config has `replay_positive_only=true`.
+    ///
+    /// Regression guard: before the fix, apply_config rebuilt the buffer using
+    /// `config.replay_positive_only` directly, reintroducing the filter that
+    /// blocks all Pendulum-v1 transitions.
+    #[test]
+    fn test_apply_config_keeps_positive_only_false_for_continuous_sac() {
+        use crate::pc_actor_critic::replay::{Action, ReplayTransition};
+
+        let mut cfg = continuous_sac_config();
+        cfg.replay_training_capacity = 100;
+        cfg.replay_batch_size = 8;
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg.clone(), 42).unwrap();
+
+        // Call apply_config with a config that changes capacity AND has
+        // replay_positive_only=true — the regression would reintroduce the filter.
+        let mut new_cfg = cfg;
+        new_cfg.replay_training_capacity = 200; // capacity change triggers buffer rebuild
+        new_cfg.replay_positive_only = true; // would block negative transitions if not overridden
+        agent
+            .apply_config(new_cfg)
+            .expect("apply_config must succeed for a valid continuous SAC config");
+
+        // After apply_config the buffer must still accept negative-reward transitions.
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("SAC agent must have a replay buffer after apply_config");
+        buf.push(ReplayTransition {
+            state: vec![0.0; 9],
+            action: Action::Continuous(vec![0.5]),
+            reward: -1.5, // negative — blocked by positive_only=true, retained by false
+            next_state: vec![0.1; 9],
+            done: false,
+            valid_actions: None,
+        })
+        .expect("push must succeed for a non-full buffer");
+
+        assert_eq!(
+            buf.total_len(),
+            1,
+            "apply_config must keep positive_only=false for continuous SAC; \
+             the negative-reward transition was dropped (regression: \
+             apply_config reintroduced positive_only=true)"
+        );
+    }
+
+    // ── Fix 2 (hysteresis rejection) ────────────────────────────────────
+
+    /// Continuous SAC must reject `actor_hysteresis=true` at construction.
+    ///
+    /// Hysteresis is silently inert in the SAC learning path; allowing it
+    /// would mislead the caller into believing it has an effect.
+    #[test]
+    fn test_sac_rejects_hysteresis() {
+        let mut cfg = continuous_sac_config();
+        cfg.actor_hysteresis = true;
+        // actor_wake/sleep_fraction must pass their own validation first
+        cfg.actor_wake_fraction = 0.5;
+        cfg.actor_sleep_fraction = 0.3;
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(
+                result,
+                Err(PcError::ConfigValidation(ref m))
+                    if m.contains("actor_hysteresis") || m.contains("critic_hysteresis")
+            ),
+            "continuous SAC with actor_hysteresis=true must return ConfigValidation, \
+             got: {result:?}"
+        );
+    }
+
+    // ── Fix 4 (discrete batch-size guard) ───────────────────────────────
+
+    /// A DISCRETE config with `replay_batch_size > replay_training_capacity`
+    /// must still construct successfully — the batch-size guard is scoped to
+    /// continuous SAC only.
+    ///
+    /// Regression guard: before the fix, the guard applied to all modes and
+    /// would reject previously-valid discrete configurations.
+    #[test]
+    fn test_discrete_allows_batch_size_exceeding_capacity() {
+        let mut cfg = default_config();
+        cfg.replay_training_capacity = 10;
+        cfg.replay_batch_size = 20; // batch > capacity — valid for discrete (no SAC path)
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            result.is_ok(),
+            "discrete config with replay_batch_size > replay_training_capacity \
+             must construct OK (guard is continuous SAC only), got: {result:?}"
+        );
+    }
+
     // ── Test 4 ──────────────────────────────────────────────────────────
 
     #[test]
@@ -14823,7 +14958,10 @@ mod tests {
             .collect();
 
         // Train critics enough to capture the monotone Q(s,·) shape.
-        for _ in 0..400 {
+        // With Fix 3 (critic batch-averaging), each call applies lr/batch_len
+        // per transition.  Use more iterations so the effective critic signal
+        // is comparable to the pre-fix baseline (property: Q_high > Q_low).
+        for _ in 0..4000 {
             agent.sac_critic_update(&q_batch);
         }
 
@@ -14838,9 +14976,11 @@ mod tests {
         // ── Phase 2: run actor updates and assert μ_raw climbs ──
         let mu_before = agent.actor_mu_raw_for_test(&s)[0];
 
-        // Build a batch of actor-update transitions at the probe state,
-        // with a_raw values spread around the current μ + some noise.
-        let actor_batch: Vec<ReplayTransition> = (0..32)
+        // Use single-transition batches so each call applies a full-lr step
+        // (update_scaled(1/1) == update); property tests direction, not magnitude.
+        // 32× smaller effective lr per 32-item batch at 200 iters would not move
+        // μ_raw enough to satisfy the contrast threshold — single-sample is cleaner.
+        let actor_single_batch: Vec<ReplayTransition> = (0..32)
             .map(|i| {
                 let a_raw = -2.0 + (i as f64) * (4.0 / 31.0);
                 ReplayTransition {
@@ -14854,8 +14994,12 @@ mod tests {
             })
             .collect();
 
+        // 200 iterations × 32 single-sample calls per inner loop =
+        // 6400 full-lr actor gradient steps — matches the pre-fix baseline.
         for _ in 0..200 {
-            agent.sac_actor_update(&actor_batch);
+            for t in &actor_single_batch {
+                agent.sac_actor_update(std::slice::from_ref(t));
+            }
         }
 
         let mu_after = agent.actor_mu_raw_for_test(&s)[0];
