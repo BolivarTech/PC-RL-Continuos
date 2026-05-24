@@ -372,6 +372,56 @@ fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
     a_raw.iter().map(|&ar| 2.0 * alpha * ar.tanh()).collect()
 }
 
+/// Numerical-stability epsilon for the tanh-Jacobian log term near the squash boundary.
+///
+/// Added to `(1 − tanh²(a_raw))` before taking the logarithm so the Jacobian
+/// correction remains finite even when `|a_raw|` is very large (tanh ≈ ±1).
+/// Must equal `1e-6` — pinned by [`test_squashed_log_prob_matches_reference`].
+// wired in T10/T11
+#[allow(dead_code)]
+const SQUASH_JAC_EPS: f64 = 1e-6;
+
+/// Log-probability of the tanh-squashed diagonal Gaussian policy at `a = tanh(a_raw)`,
+/// with the tanh-Jacobian correction, for learned per-dimension `σ = exp(log_sigma)`.
+///
+/// ```text
+/// logπ(a|s) = Σ_j [ logN(a_raw_j; μ_j, σ_j²) − log(1 − tanh²(a_raw_j) + ε_stab) ]
+/// ```
+///
+/// where `logN(x; μ, σ²) = −0.5·((x−μ)/σ)² − log σ − 0.5·log(2π)`.
+///
+/// The `ε_stab = SQUASH_JAC_EPS` term prevents the Jacobian log from diverging to −∞
+/// at the squash boundary, keeping `logπ` finite for any finite `a_raw`.
+///
+/// Consumed by the SAC critic soft-Bellman target and the automatic-temperature
+/// update (T10/T11); added here as a pure free function so those tasks can call it
+/// without owning the full `PcActorCritic` context.
+///
+/// # Arguments
+///
+/// * `mu_raw` — unbounded policy mean, one value per action component.
+/// * `log_sigma` — log standard deviation (clamped to `[LOG_SIG_MIN, LOG_SIG_MAX]`
+///   before this call), one value per action component.
+/// * `a_raw` — pre-squash sample `μ_raw + σ·ε`, one value per action component.
+///
+/// # Returns
+///
+/// The scalar `logπ(a|s)` summed over all action components.
+// wired in T10/T11
+#[allow(dead_code)]
+fn squashed_log_prob(mu_raw: &[f64], log_sigma: &[f64], a_raw: &[f64]) -> f64 {
+    let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let mut lp = 0.0;
+    for j in 0..mu_raw.len() {
+        let s = log_sigma[j]; // log σ
+        let z = (a_raw[j] - mu_raw[j]) / s.exp();
+        lp += -0.5 * z * z - s - half_log_2pi;
+        let t = a_raw[j].tanh();
+        lp -= (1.0 - t * t + SQUASH_JAC_EPS).ln();
+    }
+    lp
+}
+
 /// Sample one standard-normal variate via Box–Muller (cosine half).
 ///
 /// Reuses the same sampling convention as the v4.1.0 `act_continuous` Training
