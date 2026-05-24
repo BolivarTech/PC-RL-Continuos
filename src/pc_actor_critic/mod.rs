@@ -1457,6 +1457,63 @@ impl<L: LinAlg> PcActorCritic<L> {
             )));
         }
 
+        // Q-critic topology: reject topology changes for continuous SAC agents.
+        // Rebuilding Q-critics from scratch would discard learned Q-weights and
+        // requires an RNG; rejecting is the safe minimal choice, consistent with
+        // how actor/critic topology changes are handled above.
+        // Transitioning from Some → None or None → Some changes the mode entirely;
+        // validate_config / SAC-mode checks in apply_config catch that independently.
+        if let (Some(cur_q), Some(new_q)) = (&self.config.q_critic, &config.q_critic) {
+            if cur_q.state_dim != new_q.state_dim {
+                return Err(PcError::ConfigValidation(format!(
+                    "apply_config cannot change q_critic topology for an existing SAC agent; \
+                     reconstruct via new(). \
+                     q_critic.state_dim mismatch: current {} vs new {}",
+                    cur_q.state_dim, new_q.state_dim
+                )));
+            }
+            if cur_q.action_dim != new_q.action_dim {
+                return Err(PcError::ConfigValidation(format!(
+                    "apply_config cannot change q_critic topology for an existing SAC agent; \
+                     reconstruct via new(). \
+                     q_critic.action_dim mismatch: current {} vs new {}",
+                    cur_q.action_dim, new_q.action_dim
+                )));
+            }
+            if cur_q.hidden_layers.len() != new_q.hidden_layers.len() {
+                return Err(PcError::ConfigValidation(format!(
+                    "apply_config cannot change q_critic topology for an existing SAC agent; \
+                     reconstruct via new(). \
+                     q_critic hidden layer count mismatch: current {} vs new {}",
+                    cur_q.hidden_layers.len(),
+                    new_q.hidden_layers.len()
+                )));
+            }
+            for (i, (cur_hl, new_hl)) in cur_q
+                .hidden_layers
+                .iter()
+                .zip(new_q.hidden_layers.iter())
+                .enumerate()
+            {
+                if cur_hl.size != new_hl.size {
+                    return Err(PcError::ConfigValidation(format!(
+                        "apply_config cannot change q_critic topology for an existing SAC agent; \
+                         reconstruct via new(). \
+                         q_critic hidden layer {} size mismatch: current {} vs new {}",
+                        i, cur_hl.size, new_hl.size
+                    )));
+                }
+                if cur_hl.activation != new_hl.activation {
+                    return Err(PcError::ConfigValidation(format!(
+                        "apply_config cannot change q_critic topology for an existing SAC agent; \
+                         reconstruct via new(). \
+                         q_critic hidden layer {} activation mismatch: current {:?} vs new {:?}",
+                        i, cur_hl.activation, new_hl.activation
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -15492,6 +15549,69 @@ mod tests {
             agent.sac_skipped_critic_updates(),
             0,
             "sac_skipped_critic_updates must be 0 on a fresh SAC agent"
+        );
+    }
+
+    // ── Fix 2: apply_config rejects q_critic topology change ─────────────
+
+    /// `apply_config` must return `Err(ConfigValidation)` when the new config
+    /// changes the Q-critic topology (state_dim or hidden layers) for an existing
+    /// continuous SAC agent. Learned Q-weights must not be silently discarded or
+    /// left mismatched.
+    ///
+    /// Note: `action_dim` changes also change `actor.output_size` (which equals
+    /// `2 * action_dim`), and that trips the actor topology mismatch guard in
+    /// `validate_topology_match` before the q_critic check; that path is correct
+    /// behavior but a different guard. This test targets `state_dim` and hidden
+    /// layer changes that reach the q_critic check directly.
+    #[test]
+    fn test_apply_config_rejects_q_critic_topology_change() {
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+
+        // 1. Change state_dim (does not affect actor or V-critic topology).
+        //    The q_critic state_dim check fires before any other topology guard.
+        let mut cfg_state_dim = continuous_sac_config();
+        cfg_state_dim.q_critic.as_mut().unwrap().state_dim = 5; // original is 9
+        let r = agent.apply_config(cfg_state_dim);
+        assert!(
+            matches!(&r, Err(PcError::ConfigValidation(m)) if m.contains("q_critic")),
+            "q_critic state_dim change must be rejected with q_critic error; got: {r:?}"
+        );
+
+        // 2. Change hidden layer count.
+        let mut cfg_hidden = continuous_sac_config();
+        cfg_hidden
+            .q_critic
+            .as_mut()
+            .unwrap()
+            .hidden_layers
+            .push(crate::layer::LayerDef {
+                size: 8,
+                activation: Activation::Tanh,
+            });
+        let r = agent.apply_config(cfg_hidden);
+        assert!(
+            matches!(&r, Err(PcError::ConfigValidation(m)) if m.contains("q_critic")),
+            "q_critic hidden layer count change must be rejected; got: {r:?}"
+        );
+
+        // 3. Change hidden layer size.
+        let mut cfg_hidden_size = continuous_sac_config();
+        cfg_hidden_size.q_critic.as_mut().unwrap().hidden_layers[0].size = 32;
+        let r = agent.apply_config(cfg_hidden_size);
+        assert!(
+            matches!(&r, Err(PcError::ConfigValidation(m)) if m.contains("q_critic")),
+            "q_critic hidden layer size change must be rejected; got: {r:?}"
+        );
+
+        // 4. Non-topology change (lr only) must be ACCEPTED.
+        let mut cfg_lr_only = continuous_sac_config();
+        cfg_lr_only.q_critic.as_mut().unwrap().lr = 0.0005;
+        let r = agent.apply_config(cfg_lr_only);
+        assert!(
+            r.is_ok(),
+            "q_critic lr-only change must be accepted by apply_config; got: {r:?}"
         );
     }
 }
