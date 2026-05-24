@@ -863,6 +863,26 @@ mod tests {
     }
 
     #[test]
+    fn test_target_entropy_default_is_none() {
+        let cfg = base_config();
+        assert!(cfg.target_entropy.is_none());
+        assert!(default_target_entropy().is_none());
+    }
+    #[test]
+    fn test_alpha_lr_default_is_001() {
+        assert!((default_alpha_lr() - 0.001).abs() < 1e-12);
+    }
+    #[test]
+    fn test_log_alpha_init_default_is_zero() {
+        assert!((default_log_alpha_init()).abs() < 1e-12);
+    }
+    #[test]
+    fn test_q_critic_default_is_none() {
+        let cfg = base_config();
+        assert!(cfg.q_critic.is_none());
+    }
+
+    #[test]
     fn test_policy_entropy_coeff_default_is_active() {
         // Default-on: the serde default helper returns a positive value so a
         // config file omitting the field gets the fix ACTIVE (decision A).
