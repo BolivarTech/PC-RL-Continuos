@@ -408,6 +408,22 @@ pub fn load_agent_generic<L: LinAlg>(
     // we reject it with ConfigValidation so the caller gets a clean Err, not a
     // panic or silently invalid agent.
     // For discrete mode (q_critic None): all four remain None; log_alpha stays 0.0.
+
+    // Guard: a truly pre-v6 continuous save has action_space=Continuous but
+    // no q_critic in config (the field did not exist before v6.0.0).  Without
+    // this check the SAC-restore block below is skipped, the agent loads with
+    // q1=None, and the first call to act_continuous panics.  Fail cleanly here
+    // so the caller receives Err instead of a later panic.
+    if save_file.config.action_space == crate::pc_actor_critic::ActionSpace::Continuous
+        && save_file.config.q_critic.is_none()
+    {
+        return Err(PcError::ConfigValidation(
+            "pre-v6 continuous save lacks q_critic config; cannot load as a v6 SAC agent. \
+             Re-train from scratch with v6.0.0 to obtain a compatible checkpoint."
+                .to_string(),
+        ));
+    }
+
     if save_file.config.q_critic.is_some() {
         let q_cfg = save_file.config.q_critic.clone().unwrap();
         let q1_w = save_file.q1_weights.ok_or_else(|| {
@@ -1829,6 +1845,7 @@ mod tests {
         // 1. Build a v4 agent with a small replay buffer.
         let mut cfg = default_config();
         cfg.replay_training_capacity = 4;
+        cfg.replay_batch_size = 4; // must not exceed replay_training_capacity (Fix 3)
         cfg.replay_recent_capacity = 0;
         cfg.replay_positive_only = true;
         cfg.adaptive_surprise = false;
@@ -2126,6 +2143,68 @@ mod tests {
             result.is_err(),
             "loading partial Q-weight save must return Err, not panic"
         );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A truly pre-v6 continuous save has `action_space == Continuous` but
+    /// NO `q_critic` in config (the field did not exist before v6.0.0).
+    /// Loading must return a clean `Err(PcError::ConfigValidation)` — not
+    /// panic or produce a silently invalid agent with `q1 = None`.
+    #[test]
+    fn test_pre_v6_continuous_save_without_qcritic_returns_clean_error() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::ActionSpace;
+
+        // Build a valid discrete agent (default_config uses Discrete), then
+        // mutate the serialized JSON to simulate a pre-v6 continuous save:
+        //   - set action_space to "Continuous"
+        //   - ensure q_critic is absent (it will be null from a discrete save)
+        // This is the exact schema that a v5.x continuous save would produce.
+        let agent = make_agent(); // Discrete, no q_critic
+        let path = temp_path("test_pre_v6_continuous_no_qcritic.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Mutate the saved JSON: flip action_space to Continuous, leave
+        // q_critic absent (null / missing).
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        json["config"]["action_space"] = serde_json::Value::String("Continuous".to_string());
+        // Confirm q_critic is null/missing (pre-v6 schema).
+        let q_critic_field = &json["config"]["q_critic"];
+        assert!(
+            q_critic_field.is_null() || q_critic_field.is_string(),
+            "precondition: q_critic must be absent or null for a pre-v6 continuous save"
+        );
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Verify preconditions: action_space is Continuous, q_critic is None.
+        let raw: SaveFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw.config.action_space,
+            ActionSpace::Continuous,
+            "precondition: action_space must be Continuous"
+        );
+        assert!(
+            raw.config.q_critic.is_none(),
+            "precondition: q_critic must be None (pre-v6 schema)"
+        );
+
+        // Must return Err(PcError::ConfigValidation), not panic.
+        let result = load_agent(&path, CpuLinAlg::new());
+        assert!(
+            result.is_err(),
+            "loading a pre-v6 continuous save without q_critic must return Err, not panic"
+        );
+        match result.unwrap_err() {
+            crate::error::PcError::ConfigValidation(msg) => {
+                assert!(
+                    msg.contains("pre-v6"),
+                    "error message should mention 'pre-v6', got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigValidation, got {other:?}"),
+        }
 
         let _ = fs::remove_file(&path);
     }
