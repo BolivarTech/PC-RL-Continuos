@@ -1,5 +1,83 @@
 # Changelog
 
+## [6.0.0] - 2026-05-24
+
+### Breaking
+
+- **Continuous mode is now canonical Soft Actor-Critic (SAC).** The v5.0.0
+  on-policy score-function continuous path (V-critic + GAE + fixed `policy_sigma`
+  + `policy_entropy_coeff` entropy regularizer) is **removed** for continuous mode.
+  `policy_sigma` is ignored in continuous SAC (σ is now learned). Discrete mode is
+  **bit-identical** to v5.0.0 (runtime behavior unchanged; the serialized JSON gains
+  new optional fields but the discrete learning path is untouched).
+
+- **New required config for continuous mode.** `q_critic: Some(QCriticConfig { .. })`
+  and `replay_training_capacity > 0` are now mandatory. Missing or invalid values
+  return `PcError::ConfigValidation` at construction. Previously valid continuous configs
+  (V-critic + fixed σ) are now rejected.
+
+- **Actor output doubles in continuous mode.** `output_size` must equal
+  `2 * action_dim`; the actor emits `μ_raw` and `log_σ_raw` side-by-side (first
+  `action_dim` outputs = μ, last = log σ). Single-head actors are rejected.
+
+- **Serialization format extended.** v6 save files add optional SAC fields
+  (`q1_weights`, `q2_weights`, `q1_target_weights`, `q2_target_weights`, `log_alpha`).
+  Pre-v6 **discrete** saves load without modification. Pre-v6 **continuous** saves
+  produce a descriptive `ConfigValidation` error (the old on-policy continuous path
+  is gone; re-train from scratch with v6.0.0).
+
+### Added
+
+- **`QCritic` / `QCriticConfig` / `QCriticWeights` / `QCriticCpu`** — action-value
+  critic `Q(s, a)` for SAC. Twin-critic architecture (Q1 + Q2) with Polyak-averaged
+  soft target networks (`polyak_tau` reused from the existing config field).
+
+- **`Layer::input_gradient`** — backpropagation to the input (∂L/∂input). Required
+  for the SAC actor pathwise update where the actor loss gradient must flow through
+  the Q-network back to the actor output.
+
+- **SAC actor: reparameterized squashed-Gaussian.** The actor emits μ and log σ and
+  samples actions via the reparameterization trick (`a = tanh(μ + σ·ε)`), enabling
+  pathwise gradients. Actions are squashed to (−1, 1); the tanh log-det Jacobian
+  correction is applied to the log-probability.
+
+- **Automatic entropy temperature (`log_alpha`, `alpha_lr`, `target_entropy`).**
+  `log_alpha` is a learnable scalar; its gradient is `−(log π(a|s) + H_target)`.
+  `target_entropy` defaults to `−action_dim` (standard SAC heuristic) when `None`.
+  `log_alpha_init` sets the initial temperature. All three are optional config fields;
+  `alpha_lr` defaults to the actor learning rate.
+
+- **Off-policy replay wiring.** SAC continuous mode uses `replay_training_capacity`
+  (must be `> 0`) as its experience replay buffer. Each SAC update samples a mini-batch
+  and runs the full twin-critic + actor + temperature update in a single `sac_learn_step`.
+
+### Changed
+
+- `policy_sigma` is **ignored** in continuous SAC mode (σ is learned). The field
+  remains in `PcActorCriticConfig` for API continuity (discrete is unaffected).
+
+- `policy_entropy_coeff` (v5.0.0 score-function entropy regularizer) is **ignored**
+  in continuous SAC mode. The field remains in the config struct for backward
+  compatibility; it has no effect on the SAC continuous path.
+
+### Notes
+
+- Deterministic-policy convergence on Pendulum-v1 is validated downstream by the
+  PC-Pendulum harness (B10, authoritative): `multi_seed` 10×500, deterministic eval
+  mean clears ≈ −500 with ≥ 5/10 seeds > −400. Reward and observation normalization
+  are enabled from the first B10 run (not a deferred lever). The library provides the
+  capability; the harness provides the convergence evidence.
+
+- **Escalation path if B10 misses**: the SAC reparameterization gradient (v6.0.0) is
+  the primary lever. No further in-library escalation is planned; out-of-scope levers
+  (multi-step off-policy returns, distributional critics) remain external.
+
+- **SemVer rationale:** removing the continuous on-policy path, adding required
+  config fields, and doubling the actor output size are breaking changes for
+  continuous-mode consumers; the major bump is mandatory per SemVer 2.0.0.
+  Discrete consumers are unaffected at runtime and only see new optional JSON fields
+  on load.
+
 ## [5.0.0] - 2026-05-23
 
 ### Breaking
