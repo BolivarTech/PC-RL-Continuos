@@ -353,6 +353,25 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     #[test]
+    fn test_action_gradient_matches_finite_difference() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let cfg = QCriticConfig { state_dim: 2, action_dim: 2,
+            hidden_layers: vec![LayerDef { size: 12, activation: Activation::Tanh }], lr: 0.0 };
+        let q: QCritic = QCritic::new(CpuLinAlg::new(), cfg, &mut rng).unwrap();
+        let s = [0.3, -0.4]; let a = [0.2, -0.1];
+        let grad = q.action_gradient(&s, &a);
+        assert_eq!(grad.len(), 2);
+        let h = 1e-6;
+        for j in 0..2 {
+            let mut ap = a; let mut am = a;
+            ap[j] += h; am[j] -= h;
+            let num = (q.forward(&s, &ap) - q.forward(&s, &am)) / (2.0 * h);
+            assert!((grad[j] - num).abs() < 1e-4,
+                "∇_a Q[{j}] = {} vs finite-diff {num}", grad[j]);
+        }
+    }
+
+    #[test]
     fn test_qcritic_forward_finite_scalar() {
         let mut rng = StdRng::seed_from_u64(42);
         let cfg = QCriticConfig {
