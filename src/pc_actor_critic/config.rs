@@ -93,7 +93,7 @@ fn default_entropy_coeff() -> f64 {
 /// margin (tuned in Task 6; starting point 0.1, search range 0.05–0.5).
 /// `α = 0` reproduces v4.1.0 continuous behavior exactly. Distinct from the
 /// DISCRETE `entropy_coeff` (different estimator); see that field's doc.
-fn default_policy_entropy_coeff() -> f64 {
+pub(crate) fn default_policy_entropy_coeff() -> f64 {
     0.1
 }
 
@@ -635,6 +635,8 @@ pub struct PcActorCriticConfig {
     /// `μ_raw` at the squash boundary (closes H-A). Read on every learning
     /// step and runtime-mutable like `policy_sigma`; annealing is caller-side.
     /// Must be `>= 0.0 && finite`. Default-on (`> 0`); `0.0` = v4.1.0 behavior.
+    /// There is no upper bound enforced — values far outside the operational
+    /// range (≈0.05–0.5) over-regularize (`μ_raw` collapses toward 0); keep α small.
     #[serde(default = "default_policy_entropy_coeff")]
     pub policy_entropy_coeff: f64,
 }

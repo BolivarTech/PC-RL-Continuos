@@ -14625,7 +14625,7 @@ mod tests {
             }
             peak
         }
-        let a_def = default_config().policy_entropy_coeff.max(0.1);
+        let a_def = crate::pc_actor_critic::config::default_policy_entropy_coeff();
         let mut ok = 0;
         for seed in [42u64, 43, 44] {
             let with = max_abs_mu(a_def, seed);
@@ -14654,7 +14654,7 @@ mod tests {
         // over-regularize and degrade the v4.1.0 stochastic path. Reuses the same
         // train_regulation helper as the v4.1.0 immediate-credit smoke test (D4),
         // only changing α from 0.0 to the default.
-        let alpha = default_config().policy_entropy_coeff.max(0.1);
+        let alpha = crate::pc_actor_critic::config::default_policy_entropy_coeff();
         let mut wins = 0;
         for seed in [42u64, 43, 44, 45, 46] {
             let (m_neg, m_pos) = train_regulation(None, false, seed, 2500, alpha);
