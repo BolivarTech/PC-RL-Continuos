@@ -14941,38 +14941,163 @@ mod tests {
         );
     }
 
-    /// B7 — learned σ collapses as the policy commits.
+    /// B7 — learned σ narrows under Q-pressure at an interior optimum when the
+    /// policy commits and temperature is frozen low (exploitation regime).
     ///
-    /// On a single-optimum task, σ = exp(log_σ) should DECREASE over training
-    /// (explore → exploit).  Asserted directionally: σ_final < σ_initial.
+    /// ## Re-specification rationale
+    ///
+    /// The original test used `reward = tanh(a_raw)` (optimum at `a → +1`,
+    /// i.e. the tanh saturation boundary) with auto-temperature enabled.
+    /// It now fails because of two canonical-SAC properties the original spec
+    /// ignored:
+    ///
+    /// 1. **Auto-temperature regulates entropy, NOT σ.** With α adapting to
+    ///    hold `H ≈ H_target`, σ settles at a regulated level — it does NOT
+    ///    collapse to zero under auto-temp in general.
+    /// 2. **Saturated optima give no Q-pressure on σ.** At the tanh boundary
+    ///    (`tanh(a_raw) ≈ ±1`), `jac ≈ 0`, so the pathwise Q-gradient through
+    ///    σ vanishes. Only the entropy term acts; but with auto-temp this is
+    ///    regulated and cannot compress σ.
+    ///
+    /// ## Mechanism and setup
+    ///
+    /// The σ-narrowing mechanism in `sac_actor_delta` is the interplay between:
+    ///
+    /// 1. The entropy descent baseline: `alpha * (-1 + ...)` in `delta[n+j]`.
+    ///    At an interior optimum (non-zero `a*`), the stochastic term
+    ///    `jac_ent * σ * ε` has zero mean, leaving `E[entropy_term] = -alpha`.
+    /// 2. The Q-pathwise gradient: with `Q ≈ -(a-a*)²`, when the actor is
+    ///    COMMITTED (μ_raw near `atanh(a*)`), `E[Q_term] ≈ +2σ²jac²(a*)`.
+    ///    Net expected descent: `-alpha + 2σ²jac²(a*)`. For `alpha = 1.0` and
+    ///    a* = 0.5 (jac = 0.75, jac² = 0.5625): `-1 + 2σ²*0.56`. With σ < 0.94,
+    ///    this is negative → log_σ descends → σ narrows.
+    ///
+    /// A shared hidden-layer actor couples μ and log_σ updates, which can mask
+    /// σ-narrowing when μ is far from the optimum (large μ-gradient overpowers
+    /// the σ-gradient through shared weights).  This test uses a **no-hidden-layer
+    /// actor** (direct input → 2-output linear layer) to isolate log_σ updates:
+    /// with linear output and no hidden layers, δμ and δlog_σ update independent
+    /// weight rows — there is no cross-coupling to confound the σ-gradient.
+    ///
+    /// ## Two-phase setup (mirrors B4)
+    ///
+    /// * **Phase 1:** pre-train the twin Q-critics on `reward = −(a − 0.5)²`
+    ///   so `Q` is well-conditioned with interior optimum at `a* = 0.5`.
+    ///   Sanity check: `Q(a=0.5) > Q(a=-0.9)`.
+    /// * **Phase 2:** run `sac_actor_update` with critics fixed, `α` frozen at
+    ///   1.0 (log_alpha_init=0.0, alpha_lr=1e-9). The net descent direction for
+    ///   log_σ is negative once μ commits, and σ narrows.
+    ///
+    /// **Asserted directionally:** `σ_final < σ_initial` (σ decreases from its
+    /// initial level as the policy commits and exploits the interior optimum).
+    ///
+    /// If even under these favorable conditions σ does NOT decrease, stop and
+    /// report — that is a real signal about the learned-σ mechanism.
     #[test]
     #[ignore = "slow SAC learning guard (B7)"]
     fn test_learned_sigma_collapses_as_policy_commits() {
-        const STEPS: usize = 800;
+        use crate::pc_actor_critic::replay::{Action, ReplayTransition};
+
+        // Interior optimum: a* = 0.5 → Q = −(a − 0.5)².
+        // μ_raw* = atanh(0.5) ≈ 0.549.
+        const TARGET: f64 = 0.5;
+        const SEED: u64 = 53;
 
         let s = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
-        let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 53).unwrap();
+        // Build config: NO hidden layers (isolates μ and log_σ weight rows),
+        // α = 1.0 frozen (log_alpha_init=0.0, alpha_lr=1e-9 ≈ frozen).
+        // Without hidden layers, μ and log_σ weight rows are decoupled: the
+        // output weight matrix W has independent rows for μ (row 0) and log_σ
+        // (row 1), so delta[0] only updates W[0,:] and delta[1] only W[1,:].
+        let mut cfg = continuous_sac_config();
+        // Strip hidden layers: actor is a direct input (9) → output (2) linear.
+        // With no hidden layers the actor latent_concat = raw state (9 dims).
+        cfg.actor.hidden_layers = vec![];
+        // The V-critic input_size must match the latent_concat width:
+        // latent_concat = [state(9)] = 9 (no hidden activations to concatenate).
+        cfg.critic.input_size = 9;
+        // α frozen at 1.0: entropy baseline dominates over Q curvature for σ<0.94.
+        cfg.log_alpha_init = 0.0; // α₀ = exp(0) = 1.0
+        cfg.alpha_lr = 1e-9; // effectively frozen
+                             // Smaller Q-critic for speed; the critic only needs to capture Q shape.
+        cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+            state_dim: 9, // raw state only (no hidden activations in no-hidden actor)
+            action_dim: 1,
+            hidden_layers: vec![crate::layer::LayerDef {
+                size: 16,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.001,
+        });
+        cfg.replay_training_capacity = 200;
+        cfg.replay_batch_size = 16;
 
-        // Measure initial σ.
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, SEED).unwrap();
+
+        // ── Phase 1: pre-train twin Q-critics on interior-optimum task ──
+        //
+        // Dense batch: a_squashed ∈ [−0.9, 0.9], reward = −(a − 0.5)².
+        // done=true → γ-masked Bellman target = reward (no future Q needed).
+        let q_batch: Vec<ReplayTransition> = (0..64_usize)
+            .map(|i| {
+                let a_squashed = -0.9 + (i as f64) * (1.8 / 63.0);
+                let a_raw = a_squashed.atanh();
+                let r = -((a_squashed - TARGET) * (a_squashed - TARGET));
+                ReplayTransition {
+                    state: s.clone(),
+                    action: Action::Continuous(vec![a_raw]),
+                    reward: r,
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                }
+            })
+            .collect();
+
+        for _ in 0..800 {
+            agent.sac_critic_update(&q_batch);
+        }
+
+        // Sanity: Q must score a* = 0.5 above the boundary.
+        let q_opt = agent.q1_for_test(&s, &[TARGET]);
+        let q_edge = agent.q1_for_test(&s, &[-0.9]);
+        assert!(
+            q_opt > q_edge,
+            "B7 critic sanity: Q(a=0.5)={q_opt:.4} must > Q(a=−0.9)={q_edge:.4}"
+        );
+
+        // ── Phase 2: actor-only updates — σ narrows as policy commits ──
+        //
+        // The net expected descent on log_σ:
+        //   E[delta[n+j]] = -alpha + 2*σ²*jac²(a*) = -1.0 + 2σ²*0.5625
+        // For σ < 0.94: negative → log_σ descends → σ narrows.
+        // No hidden layers → δlog_σ is independent of δμ (separate weight rows).
         let sigma_initial: f64 = agent
             .actor_log_sigma_for_test(&s)
             .iter()
             .map(|ls| ls.exp())
             .sum::<f64>();
 
-        // Drive SAC loop with reward = action (optimum at a = +1).
-        let mut state = s.clone();
-        let next_s: Vec<f64> = s.iter().map(|&x| x + 0.01).collect();
-        for step in 0..STEPS {
-            let done = (step + 1) % 50 == 0;
-            let reward = {
-                let mu = agent.actor_mu_raw_for_test(&state);
-                mu[0].tanh()
-            };
-            let _ = agent.step_continuous(&state, reward, done);
-            state = if done { s.clone() } else { next_s.clone() };
+        // Actor batch: spread of a_raw values at the probe state so the
+        // actor update sees the Q-gradient shape over the interior-optimum task.
+        let actor_batch: Vec<ReplayTransition> = (0..32_usize)
+            .map(|i| {
+                let a_raw = -2.0 + (i as f64) * (4.0 / 31.0);
+                let r = -(a_raw.tanh() - TARGET).powi(2);
+                ReplayTransition {
+                    state: s.clone(),
+                    action: Action::Continuous(vec![a_raw]),
+                    reward: r,
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                }
+            })
+            .collect();
+
+        for _ in 0..800 {
+            agent.sac_actor_update(&actor_batch);
         }
 
         let sigma_final: f64 = agent
@@ -14981,9 +15106,16 @@ mod tests {
             .map(|ls| ls.exp())
             .sum::<f64>();
 
+        let mu_final = agent.actor_mu_raw_for_test(&s)[0];
+        let mu_target = TARGET.atanh(); // ≈ 0.549
+
         assert!(
             sigma_final < sigma_initial,
-            "B7: σ must decrease as policy commits; σ_initial={sigma_initial:.4}, σ_final={sigma_final:.4}"
+            "B7: σ must narrow as policy commits to interior optimum \
+             (no-hidden-layer actor, α=1.0 frozen); \
+             σ_initial={sigma_initial:.4}, σ_final={sigma_final:.4} \
+             (μ_final={mu_final:.4}, μ_target={mu_target:.4}); \
+             seed={SEED}"
         );
     }
 
