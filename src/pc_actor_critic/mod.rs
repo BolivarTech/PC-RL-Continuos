@@ -1857,6 +1857,9 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// # Errors
     ///
+    /// Returns `PcError::ConfigValidation` if either parent is a continuous SAC
+    /// agent (`action_space == Continuous`) — Q-critic crossover is out of scope
+    /// for v6.0.0; reconstruct separate agents via [`new`](Self::new) instead.
     /// Returns `PcError::DimensionMismatch` if activation caches have different
     /// batch sizes. Returns `PcError::ConfigValidation` if child config is invalid.
     #[allow(clippy::too_many_arguments)]
@@ -1871,6 +1874,19 @@ impl<L: LinAlg> PcActorCritic<L> {
         child_config: PcActorCriticConfig,
         seed: u64,
     ) -> Result<Self, PcError> {
+        // Reject continuous SAC parents: crossover is a GA operator for the
+        // discrete PC actor. Q-critic crossover is out of scope for v6.0.0.
+        // Checking parent_a suffices; both parents must have the same config
+        // for a meaningful crossover, so checking one is a reliable guard.
+        if parent_a.config.action_space == ActionSpace::Continuous {
+            return Err(PcError::ConfigValidation(
+                "crossover is not supported for continuous SAC agents in v6.0.0 \
+                 (Q-critic crossover is out of scope; use crossover only with \
+                 discrete PC actor-critic agents)"
+                    .to_string(),
+            ));
+        }
+
         // Validate actor batch sizes match
         if actor_cache_a.batch_size() != actor_cache_b.batch_size() {
             return Err(PcError::DimensionMismatch {
@@ -15612,6 +15628,50 @@ mod tests {
         assert!(
             r.is_ok(),
             "q_critic lr-only change must be accepted by apply_config; got: {r:?}"
+        );
+    }
+
+    // ── Fix 3: crossover rejects continuous SAC agents ────────────────────
+
+    /// `crossover` must return `Err(ConfigValidation)` when either parent is a
+    /// continuous SAC agent. The Q-critic crossover is out of scope for v6.0.0;
+    /// silently producing a child with `q1=None` would cause a panic on the first
+    /// `act_continuous` call.
+    #[test]
+    fn test_crossover_rejects_continuous_sac() {
+        let parent_a =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let parent_b =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 99).unwrap();
+
+        // Build minimal caches — content does not matter because the function
+        // returns early on the continuous-mode check before inspecting the caches.
+        let num_actor_hidden = parent_a.config.actor.hidden_layers.len();
+        let num_critic_hidden = parent_a.config.critic.hidden_layers.len();
+        let cache_a_actor: ActivationCache = ActivationCache::new(num_actor_hidden);
+        let cache_b_actor: ActivationCache = ActivationCache::new(num_actor_hidden);
+        let cache_a_critic: ActivationCache = ActivationCache::new(num_critic_hidden);
+        let cache_b_critic: ActivationCache = ActivationCache::new(num_critic_hidden);
+
+        let result = PcActorCritic::<CpuLinAlg>::crossover(
+            &parent_a,
+            &parent_b,
+            &cache_a_actor,
+            &cache_b_actor,
+            &cache_a_critic,
+            &cache_b_critic,
+            0.5,
+            continuous_sac_config(),
+            7,
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PcError::ConfigValidation(m)) if m.contains("crossover") && m.contains("continuous")
+            ),
+            "crossover of continuous SAC agents must be rejected with a ConfigValidation \
+             error mentioning 'crossover' and 'continuous'; got: {result:?}"
         );
     }
 }
