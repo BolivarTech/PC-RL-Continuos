@@ -2290,7 +2290,18 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // the .max(GRAD_CLIP·0.1) floor keeps the headroom non-zero but the
                 // combined delta may exceed GRAD_CLIP — an unrealistic regime.
                 // α = 0 ⇒ headroom = GRAD_CLIP, entropy = 0 → identical to v4.1.0.
+                // Defense-in-depth (mirrors the policy_sigma runtime guard): the
+                // field is runtime-mutable for caller-side annealing, so a
+                // non-finite or negative α mutated in mid-training would make the
+                // entropy term NaN / anti-restoring and corrupt weights. Treat
+                // such values as 0.0 (no entropy) — construction already rejects
+                // them; this guards the runtime-mutation path.
                 let alpha = self.config.policy_entropy_coeff;
+                let alpha = if alpha.is_finite() && alpha >= 0.0 {
+                    alpha
+                } else {
+                    0.0
+                };
                 let entropy = squashed_entropy_delta(alpha, a_taken);
                 let headroom =
                     (crate::matrix::GRAD_CLIP - 2.0 * alpha).max(crate::matrix::GRAD_CLIP * 0.1);
@@ -14677,7 +14688,7 @@ mod tests {
         let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
         let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 0.0, false).unwrap();
         agent.config.policy_entropy_coeff = f64::NAN; // illegal post-construction mutation
-        // must not panic / NaN-corrupt
+                                                      // must not panic / NaN-corrupt
         let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 1.0, false);
         let w = &agent.actor.layers[0].weights.data;
         assert!(
