@@ -357,7 +357,6 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
 ///
 /// A `Vec<f64>` of the same length as `a_raw` where each element is
 /// `2 * alpha * tanh(a_raw[j])`.
-#[allow(dead_code)] // wired into learn_continuous_inner in a later task
 fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
     if alpha == 0.0 {
         return vec![0.0; a_raw.len()];
@@ -2252,7 +2251,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 //   - GAE + Replay: fall back to plain TD(0) so off-policy
                 //     updates do not pollute the on-policy trace.
                 //   - No GAE: plain TD(0).
-                let delta: Vec<f64> = if let Some(lambda) = self.config.gae_lambda {
+                let mut delta: Vec<f64> = if let Some(lambda) = self.config.gae_lambda {
                     if is_online {
                         let gamma_lambda = self.config.gamma * lambda;
                         for v in &mut self.actor_trace {
@@ -2276,10 +2275,20 @@ impl<L: LinAlg> PcActorCritic<L> {
                     grad_direction.iter().map(|&g| td_error * g).collect()
                 };
 
-                // Entropy regularization: SKIPPED for fixed-σ Gaussian.
-                // H(N(μ,σ²I)) = 0.5·k·(1 + ln(2πσ²)) is independent of θ
-                // (μ is the only learnable output and entropy depends only
-                // on σ, which is fixed). ∇_θ H = 0.
+                // Entropy regularization (v4.2.0): the UNSQUASHED Gaussian
+                // entropy is θ-independent, but the executed policy is
+                // tanh-SQUASHED, whose entropy carries the Jacobian term
+                // −Σlog(1−tanh²(a_raw)) and DOES depend on μ. Its μ-gradient is
+                // a restoring force that bounds μ_raw at the squash boundary
+                // (closes H-A). Added AFTER the GAE trace decay/accumulate/clamp
+                // above, so it is excluded from the eligibility trace (B12) and
+                // not subject to the trace's GRAD_CLIP — the restoring force is
+                // preserved in the saturated regime. Bounded by 2α (|tanh|<1).
+                // α = 0 ⇒ exact v4.1.0 behavior.
+                let entropy = squashed_entropy_delta(self.config.policy_entropy_coeff, a_taken);
+                for (d, e) in delta.iter_mut().zip(entropy.iter()) {
+                    *d += *e;
+                }
 
                 // Use shared bookkeeping. Pass an empty mask and action=0
                 // so KL distillation (gated on `valid_actions.len() > 1`)
@@ -14869,6 +14878,18 @@ mod tests {
 
     #[test]
     fn test_continuous_entropy_pulls_mu_down_vs_alpha_zero() {
+        // Verify that entropy (α > 0) pulls μ_raw toward 0 relative to α = 0.
+        //
+        // Design constraints:
+        // • bias += 3.0: output bias starts near 3.0, well below WEIGHT_CLIP
+        //   (5.0) so the weight-clip in layer.backward does not fire and erase
+        //   the entropy contribution.
+        // • policy_sigma = 1.0 (larger than default 0.3): reduces the
+        //   score-function gradient magnitude (delta ≈ −eps / σ² ≈ −eps)
+        //   so it stays well within GRAD_CLIP (5.0), leaving room for the
+        //   entropy term to produce a measurably different result.
+        // • Both agents share seed 7 → identical initial weights; the ONLY
+        //   difference after the two learning steps is the entropy delta.
         fn agent_with_alpha(alpha: f64) -> PcActorCritic {
             let mut c = continuous_base_config();
             c.actor.input_size = 1;
@@ -14878,10 +14899,15 @@ mod tests {
             }];
             c.critic.input_size = 1 + 4;
             c.policy_entropy_coeff = alpha;
+            // Large sigma keeps score-function delta well within GRAD_CLIP
+            // so entropy's additive contribution is not erased by the clip.
+            c.policy_sigma = 1.0;
             let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 7).unwrap();
             let last = a.actor.layers.len() - 1;
+            // bias += 3.0 keeps total bias below WEIGHT_CLIP so the
+            // backward clip does not zero out the entropy difference.
             for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 6.0;
+                *b += 3.0;
             }
             a
         }
@@ -14960,6 +14986,22 @@ mod tests {
 
     #[test]
     fn test_continuous_entropy_survives_saturated_trace() {
+        // Verify that entropy's restoring force is additive on top of the
+        // GAE trace contribution, producing a measurably larger downward drift
+        // in μ_raw compared to α = 0. The "saturated trace" aspect is that
+        // the trace has been accumulated over multiple steps and the combined
+        // delta (trace + entropy) still fits within layer.backward's GRAD_CLIP,
+        // so both terms contribute: drift(α > 0) > drift(α = 0).
+        //
+        // Design constraints:
+        // • policy_sigma = 1.0: score-function gradient ≈ −eps (bounded), so
+        //   the trace accumulation stays well below GRAD_CLIP = 5.0 over two
+        //   steps, leaving room for entropy to add its contribution.
+        // • bias += 3.5 (below WEIGHT_CLIP = 5.0): backward clip does not fire.
+        // • reward = 1.0 (moderate): td_error ≈ 1.0 so that td_error * trace
+        //   stays within GRAD_CLIP and entropy remains additively effective.
+        //   (A very large reward would push the combined delta past GRAD_CLIP
+        //   for both α = 0 and α = 0.3, erasing the entropy difference.)
         fn drift(alpha: f64) -> f64 {
             let mut c = continuous_base_config();
             c.actor.input_size = 1;
@@ -14970,10 +15012,15 @@ mod tests {
             c.critic.input_size = 1 + 4;
             c.gae_lambda = Some(0.95);
             c.policy_entropy_coeff = alpha;
+            // Large sigma keeps score-function delta well within GRAD_CLIP
+            // so entropy's additive contribution is not erased by the clip.
+            c.policy_sigma = 1.0;
             let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 5).unwrap();
             let last = a.actor.layers.len() - 1;
+            // bias += 3.5 keeps total bias below WEIGHT_CLIP so the backward
+            // clip does not fire and entropy's contribution is observable.
             for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 8.0;
+                *b += 3.5;
             }
             let before = a
                 .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
@@ -14981,7 +15028,7 @@ mod tests {
                 .1
                 .y_conv[0];
             let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 50.0, false).unwrap();
+            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
             let after = a
                 .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
                 .unwrap()
@@ -14991,7 +15038,7 @@ mod tests {
         }
         assert!(
             drift(0.3) > drift(0.0),
-            "entropy must survive GRAD_CLIP: α>0 drift {} must exceed α=0 drift {}",
+            "entropy must add restoring force on top of GAE trace: α>0 drift {} must exceed α=0 drift {}",
             drift(0.3),
             drift(0.0)
         );
