@@ -372,6 +372,91 @@ fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
     a_raw.iter().map(|&ar| 2.0 * alpha * ar.tanh()).collect()
 }
 
+/// Sample one standard-normal variate via Box–Muller (cosine half).
+///
+/// Reuses the same sampling convention as the v4.1.0 `act_continuous` Training
+/// arm: `u1 ∈ [ε, 1]`, `u2 ∈ [0, 1)`, `ε = (-2·ln u1)^½ · cos(2πu2)`.
+/// No new dependencies — only `rand::Rng::gen_range` from the existing `rand = "0.8"` dep.
+///
+/// # Arguments
+///
+/// * `rng` — any `rand::Rng` implementor (typically `StdRng`).
+///
+/// # Returns
+///
+/// A single `f64` drawn from `N(0, 1)`.
+fn sample_standard_normal(rng: &mut impl rand::Rng) -> f64 {
+    let u1: f64 = rng.gen_range(f64::EPSILON..=1.0);
+    let u2: f64 = rng.gen_range(0.0..1.0);
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Split a `2·action_dim` actor output into `(μ_raw, clamp(log_σ_raw, LOG_SIG_MIN, LOG_SIG_MAX))`.
+///
+/// The dual-head actor emits `[μ_raw | log_σ_raw]` concatenated into `y_conv`.
+/// This helper partitions the vector and clamps `log_σ` to `[LOG_SIG_MIN, LOG_SIG_MAX]`
+/// so that `σ = exp(log_σ)` stays in a numerically safe range.
+///
+/// # Arguments
+///
+/// * `y_conv` — actor convergence output of length `2 * action_dim`.
+/// * `action_dim` — number of action components.
+///
+/// # Returns
+///
+/// `(mu_raw, log_sigma_clamped)`, each of length `action_dim`.
+fn split_mu_log_sigma(y_conv: &[f64], action_dim: usize) -> (Vec<f64>, Vec<f64>) {
+    let mu = y_conv[..action_dim].to_vec();
+    let log_sigma = y_conv[action_dim..2 * action_dim]
+        .iter()
+        .map(|&x| x.clamp(LOG_SIG_MIN, LOG_SIG_MAX))
+        .collect();
+    (mu, log_sigma)
+}
+
+/// Deterministic (Play) action: `tanh(μ_raw)` for each action component.
+///
+/// Used in `SelectionMode::Play` — no RNG, no exploration noise.
+///
+/// # Arguments
+///
+/// * `mu_raw` — unbounded mean output from the actor, one value per action component.
+///
+/// # Returns
+///
+/// Squashed action vector where each element ∈ (−1, 1).
+fn deterministic_squashed_action(mu_raw: &[f64]) -> Vec<f64> {
+    mu_raw.iter().map(|&m| m.tanh()).collect()
+}
+
+/// Reparameterized sample: returns `(a_raw, a = tanh(a_raw))`.
+///
+/// Samples `ε ~ N(0, I)` via Box–Muller (factored into [`sample_standard_normal`]),
+/// computes `a_raw = μ_raw + exp(log_σ) · ε`, and squashes to `a = tanh(a_raw) ∈ (−1, 1)`.
+///
+/// # Arguments
+///
+/// * `mu_raw` — unbounded mean, one value per action component.
+/// * `log_sigma` — clamped log standard deviation, one value per action component.
+/// * `rng` — any `rand::Rng` implementor.
+///
+/// # Returns
+///
+/// `(a_raw, a)` where `a_raw` is the pre-squash sample and `a ∈ (−1, 1)` is the executed action.
+fn sample_squashed_action(
+    mu_raw: &[f64],
+    log_sigma: &[f64],
+    rng: &mut impl rand::Rng,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut a_raw = Vec::with_capacity(mu_raw.len());
+    for (i, &m) in mu_raw.iter().enumerate() {
+        let eps = sample_standard_normal(rng);
+        a_raw.push(m + log_sigma[i].exp() * eps);
+    }
+    let a = a_raw.iter().map(|&ar| ar.tanh()).collect();
+    (a_raw, a)
+}
+
 impl<L: LinAlg> PcActorCritic<L> {
     /// Returns the eligibility trace length: output_size when GAE enabled, 0 otherwise.
     fn gae_trace_len(config: &PcActorCriticConfig) -> usize {
@@ -2942,25 +3027,45 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         let infer = self.actor.infer(state);
-        let mu = self.backend.vec_to_vec(&infer.y_conv);
+        let y_conv = self.backend.vec_to_vec(&infer.y_conv);
 
-        let action = match mode {
-            crate::pc_actor::SelectionMode::Play => {
-                // Play: deterministic tanh(μ_raw), no RNG advance.
-                mu.iter().map(|&m| m.tanh()).collect::<Vec<f64>>()
+        let action = if let Some(q_cfg) = &self.config.q_critic {
+            // SAC dual-head path: actor output = [μ_raw | log_σ_raw], length 2 * action_dim.
+            let action_dim = q_cfg.action_dim;
+            let (mu, log_sigma) = split_mu_log_sigma(&y_conv, action_dim);
+            match mode {
+                crate::pc_actor::SelectionMode::Play => {
+                    // Deterministic: tanh(μ_raw), no RNG advance.
+                    deterministic_squashed_action(&mu)
+                }
+                crate::pc_actor::SelectionMode::Training => {
+                    // Reparameterized sample: tanh(μ_raw + exp(log_σ)·ε).
+                    let (_, a) = sample_squashed_action(&mu, &log_sigma, &mut self.rng);
+                    a
+                }
             }
-            crate::pc_actor::SelectionMode::Training => {
-                // Training: tanh(μ_raw + σ·ε), RNG advances. Box-Muller per dim.
-                use rand::Rng;
-                let sigma = self.config.policy_sigma;
-                mu.iter()
-                    .map(|m| {
-                        let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
-                        let u2: f64 = self.rng.gen_range(0.0..1.0);
-                        let eps = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                        (m + sigma * eps).tanh()
-                    })
-                    .collect::<Vec<f64>>()
+        } else {
+            // v4.1.0 fixed-σ path (non-SAC continuous): preserved bit-for-bit.
+            let mu = y_conv;
+            match mode {
+                crate::pc_actor::SelectionMode::Play => {
+                    // Play: deterministic tanh(μ_raw), no RNG advance.
+                    mu.iter().map(|&m| m.tanh()).collect::<Vec<f64>>()
+                }
+                crate::pc_actor::SelectionMode::Training => {
+                    // Training: tanh(μ_raw + σ·ε), RNG advances. Box-Muller per dim.
+                    use rand::Rng;
+                    let sigma = self.config.policy_sigma;
+                    mu.iter()
+                        .map(|m| {
+                            let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
+                            let u2: f64 = self.rng.gen_range(0.0..1.0);
+                            let eps =
+                                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                            (m + sigma * eps).tanh()
+                        })
+                        .collect::<Vec<f64>>()
+                }
             }
         };
 
