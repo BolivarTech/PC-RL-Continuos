@@ -4775,6 +4775,7 @@ mod tests {
             target_entropy: None,
             log_alpha_init: 0.0,
             alpha_lr: 0.001,
+            learning_starts: 0,
         }
     }
 
@@ -5328,6 +5329,7 @@ mod tests {
             target_entropy: None,
             log_alpha_init: 0.0,
             alpha_lr: 0.001,
+            learning_starts: 0,
         };
         let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), config, 42).unwrap();
 
@@ -6591,6 +6593,7 @@ mod tests {
             target_entropy: None,
             log_alpha_init: 0.0,
             alpha_lr: 0.001,
+            learning_starts: 0,
         }
     }
 
@@ -15416,6 +15419,79 @@ mod tests {
         assert!(
             (q1_before - q1_after).abs() > 1e-9,
             "q1 should change after SAC steps; before={q1_before}, after={q1_after}"
+        );
+    }
+
+    /// `learning_starts` delays SAC learning until at least that many
+    /// transitions are buffered.
+    ///
+    /// With `learning_starts = 200` and `replay_batch_size = 8`, the effective
+    /// warmup floor is `max(8, 200) = 200`. After 5 steps (well below 200) the
+    /// Q-critic must be unchanged; after 250 steps (above 200 and above 8) it
+    /// must have changed — confirming the gate fires exactly when expected.
+    #[test]
+    fn test_learning_starts_delays_sac_learning() {
+        let mut cfg = continuous_sac_config();
+        // learning_starts above what a handful of steps fill.
+        cfg.learning_starts = 200;
+        cfg.replay_batch_size = 8;
+        cfg.replay_training_capacity = 2000;
+        // Disable positive-only so every step is buffered.
+        cfg.replay_positive_only = false;
+
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let probe_action = vec![0.5_f64];
+        let q1_before = agent.q1_for_test(&state, &probe_action);
+
+        // 5 steps — far below learning_starts=200; no SAC update should fire.
+        for _ in 0..5 {
+            let _ = agent
+                .step_continuous(&state, 1.0, false)
+                .expect("step_continuous must not error");
+        }
+        let q1_after_few = agent.q1_for_test(&state, &probe_action);
+        assert!(
+            (q1_before - q1_after_few).abs() < 1e-12,
+            "q1 must not change before learning_starts is reached; \
+             before={q1_before}, after_few={q1_after_few}"
+        );
+
+        // 250 more steps — total > learning_starts=200 and > batch_size=8;
+        // at least one SAC update must fire.
+        let next_state = vec![0.2_f64, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        for i in 0..250 {
+            let s: Vec<f64> = state.iter().map(|&x| x + i as f64 * 0.001).collect();
+            let _ = agent
+                .step_continuous(&s, 1.0, false)
+                .expect("step_continuous must not error");
+            let _ = agent
+                .step_continuous(&next_state, 0.5, false)
+                .expect("step_continuous must not error");
+        }
+        let q1_after_many = agent.q1_for_test(&state, &probe_action);
+        assert!(
+            (q1_before - q1_after_many).abs() > 1e-9,
+            "q1 should change after learning_starts is surpassed; \
+             before={q1_before}, after_many={q1_after_many}"
+        );
+    }
+
+    /// SAC skip counters start at zero on a freshly constructed agent.
+    #[test]
+    fn test_sac_skip_counters_zero_on_fresh_agent() {
+        let agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        assert_eq!(
+            agent.sac_skipped_actor_updates(),
+            0,
+            "sac_skipped_actor_updates must be 0 on a fresh SAC agent"
+        );
+        assert_eq!(
+            agent.sac_skipped_critic_updates(),
+            0,
+            "sac_skipped_critic_updates must be 0 on a fresh SAC agent"
         );
     }
 }

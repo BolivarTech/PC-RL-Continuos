@@ -264,6 +264,14 @@ fn default_log_alpha_init() -> f64 {
     0.0
 }
 
+/// Default minimum number of replay transitions required before the first
+/// SAC learning step. `0` means the warmup is governed solely by
+/// `replay_batch_size` (effective warmup = `max(replay_batch_size, 0)` =
+/// `replay_batch_size`), preserving the pre-v6.1.0 behavior exactly.
+fn default_learning_starts() -> usize {
+    0
+}
+
 /// Default positive-reward-only filter flag for the replay buffer.
 fn default_replay_positive_only() -> bool {
     true
@@ -373,6 +381,7 @@ fn default_critic_floor_replay() -> f64 {
 ///     target_entropy: None,
 ///     log_alpha_init: 0.0,
 ///     alpha_lr: 0.001,
+///     learning_starts: 0,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -685,6 +694,20 @@ pub struct PcActorCriticConfig {
     /// `0.001`. Pre-v6 JSON files omitting this field deserialize to `0.001`.
     #[serde(default = "default_alpha_lr")]
     pub alpha_lr: f64,
+    /// v6.0.0 — minimum number of replay transitions that must be collected
+    /// before the first SAC learning step is executed.
+    ///
+    /// The effective warmup floor is `max(replay_batch_size, learning_starts)`:
+    /// - `0` (default): warmup governed entirely by `replay_batch_size`,
+    ///   preserving the behavior of all pre-field releases exactly.
+    /// - `n > 0`: `sac_learn_step` is a no-op until at least `n` AND
+    ///   `replay_batch_size` transitions are buffered. Useful when the
+    ///   caller wants to pre-populate the replay buffer before training begins
+    ///   (e.g. random exploration phase).
+    ///
+    /// Has no effect on discrete mode (discrete does not call `sac_learn_step`).
+    #[serde(default = "default_learning_starts")]
+    pub learning_starts: usize,
 }
 
 #[cfg(test)]
@@ -779,6 +802,7 @@ mod tests {
             target_entropy: None,
             log_alpha_init: 0.0,
             alpha_lr: 0.001,
+            learning_starts: 0,
         }
     }
 

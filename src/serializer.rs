@@ -651,6 +651,7 @@ mod tests {
             target_entropy: None,
             log_alpha_init: 0.0,
             alpha_lr: 0.001,
+            learning_starts: 0,
         }
     }
 

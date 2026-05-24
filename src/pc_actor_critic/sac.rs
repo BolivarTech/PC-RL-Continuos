@@ -24,6 +24,33 @@ use crate::pc_actor_critic::replay::{Action, ReplayTransition};
 use crate::pc_actor_critic::PcActorCritic;
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Number of SAC critic update transitions skipped due to non-finite
+    /// intermediate values (non-finite actions, log-prob, Q-values, or
+    /// Bellman target).
+    ///
+    /// Monotonically increasing; never resets. Returns `0` on a fresh agent.
+    /// Useful as a diagnostic indicator that transitions are being discarded,
+    /// which may signal numerical instability or misconfiguration.
+    ///
+    /// A non-zero value does not imply incorrect operation — occasional skips
+    /// due to extreme inputs near episode boundaries are expected.
+    pub fn sac_skipped_critic_updates(&self) -> u64 {
+        self.sac_skipped_critic_updates
+    }
+
+    /// Number of SAC actor update transitions skipped due to non-finite
+    /// delta values (non-finite Q-gradient, log-prob, or intermediate values).
+    ///
+    /// Monotonically increasing; never resets. Returns `0` on a fresh agent.
+    /// Useful as a diagnostic indicator alongside
+    /// [`sac_skipped_critic_updates`](Self::sac_skipped_critic_updates).
+    ///
+    /// A non-zero value does not imply incorrect operation — occasional skips
+    /// due to extreme inputs near episode boundaries are expected.
+    pub fn sac_skipped_actor_updates(&self) -> u64 {
+        self.sac_skipped_actor_updates
+    }
+
     /// Current SAC entropy temperature `α = exp(log_alpha)`.
     ///
     /// Always `> 0` by construction (`exp` is strictly positive).
@@ -359,8 +386,13 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// # Returns
     ///
-    /// `(mean |delta|, Option<mean logπ>)`. `None` logπ means no transitions
-    /// were applied; the caller must skip `sac_temperature_update` in that case.
+    /// `(mean |delta|, Option<mean logπ>)` over non-skipped transitions.
+    /// The `mean |delta|` is the mean over the non-skipped batch of the
+    /// post-(1/n-scaling) per-component |delta| (each transition's delta
+    /// carries the 1/n batch-averaging factor applied in Pass 1 before
+    /// being stored in `collected`).
+    /// `None` logπ means no transitions were applied; the caller must skip
+    /// `sac_temperature_update` in that case.
     pub(crate) fn sac_actor_update(&mut self, batch: &[ReplayTransition]) -> (f64, Option<f64>) {
         let action_dim = match self.config.q_critic.as_ref() {
             Some(q) => q.action_dim,
@@ -500,9 +532,12 @@ impl<L: LinAlg> PcActorCritic<L> {
         let mut total_logp = 0.0_f64;
 
         for td in collected {
-            // Mean |delta| over all delta components (μ and log_σ halves),
-            // before the 1/n scaling is applied — report the per-state magnitude
-            // so the reported metric is comparable across batch sizes.
+            // Mean |delta| over all delta components (μ and log_σ halves).
+            // `td.delta` already carries the 1/n batch-averaging scale applied
+            // in Pass 1, so the value is the post-(1/n-scaling) mean component
+            // magnitude for this transition. Summing over collected and dividing
+            // by n (the number of non-skipped transitions) produces the mean
+            // over the non-skipped batch of the post-scaled |delta|.
             let mean_abs: f64 =
                 td.delta.iter().map(|d| d.abs()).sum::<f64>() / td.delta.len().max(1) as f64;
             total_delta_abs += mean_abs;
@@ -562,11 +597,13 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// critic → actor → temperature → Polyak pipeline.
     ///
     /// No-op (early return) until the replay buffer holds at least
-    /// `replay_batch_size` transitions (warmup = batch-size floor).
+    /// `max(replay_batch_size, learning_starts)` transitions. When
+    /// `learning_starts == 0` (default) the effective floor is `replay_batch_size`,
+    /// preserving the pre-field behavior exactly.
     ///
     /// # Call order
     ///
-    /// 1. Check warmup: return if `total_len < replay_batch_size`.
+    /// 1. Check warmup: return if `total_len < max(replay_batch_size, learning_starts)`.
     /// 2. Sample `replay_batch_size` transitions from the replay buffer.
     /// 3. [`sac_critic_update`](Self::sac_critic_update) — soft-Bellman TD
     ///    update of the twin Q-critics.
@@ -579,14 +616,17 @@ impl<L: LinAlg> PcActorCritic<L> {
     pub(crate) fn sac_learn_step(&mut self) {
         let batch_size = self.config.replay_batch_size;
 
-        // Warmup: do nothing until the buffer holds at least `batch_size`
-        // transitions.
+        // Warmup: do nothing until the buffer holds at least
+        // `max(batch_size, learning_starts)` transitions. When
+        // `learning_starts == 0` (default) this collapses to the original
+        // `batch_size` floor, preserving backward-compatible behavior.
+        let warmup_floor = batch_size.max(self.config.learning_starts);
         let buf_len = self
             .replay_buffer
             .as_ref()
             .map(|b| b.total_len())
             .unwrap_or(0);
-        if buf_len < batch_size {
+        if buf_len < warmup_floor {
             return;
         }
 
