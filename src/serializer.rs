@@ -1841,6 +1841,201 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    // ── T13: SAC serialization round-trip + safe-load tests ──────────
+
+    fn continuous_sac_config_for_serializer() -> PcActorCriticConfig {
+        use crate::pc_actor_critic::ActionSpace;
+        use crate::q_critic::QCriticConfig;
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.actor.output_size = 2; // 2 * action_dim(=1)
+        cfg.actor.output_activation = Activation::Linear;
+        cfg.policy_sigma = 0.3;
+        cfg.q_critic = Some(QCriticConfig {
+            state_dim: cfg.actor.input_size, // 9
+            action_dim: 1,
+            hidden_layers: vec![LayerDef {
+                size: 16,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.001,
+        });
+        cfg.replay_training_capacity = 1000;
+        cfg.replay_batch_size = 8;
+        cfg.polyak_tau = 0.005;
+        cfg.gae_lambda = None;
+        cfg.td_steps = 0;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg
+    }
+
+    /// SAC agent round-trips: Q1/Q2 weights and log_alpha survive save/load.
+    #[test]
+    fn test_sac_agent_roundtrips_q_and_log_alpha() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        let cfg = continuous_sac_config_for_serializer();
+        let agent: crate::pc_actor_critic::PcActorCritic =
+            crate::pc_actor_critic::PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Q critics must be present for SAC continuous config.
+        assert!(agent.q1.is_some(), "SAC agent must have q1");
+        assert!(agent.q2.is_some(), "SAC agent must have q2");
+
+        // Capture forward values before save.
+        let state = vec![0.1f64; 9];
+        let action = vec![0.5f64];
+        let q1_before = agent.q1.as_ref().unwrap().forward(&state, &action);
+        let q2_before = agent.q2.as_ref().unwrap().forward(&state, &action);
+        let log_alpha_before = agent.log_alpha;
+
+        let path = temp_path("test_sac_roundtrip.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+
+        assert!(loaded.q1.is_some(), "loaded q1 must be Some");
+        assert!(loaded.q2.is_some(), "loaded q2 must be Some");
+        assert!(loaded.q1_target.is_some(), "loaded q1_target must be Some");
+        assert!(loaded.q2_target.is_some(), "loaded q2_target must be Some");
+
+        let q1_after = loaded.q1.as_ref().unwrap().forward(&state, &action);
+        let q2_after = loaded.q2.as_ref().unwrap().forward(&state, &action);
+
+        assert!(
+            (q1_before - q1_after).abs() < 1e-12,
+            "q1 forward must match after round-trip: {q1_before} vs {q1_after}"
+        );
+        assert!(
+            (q2_before - q2_after).abs() < 1e-12,
+            "q2 forward must match after round-trip: {q2_before} vs {q2_after}"
+        );
+        assert!(
+            (log_alpha_before - loaded.log_alpha).abs() < 1e-12,
+            "log_alpha must match after round-trip"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Pre-v6 discrete save (no SAC fields) must load without error;
+    /// q critics remain None and actor output is preserved.
+    #[test]
+    fn test_pre_v6_discrete_save_still_loads() {
+        use crate::linalg::cpu::CpuLinAlg;
+
+        // A discrete agent save has no q_*_weights fields (they are Option
+        // and will be omitted / defaulted to null). Loading must succeed.
+        let agent = make_agent(); // uses default_config() which is Discrete
+        assert!(agent.q1.is_none(), "Discrete agent must have q1 = None");
+
+        let path = temp_path("test_discrete_pre_v6_load.json");
+        save_agent(&agent, &path, 10, None).unwrap();
+
+        let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
+        assert!(loaded.q1.is_none(), "Loaded discrete agent must have q1 = None");
+        assert!(loaded.q2.is_none(), "Loaded discrete agent must have q2 = None");
+
+        // Actor output must be preserved.
+        let input = vec![0.5f64; 9];
+        let orig_infer = agent.infer(&input);
+        let loaded_infer = loaded.infer(&input);
+        for (a, b) in orig_infer.y_conv.iter().zip(loaded_infer.y_conv.iter()) {
+            assert!((a - b).abs() < 1e-12, "y_conv differs: {a} vs {b}");
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A v5-era continuous save (q_critic Some in config but NO q-weights in JSON)
+    /// must return Err(PcError), not panic.
+    #[test]
+    fn test_v5_continuous_save_returns_clean_error_or_loads_safely() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::ActionSpace;
+
+        // Build a SAC agent and save it, then strip the Q-weight fields from
+        // the JSON to simulate a v5 continuous save (config has q_critic = Some
+        // but file predates T13 serialization).
+        let cfg = continuous_sac_config_for_serializer();
+        let agent: crate::pc_actor_critic::PcActorCritic =
+            crate::pc_actor_critic::PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = temp_path("test_v5_continuous_no_q_weights.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Strip Q-weight fields to simulate a pre-T13 save.
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("q1_weights");
+            obj.remove("q2_weights");
+            obj.remove("q1_target_weights");
+            obj.remove("q2_target_weights");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Verify config round-trips as Continuous (precondition for the test).
+        let raw: SaveFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw.config.action_space,
+            ActionSpace::Continuous,
+            "precondition: config must be Continuous"
+        );
+        assert!(
+            raw.config.q_critic.is_some(),
+            "precondition: config must have q_critic"
+        );
+
+        // Must NOT panic; must return Err.
+        let result = load_agent(&path, CpuLinAlg::new());
+        assert!(
+            result.is_err(),
+            "loading v5 continuous save with missing Q-weights must return Err, not panic"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A ClState with q1_weights = Some but q2_weights = None (partial) must
+    /// return a clean Err(PcError), never panic.
+    #[test]
+    fn test_partial_q_save_returns_clean_error() {
+        use crate::linalg::cpu::CpuLinAlg;
+        use crate::pc_actor_critic::ActionSpace;
+
+        let cfg = continuous_sac_config_for_serializer();
+        let agent: crate::pc_actor_critic::PcActorCritic =
+            crate::pc_actor_critic::PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let path = temp_path("test_partial_q_weights.json");
+        save_agent(&agent, &path, 0, None).unwrap();
+
+        // Keep q1_weights but remove q2_weights → partial save.
+        let json_str = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("q2_weights");
+            obj.remove("q1_target_weights");
+            obj.remove("q2_target_weights");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Precondition: config remains Continuous with q_critic Some.
+        let raw: SaveFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.config.action_space, ActionSpace::Continuous);
+        assert!(raw.config.q_critic.is_some());
+
+        // Must NOT panic; must return Err.
+        let result = load_agent(&path, CpuLinAlg::new());
+        assert!(
+            result.is_err(),
+            "loading partial Q-weight save must return Err, not panic"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
     /// v3.0.0 forward-compat: pre-v3 JSON state files (which lack the
     /// new `critic_floor_replay` config field) must load successfully
     /// and surface the field at its `-1.0` sentinel default. Closes
