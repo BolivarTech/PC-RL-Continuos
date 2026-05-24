@@ -319,24 +319,19 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// `config.log_alpha_init` in `new()` for SAC mode (else `0.0`).
     /// Updated by `sac_temperature_update()`. Not serialized — treated
     /// as transient training state (restored to init on deserialize).
-    #[allow(dead_code)] // wired in T10-T12
     pub(crate) log_alpha: f64,
     /// SAC twin Q-critics (v6.0.0). `Some` in continuous SAC mode
     /// (`action_space == Continuous && q_critic.is_some()`). `None`
     /// for discrete agents and pre-v6 continuous agents without
     /// `q_critic` config. Wired into the soft-Bellman target in T10.
-    #[allow(dead_code)] // wired in T10-T13
     pub(crate) q1: Option<crate::q_critic::QCritic<L>>,
     /// SAC twin Q-critic 2 (v6.0.0). See [`Self::q1`].
-    #[allow(dead_code)] // wired in T10-T13
     pub(crate) q2: Option<crate::q_critic::QCritic<L>>,
     /// Polyak-averaged soft target copy of `q1` (v6.0.0). Updated via
     /// `polyak_update_targets()` after every critic update. `None`
     /// when `q1` is `None`. Wired in T10.
-    #[allow(dead_code)] // wired in T10-T13
     pub(crate) q1_target: Option<crate::q_critic::QCritic<L>>,
     /// Polyak-averaged soft target copy of `q2` (v6.0.0). See [`Self::q1_target`].
-    #[allow(dead_code)] // wired in T10-T13
     pub(crate) q2_target: Option<crate::q_critic::QCritic<L>>,
     /// Monotonic counter of SAC critic update steps skipped due to non-finite
     /// intermediate values (non-finite actions, log-prob, Q-values, or Bellman
@@ -2832,9 +2827,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Mirrors [`step_masked`](Self::step_masked) for `ActionSpace::Continuous`:
     ///
     /// 1. Runs actor inference on the current `state` to obtain `μ(s)`.
-    /// 2. Samples `a = μ + σ·ε` with `ε ~ N(0, I)` via Box-Muller from
+    /// 2. Samples `a = tanh(μ + σ·ε)` with `ε ~ N(0, I)` via Box-Muller from
     ///    the agent's deterministic [`StdRng`] (so a fixed seed yields
-    ///    a fixed action sequence). `σ = config.policy_sigma`.
+    ///    a fixed action sequence). `σ` is the actor's LEARNED per-state standard
+    ///    deviation (emitted by the actor's log_σ head); `policy_sigma` is ignored
+    ///    in continuous SAC mode.
     /// 3. If a previous transition is stored from the prior call, runs
     ///    a TD(0) update via the internal continuous learning path with
     ///    `StepAction::Continuous` — exercising the Gaussian-policy

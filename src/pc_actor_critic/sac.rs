@@ -35,7 +35,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// ```
     /// // α = exp(0.0) = 1.0 initially (log_alpha_init = 0.0 default).
     /// ```
-    #[allow(dead_code)] // wired in T10-T12
     pub(crate) fn alpha(&self) -> f64 {
         self.log_alpha.exp()
     }
@@ -65,7 +64,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// * `logp_mean` — mean log-probability of sampled actions under the
     ///   current policy (batch average of `log π(a|s)`).
-    #[allow(dead_code)] // wired in T10-T12
     pub(crate) fn sac_temperature_update(&mut self, logp_mean: f64) {
         /// Lower bound on `log_alpha`; `exp(-20) ≈ 2e-9` (effectively zero temperature).
         const LOG_ALPHA_MIN: f64 = -20.0;
@@ -100,7 +98,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// Equivalent to `self.q1.is_some()`.  Used by tests and future task
     /// callers to gate SAC-specific code paths without pattern-matching on all
     /// four Option fields.
-    #[allow(dead_code)] // called by tests + wired in T10
     pub(crate) fn has_sac_critics(&self) -> bool {
         self.q1.is_some()
     }
@@ -120,7 +117,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// live critic (which remains in `self`), then put it back.  The `Option`
     /// slot is `None` only during the few lines of the update; no public method
     /// is called on `self` inside that window, so the invariant is maintained.
-    #[allow(dead_code)] // wired in T10
     pub(crate) fn polyak_update_targets(&mut self) {
         if !self.has_sac_critics() {
             return;
@@ -238,7 +234,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// # Returns
     ///
     /// Mean MSE loss over the batch.
-    #[allow(dead_code)] // wired in T12
     pub(crate) fn sac_critic_update(&mut self, batch: &[ReplayTransition]) -> f64 {
         // --- Pass 1: compute all soft-Bellman targets ---
         // Each entry is (state, executed_a_squashed, next_state is in t, y).
@@ -332,7 +327,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// # Returns
     ///
     /// `(mean |delta|, mean logπ)`.
-    #[allow(dead_code)] // wired in T12
     pub(crate) fn sac_actor_update(&mut self, batch: &[ReplayTransition]) -> (f64, f64) {
         let action_dim = match self.config.q_critic.as_ref() {
             Some(q) => q.action_dim,
@@ -368,7 +362,14 @@ impl<L: LinAlg> PcActorCritic<L> {
             // Split actor output into (μ, log_σ).
             let (mu, log_sigma) = super::split_mu_log_sigma(&y_conv_vec, action_dim);
 
-            // Reconstruct fixed ε from stored a_raw (ε = (a_raw − μ) / σ).
+            // Reconstruct ε from the replay-stored a_raw and the CURRENT (μ, σ).
+            // Canonical SAC draws a fresh ε~N(0,I) per actor update; here we
+            // reconstruct ε = (a_raw − μ_current) / σ_current so the pathwise
+            // gradient is evaluated at the stored action rather than a new sample.
+            // Algebraically a_raw = μ_current + σ_current·ε reproduces the stored
+            // pre-squash value; the gradient is exact at that point but is computed
+            // at the off-policy stored action, not a fresh on-policy draw.
+            // Deterministic convergence is validated downstream (B10).
             let eps: Vec<f64> = (0..action_dim)
                 .map(|j| (a_raw_stored[j] - mu[j]) / log_sigma[j].exp())
                 .collect();
@@ -487,7 +488,6 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// Pure function on the two layers — no `&self` needed, which avoids
     /// a three-way borrow conflict when the caller already holds `&self.backend`.
-    #[allow(dead_code)] // called by polyak_update_targets; wired in T10
     fn polyak_layer(target: &mut Layer<L>, live: &Layer<L>, tau: f64, backend: &L) {
         let one_minus_tau = 1.0 - tau;
 

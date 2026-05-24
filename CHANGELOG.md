@@ -42,10 +42,10 @@
   correction is applied to the log-probability.
 
 - **Automatic entropy temperature (`log_alpha`, `alpha_lr`, `target_entropy`).**
-  `log_alpha` is a learnable scalar; its gradient is `−(log π(a|s) + H_target)`.
+  `log_alpha` is a learnable scalar; its gradient is `−α·(log π + H_target)`.
   `target_entropy` defaults to `−action_dim` (standard SAC heuristic) when `None`.
   `log_alpha_init` sets the initial temperature. All three are optional config fields;
-  `alpha_lr` defaults to the actor learning rate.
+  `alpha_lr` defaults to `0.001`.
 
 - **Off-policy replay wiring.** SAC continuous mode uses `replay_training_capacity`
   (must be `> 0`) as its experience replay buffer. Each SAC update samples a mini-batch
