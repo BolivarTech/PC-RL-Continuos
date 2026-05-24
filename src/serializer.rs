@@ -188,6 +188,26 @@ pub struct SaveFile {
     /// `replay_training_capacity == 0` or legacy file).
     #[serde(default)]
     pub replay_buffer: Option<crate::pc_actor_critic::replay::ReplayBuffer>,
+    /// SAC twin Q-critic 1 weights (v6.0.0). `None` for discrete agents and
+    /// pre-v6 files (serde default). When `config.q_critic` is `Some` on load,
+    /// ALL four Q-weight fields must be `Some`; a partial or missing set returns
+    /// `Err(PcError::ConfigValidation)`.
+    #[serde(default)]
+    pub q1_weights: Option<crate::q_critic::QCriticWeights>,
+    /// SAC twin Q-critic 2 weights (v6.0.0). See [`q1_weights`](Self::q1_weights).
+    #[serde(default)]
+    pub q2_weights: Option<crate::q_critic::QCriticWeights>,
+    /// Polyak target of Q1 weights (v6.0.0). See [`q1_weights`](Self::q1_weights).
+    #[serde(default)]
+    pub q1_target_weights: Option<crate::q_critic::QCriticWeights>,
+    /// Polyak target of Q2 weights (v6.0.0). See [`q1_weights`](Self::q1_weights).
+    #[serde(default)]
+    pub q2_target_weights: Option<crate::q_critic::QCriticWeights>,
+    /// SAC log-temperature α (v6.0.0). `None` for discrete / pre-v6 files.
+    /// When present, restored directly; absent for SAC mode falls back to
+    /// `config.log_alpha_init`.
+    #[serde(default)]
+    pub log_alpha: Option<f64>,
     /// Monotonic count of replay_learn saturation events (legacy files
     /// default to 0).
     #[serde(default)]
@@ -252,6 +272,15 @@ pub fn save_agent<L: LinAlg>(
         cl_state: agent.to_cl_state(),
         polyak_target_weights: agent.polyak_target.as_ref().map(|a| a.to_weights()),
         frozen_champion_weights: agent.frozen_champion.as_ref().map(|a| a.to_weights()),
+        q1_weights: agent.q1.as_ref().map(|q| q.to_weights()),
+        q2_weights: agent.q2.as_ref().map(|q| q.to_weights()),
+        q1_target_weights: agent.q1_target.as_ref().map(|q| q.to_weights()),
+        q2_target_weights: agent.q2_target.as_ref().map(|q| q.to_weights()),
+        log_alpha: if agent.q1.is_some() {
+            Some(agent.log_alpha)
+        } else {
+            None
+        },
         replay_buffer: agent.replay_buffer.clone(),
         replay_clamp_count: agent.replay_clamp_count,
         steps_since_last_rollback_hard: agent.steps_since_last_rollback_hard,
@@ -358,7 +387,7 @@ pub fn load_agent_generic<L: LinAlg>(
     if save_file.config.distillation_lambda_frozen > 0.0 {
         if let Some(frozen_weights) = save_file.frozen_champion_weights {
             let frozen = PcActor::<L>::from_weights(
-                backend,
+                backend.clone(),
                 save_file.config.actor.clone(),
                 frozen_weights,
             )?;
@@ -371,6 +400,65 @@ pub fn load_agent_generic<L: LinAlg>(
 
     if let Some(cl_state) = save_file.cl_state {
         agent.restore_cl_state(cl_state);
+    }
+
+    // Restore SAC twin Q-critics and log_alpha (v6.0.0).
+    // For SAC mode (q_critic Some in config): ALL four Q-weight fields must be
+    // present. A partial or absent set (pre-v6 continuous save) is a hard error —
+    // we reject it with ConfigValidation so the caller gets a clean Err, not a
+    // panic or silently invalid agent.
+    // For discrete mode (q_critic None): all four remain None; log_alpha stays 0.0.
+    if save_file.config.q_critic.is_some() {
+        let q_cfg = save_file.config.q_critic.clone().unwrap();
+        let q1_w = save_file.q1_weights.ok_or_else(|| {
+            PcError::ConfigValidation(
+                "SAC save file missing q1_weights: pre-v6 continuous save cannot be loaded \
+                 as a v6 SAC agent. Re-train from scratch with v6.0.0 to obtain a \
+                 compatible checkpoint."
+                    .to_string(),
+            )
+        })?;
+        let q2_w = save_file.q2_weights.ok_or_else(|| {
+            PcError::ConfigValidation(
+                "SAC save file missing q2_weights: incomplete or corrupt checkpoint.".to_string(),
+            )
+        })?;
+        let q1_target_w = save_file.q1_target_weights.ok_or_else(|| {
+            PcError::ConfigValidation(
+                "SAC save file missing q1_target_weights: incomplete or corrupt checkpoint."
+                    .to_string(),
+            )
+        })?;
+        let q2_target_w = save_file.q2_target_weights.ok_or_else(|| {
+            PcError::ConfigValidation(
+                "SAC save file missing q2_target_weights: incomplete or corrupt checkpoint."
+                    .to_string(),
+            )
+        })?;
+
+        agent.q1 = Some(crate::q_critic::QCritic::from_weights(
+            backend.clone(),
+            q_cfg.clone(),
+            q1_w,
+        )?);
+        agent.q2 = Some(crate::q_critic::QCritic::from_weights(
+            backend.clone(),
+            q_cfg.clone(),
+            q2_w,
+        )?);
+        agent.q1_target = Some(crate::q_critic::QCritic::from_weights(
+            backend.clone(),
+            q_cfg.clone(),
+            q1_target_w,
+        )?);
+        agent.q2_target = Some(crate::q_critic::QCritic::from_weights(
+            backend.clone(), // use clone; `backend` is used above
+            q_cfg,
+            q2_target_w,
+        )?);
+        agent.log_alpha = save_file
+            .log_alpha
+            .unwrap_or(save_file.config.log_alpha_init);
     }
 
     // Restore replay buffer:
@@ -1933,8 +2021,14 @@ mod tests {
         save_agent(&agent, &path, 10, None).unwrap();
 
         let (loaded, _) = load_agent(&path, CpuLinAlg::new()).unwrap();
-        assert!(loaded.q1.is_none(), "Loaded discrete agent must have q1 = None");
-        assert!(loaded.q2.is_none(), "Loaded discrete agent must have q2 = None");
+        assert!(
+            loaded.q1.is_none(),
+            "Loaded discrete agent must have q1 = None"
+        );
+        assert!(
+            loaded.q2.is_none(),
+            "Loaded discrete agent must have q2 = None"
+        );
 
         // Actor output must be preserved.
         let input = vec![0.5f64; 9];
