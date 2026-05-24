@@ -293,15 +293,16 @@ impl<L: LinAlg> PcActorCritic<L> {
 
         // --- Pass 2: update live Q-critics with collected targets ---
         //
-        // Batch-averaging: the actor update already scales each per-state delta
-        // by `1/batch_len` so the aggregate weight change equals the mean
-        // gradient, not the sum (effective lr = `lr / n` per transition).
-        // The critic must be consistent: we use `update_scaled(…, 1/n)` so
-        // both networks operate at the same effective learning rate per batch.
+        // Batch-averaging: use the FULL batch length (same as the actor update's
+        // `inv_n = 1/batch.len()`) so both networks operate at the same effective
+        // learning rate per batch, regardless of how many transitions were skipped.
+        // Using `targets.len()` (applied count) would give a larger effective lr
+        // when transitions are skipped, inconsistent with the actor's convention.
         // Using plain `update()` (lr_scale=1.0) would give effective lr = n×lr,
-        // an inflated step inconsistent with the actor's 1/n normalisation.
-        let n = targets.len() as f64;
-        let lr_scale = 1.0 / n;
+        // an inflated step inconsistent with the 1/n normalisation.
+        let batch_n = batch.len() as f64;
+        let lr_scale = 1.0 / batch_n;
+        let applied_n = targets.len() as f64;
         let mut total = 0.0_f64;
 
         for (state, a_squashed, y) in &targets {
@@ -318,7 +319,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             total += 0.5 * (l1 + l2);
         }
 
-        total / n
+        total / applied_n
     }
 
     /// SAC reparameterised actor update over a replay batch.
