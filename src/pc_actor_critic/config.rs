@@ -267,7 +267,7 @@ fn default_log_alpha_init() -> f64 {
 /// Default minimum number of replay transitions required before the first
 /// SAC learning step. `0` means the warmup is governed solely by
 /// `replay_batch_size` (effective warmup = `max(replay_batch_size, 0)` =
-/// `replay_batch_size`), preserving the pre-v6.1.0 behavior exactly.
+/// `replay_batch_size`), preserving the pre-v6.0.0 behavior exactly.
 fn default_learning_starts() -> usize {
     0
 }

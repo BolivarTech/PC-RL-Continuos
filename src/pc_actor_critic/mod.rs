@@ -105,10 +105,9 @@ pub(crate) enum LearnMode {
 /// * `Discrete` — index-based action with a valid-action mask. Preserves
 ///   the v3.x discrete gradient path bit-for-bit.
 /// * `Continuous` — sampled action vector `a = μ + σ·ε`. Used to compute
-///   `(a − μ)` for the Gaussian-policy gradient (Phase 3.3).
+///   `(a − μ)` for the Gaussian-policy gradient.
 #[derive(Debug, Clone, Copy)]
-// `Continuous` variant is a Phase 3.3 stub; suppress the dead-code lint
-// so the build stays warning-free before the gradient dispatch lands.
+// `Continuous` variant may be unused in some code paths; suppress the lint.
 #[allow(dead_code)]
 pub(crate) enum StepAction<'a> {
     /// Discrete action taken at the current state.
@@ -325,13 +324,13 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// SAC twin Q-critics (v6.0.0). `Some` in continuous SAC mode
     /// (`action_space == Continuous && q_critic.is_some()`). `None`
     /// for discrete agents and pre-v6 continuous agents without
-    /// `q_critic` config. Wired into the soft-Bellman target in T10.
+    /// `q_critic` config.
     pub(crate) q1: Option<crate::q_critic::QCritic<L>>,
     /// SAC twin Q-critic 2 (v6.0.0). See [`Self::q1`].
     pub(crate) q2: Option<crate::q_critic::QCritic<L>>,
     /// Polyak-averaged soft target copy of `q1` (v6.0.0). Updated via
     /// `polyak_update_targets()` after every critic update. `None`
-    /// when `q1` is `None`. Wired in T10.
+    /// when `q1` is `None`.
     pub(crate) q1_target: Option<crate::q_critic::QCritic<L>>,
     /// Polyak-averaged soft target copy of `q2` (v6.0.0). See [`Self::q1_target`].
     pub(crate) q2_target: Option<crate::q_critic::QCritic<L>>,
@@ -380,7 +379,6 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
 /// Added to `(1 − tanh²(a_raw))` before taking the logarithm so the Jacobian
 /// correction remains finite even when `|a_raw|` is very large (tanh ≈ ±1).
 /// Must equal `1e-6` — pinned by [`test_squashed_log_prob_matches_reference`].
-// wired in T10/T11
 const SQUASH_JAC_EPS: f64 = 1e-6;
 
 /// Log-probability of the tanh-squashed diagonal Gaussian policy at `a = tanh(a_raw)`,
@@ -409,7 +407,6 @@ const SQUASH_JAC_EPS: f64 = 1e-6;
 /// # Returns
 ///
 /// The scalar `logπ(a|s)` summed over all action components.
-// wired in T10/T11
 fn squashed_log_prob(mu_raw: &[f64], log_sigma: &[f64], a_raw: &[f64]) -> f64 {
     let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
     let mut lp = 0.0;
@@ -2041,7 +2038,6 @@ impl<L: LinAlg> PcActorCritic<L> {
             replay_buffer: None,
             replay_clamp_count: 0,
             log_alpha: 0.0,
-            // SAC twin Q critics restored separately in T13.
             q1: None,
             q2: None,
             q1_target: None,
@@ -2522,7 +2518,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             &self.critic_decay_factors,
         );
 
-        // Policy gradient — dispatch on action space (v4.0.0 Phase 3.3).
+        // Policy gradient — dispatch on action space.
         //
         // Sign convention: `update_weights` performs descent
         // `θ ← θ − lr · ∂loss/∂θ`, so `delta` MUST be the descent
@@ -2975,7 +2971,7 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// 3. If a previous transition is stored from the prior call, runs
     ///    a TD(0) update via the internal continuous learning path with
     ///    `StepAction::Continuous` — exercising the Gaussian-policy
-    ///    gradient `δ_j = td_error · (μ_j − a_j)/σ²` (Phase 3.3).
+    ///    gradient `δ_j = td_error · (μ_j − a_j)/σ²`.
     /// 4. Records `(state, action, reward, next_state, done)` in the
     ///    replay buffer when configured.
     /// 5. Updates `state_prev / action_prev_continuous / infer_prev`
@@ -4582,14 +4578,14 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             let clamped_td_error = raw_td_error.clamp(-MAX_REPLAY_TD_ERROR, MAX_REPLAY_TD_ERROR);
 
-            // Phase 2: only Discrete transitions supported. Continuous
-            // gradient dispatch lands in Phase 3.3.
+            // Only Discrete transitions are supported in this replay path;
+            // use `sac_replay_learn` for Continuous (SAC) agents.
             let action_idx = match &transition.action {
                 crate::pc_actor_critic::replay::Action::Discrete(idx) => *idx,
                 crate::pc_actor_critic::replay::Action::Continuous(_) => {
                     return Err(PcError::ConfigValidation(
-                        "replay_learn cannot handle Continuous transitions in Phase 2 \
-                         (gradient dispatch lands Phase 3.3)"
+                        "replay_learn does not support Continuous transitions; \
+                         use sac_replay_learn for SAC agents"
                             .into(),
                     ));
                 }
@@ -4700,7 +4696,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             .forward(state, action)
     }
 
-    // ── T10 test shims ────────────────────────────────────────────────────────
+    // ── SAC test shims ────────────────────────────────────────────────────────
 
     /// Forward the LIVE Q-critic `q1` at `(state, action)` (test helper only).
     ///
@@ -14819,7 +14815,7 @@ mod tests {
         );
     }
 
-    // ── T10: SAC soft-Bellman critic update ───────────────────────────────────
+    // ── SAC soft-Bellman critic update ───────────────────────────────────────
 
     #[test]
     fn test_sac_critic_target_is_finite_single_transition() {
@@ -14873,7 +14869,7 @@ mod tests {
         );
     }
 
-    // ── T11 RED: SAC reparameterized actor delta tests ─────────────────────
+    // ── SAC reparameterized actor delta tests ──────────────────────────────
 
     /// FD-verified correctness gate for `sac_actor_delta`.
     ///
@@ -15423,7 +15419,7 @@ mod tests {
         );
     }
 
-    // ── T12 RED: SAC replay-loop wiring tests ────────────────────────────────
+    // ── SAC replay-loop wiring tests ─────────────────────────────────────────
 
     /// Push a continuous transition into a SAC agent's replay buffer directly
     /// and sample it back; assert the stored `a_raw` is preserved exactly.

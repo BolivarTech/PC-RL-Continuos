@@ -342,8 +342,8 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///    `action=0` (no discrete KL / EWC logit-reversal; continuous-only path).
     ///
     /// Returns `(mean |delta|, Option<mean logπ>)` over non-skipped transitions.
-    /// The mean logπ is consumed by [`sac_temperature_update`](Self::sac_temperature_update)
-    /// (caller, T12). Returns `(0.0, None)` when the entire batch is skipped —
+    /// The mean logπ is consumed by [`sac_temperature_update`](Self::sac_temperature_update).
+    /// Returns `(0.0, None)` when the entire batch is skipped —
     /// the `None` signals the caller to skip the temperature update rather than
     /// drift `log_alpha` on a garbage zero logp (Fix 5).
     ///
@@ -489,7 +489,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 }
             };
 
-            // Step 5 — reparameterised descent delta (FD-verified formula, T11).
+            // Step 5 — reparameterised descent delta (FD-verified formula).
             let mut delta =
                 super::sac_actor_delta(&mu, &log_sigma, &a_raw_fresh, &eps_fresh, &g_a, alpha);
 
