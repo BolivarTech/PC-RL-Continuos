@@ -463,7 +463,7 @@ impl<L: LinAlg> MlpCritic<L> {
 
     /// Extracts a serializable snapshot of current weights.
     ///
-    /// Converts generic layers to CPU layers via [`layer_to_cpu`] for
+    /// Converts generic layers to CPU layers via `layer_to_cpu` for
     /// backend-agnostic serialization.
     pub fn to_weights(&self) -> MlpCriticWeights {
         let layers = self

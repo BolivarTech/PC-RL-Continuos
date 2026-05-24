@@ -44,6 +44,7 @@ pub use pc_actor_critic::{
     ActionSpace, ActivationCache, EwmaTracker, FisherState, HysteresisState, PcActorCritic,
     PcActorCriticConfig, PlasticityState, TrajectoryStep,
 };
+pub use q_critic::{QCritic, QCriticConfig, QCriticWeights};
 pub use serializer::{
     checkpoint_filename, load_agent, load_agent_generic, save_agent, save_checkpoint,
     AgentMetadata, PcActorWeights, SaveFile, TrainingMetrics,
@@ -55,5 +56,7 @@ pub type LayerCpu = Layer<CpuLinAlg>;
 pub type PcActorCpu = PcActor<CpuLinAlg>;
 /// Type alias: CPU-backed MLP critic.
 pub type MlpCriticCpu = MlpCritic<CpuLinAlg>;
+/// Type alias: CPU-backed Q-critic.
+pub type QCriticCpu = QCritic<CpuLinAlg>;
 /// Type alias: CPU-backed PC actor-critic agent.
 pub type PcActorCriticCpu = PcActorCritic<CpuLinAlg>;
