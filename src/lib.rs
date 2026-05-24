@@ -25,6 +25,7 @@ pub mod matrix;
 pub mod mlp_critic;
 pub mod pc_actor;
 pub mod pc_actor_critic;
+pub mod q_critic;
 pub mod serializer;
 
 pub use activation::Activation;
