@@ -14646,8 +14646,7 @@ mod tests {
     #[test]
     fn test_sac_critic_target_is_finite_single_transition() {
         let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
         let t = crate::pc_actor_critic::replay::ReplayTransition {
             state: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
             action: crate::pc_actor_critic::replay::Action::Continuous(vec![0.4]),
@@ -14667,8 +14666,7 @@ mod tests {
         // in transitions, after many sac_critic_update calls the trained Q must
         // rank a=0.7 above a=-0.7.
         let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 7)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 7).unwrap();
         let s = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
         let make = |a_raw: f64, r: f64| crate::pc_actor_critic::replay::ReplayTransition {
             state: s.clone(),

@@ -20,6 +20,7 @@
 
 use crate::layer::Layer;
 use crate::linalg::LinAlg;
+use crate::pc_actor_critic::replay::{Action, ReplayTransition};
 use crate::pc_actor_critic::PcActorCritic;
 
 impl<L: LinAlg> PcActorCritic<L> {
@@ -146,6 +147,147 @@ impl<L: LinAlg> PcActorCritic<L> {
             }
             self.q2_target = Some(target);
         }
+    }
+
+    /// Computes the soft-Bellman target `y` for a single replay transition.
+    ///
+    /// Runs PC inference on `next_state` with the LIVE actor to draw a fresh
+    /// reparameterized action `a'`, computes `log π(a'|s')`, evaluates both
+    /// target Q-critics, and returns:
+    ///
+    /// ```text
+    /// y = r + γ·(1−done)·(min(q1_target(s',a'), q2_target(s',a')) − α·log π(a'|s'))
+    /// ```
+    ///
+    /// Returns `None` if the transition contains a non-Continuous action,
+    /// or if any intermediate value (sampled action, log-prob, Q-values,
+    /// or final target) is non-finite.  The caller increments
+    /// `sac_skipped_critic_updates` for each `None`.
+    ///
+    /// # Borrow-checker strategy
+    ///
+    /// Inference (`&self.actor`) and target-critic forward (`&self.q1_target`)
+    /// are pure reads; they complete before any mutable borrow of `self.rng`.
+    /// We snapshot the actor output as a host `Vec<f64>` and the target Q-values
+    /// as scalars, then advance `self.rng` for the fresh action sample — all
+    /// before the mutable `q1/q2.update` calls in `sac_critic_update`.
+    pub(crate) fn sac_bellman_target(&mut self, t: &ReplayTransition) -> Option<f64> {
+        let action_dim = self.config.q_critic.as_ref()?.action_dim;
+        let gamma = self.config.gamma;
+        let alpha = self.alpha();
+
+        // --- actor inference on next_state (immutable borrow of self.actor) ---
+        // Snapshot y_conv as a host Vec<f64> immediately so the borrow ends.
+        let y_next = {
+            let infer = self.actor.infer(&t.next_state);
+            self.backend.vec_to_vec(&infer.y_conv)
+        };
+        let (mu_n, ls_n) = super::split_mu_log_sigma(&y_next, action_dim);
+
+        // --- sample fresh a' using self.rng (mutable borrow of rng only) ---
+        let (a_next_raw, a_next) = super::sample_squashed_action(&mu_n, &ls_n, &mut self.rng);
+        let logp_next = super::squashed_log_prob(&mu_n, &ls_n, &a_next_raw);
+
+        // --- target Q-values (immutable borrows of q1_target / q2_target) ---
+        let q1t = self.q1_target.as_ref()?.forward(&t.next_state, &a_next);
+        let q2t = self.q2_target.as_ref()?.forward(&t.next_state, &a_next);
+
+        let q_next = q1t.min(q2t);
+        let done_mask = if t.done { 1.0 } else { 0.0 };
+        let y = t.reward + gamma * (1.0 - done_mask) * (q_next - alpha * logp_next);
+
+        // Guard: skip transitions where any intermediate value is non-finite.
+        if !a_next.iter().all(|x| x.is_finite())
+            || !logp_next.is_finite()
+            || !q_next.is_finite()
+            || !y.is_finite()
+        {
+            return None;
+        }
+
+        Some(y)
+    }
+
+    /// SAC soft-Bellman critic update over a replay batch.
+    ///
+    /// For each transition in `batch`:
+    ///
+    /// 1. Compute soft-Bellman target `y` via [`sac_bellman_target`](Self::sac_bellman_target).
+    /// 2. Update both live Q-critics toward `y` with MSE loss.
+    ///
+    /// Returns the mean `0.5 * (MSE_q1 + MSE_q2)` over non-skipped transitions.
+    /// Returns `0.0` when the entire batch is skipped.
+    ///
+    /// # Borrow-checker strategy (two-pass)
+    ///
+    /// Computing targets requires immutable borrows of `self.actor`,
+    /// `self.q1_target`, `self.q2_target`, and a mutable borrow of `self.rng`.
+    /// Updating `q1` / `q2` requires mutable borrows of those fields.
+    /// Rust forbids simultaneous `&self` and `&mut self` borrows, so we split
+    /// into two passes:
+    ///
+    /// 1. **Target pass** (immutable + rng) — call `sac_bellman_target` for
+    ///    every transition, collecting `(executed_a, y)` pairs.
+    /// 2. **Update pass** (mutable q1/q2) — iterate the collected pairs and
+    ///    call `q1.update` / `q2.update`.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` — Slice of replay transitions (SAC uses Continuous actions).
+    ///
+    /// # Returns
+    ///
+    /// Mean MSE loss over the batch.
+    #[allow(dead_code)] // wired in T12
+    pub(crate) fn sac_critic_update(&mut self, batch: &[ReplayTransition]) -> f64 {
+        // --- Pass 1: compute all soft-Bellman targets ---
+        // Each entry is (state, executed_a_squashed, next_state is in t, y).
+        // We store (state clone, executed_action_squashed, y) to avoid holding
+        // references into `batch` across the mutable update pass.
+        let mut targets: Vec<(Vec<f64>, Vec<f64>, f64)> = Vec::with_capacity(batch.len());
+
+        for t in batch {
+            let a_raw = match &t.action {
+                Action::Continuous(v) => v.clone(),
+                Action::Discrete(_) => {
+                    self.sac_skipped_critic_updates += 1;
+                    continue;
+                }
+            };
+            // Executed action is the squashed (tanh) version of the stored pre-squash a_raw.
+            let a_squashed: Vec<f64> = a_raw.iter().map(|x| x.tanh()).collect();
+
+            match self.sac_bellman_target(t) {
+                Some(y) => targets.push((t.state.clone(), a_squashed, y)),
+                None => {
+                    self.sac_skipped_critic_updates += 1;
+                }
+            }
+        }
+
+        if targets.is_empty() {
+            return 0.0;
+        }
+
+        // --- Pass 2: update live Q-critics with collected targets ---
+        let mut total = 0.0_f64;
+        let n = targets.len() as f64;
+
+        for (state, a_squashed, y) in &targets {
+            let l1 = self
+                .q1
+                .as_mut()
+                .expect("sac_critic_update: q1 must be Some in SAC mode")
+                .update(state, a_squashed, *y);
+            let l2 = self
+                .q2
+                .as_mut()
+                .expect("sac_critic_update: q2 must be Some in SAC mode")
+                .update(state, a_squashed, *y);
+            total += 0.5 * (l1 + l2);
+        }
+
+        total / n
     }
 
     /// Blends one target layer toward a live layer with Polyak rate `tau`.
