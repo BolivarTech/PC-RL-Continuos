@@ -1,6 +1,12 @@
 # Changelog
 
-## [4.2.0] - 2026-05-23
+## [5.0.0] - 2026-05-23
+
+### Breaking
+- Adding the public `policy_entropy_coeff` field to `PcActorCriticConfig` breaks external
+  code that constructs the struct with an **exhaustive struct literal** (the literal must
+  now include the new field). Deserialization via serde is unaffected — configs that omit
+  the field receive the serde default (`0.1`).
 
 ### Added (continuous action mode)
 - Entropy regularization of the tanh-squashed Gaussian policy
