@@ -290,14 +290,16 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// For each transition in `batch`:
     ///
     /// 1. Run PC inference on `state` to get `y_conv` (unbounded μ‖log_σ).
-    /// 2. Split into `(μ, log_σ)`; reconstruct the fixed ε from the stored
-    ///    `a_raw` so the reparameterisation noise is consistent with the
-    ///    Q-gradient evaluation.
+    /// 2. Split into `(μ, log_σ)`; draw a FRESH reparameterisation noise
+    ///    `ε ~ N(0, I)` via `sample_squashed_action` — canonical SAC requires
+    ///    an on-policy sample, not the replay-stored action.  Recover `ε` from
+    ///    the fresh `a_raw` as `ε[j] = (a_raw[j] − μ[j]) / σ[j]` (exact).
     /// 3. Evaluate `∂ min(Q1,Q2)(s,a) / ∂a` via the critic with the smaller
-    ///    Q-value.
+    ///    Q-value at the FRESH squashed action.
     /// 4. Compute the descent delta via [`sac_actor_delta`] (FD-verified formula).
-    /// 5. Apply GRAD_CLIP headroom (mirror of v5 entropy arm): clip the combined
-    ///    delta to `±GRAD_CLIP` so the restoring force survives `layer.backward`.
+    /// 5. Apply GRAD_CLIP headroom: clamp the per-state delta to `±GRAD_CLIP`,
+    ///    then scale by `1 / batch.len()` so the sequential application of
+    ///    per-state updates equals the MEAN gradient (not the sum).
     ///    Non-finite deltas are skipped (`sac_skipped_actor_updates += 1`).
     /// 6. Apply via `apply_actor_update_and_bookkeeping` with empty mask and
     ///    `action=0` (no discrete KL / EWC logit-reversal; continuous-only path).
@@ -306,6 +308,25 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// The mean logπ is consumed by [`sac_temperature_update`](Self::sac_temperature_update)
     /// (caller, T12). Returns `(0.0, 0.0)` when the entire batch is skipped.
     ///
+    /// # Batch averaging
+    ///
+    /// The actor is updated sequentially (one transition at a time) against a
+    /// snapshot that shifts after every `apply_actor_update_and_bookkeeping` call.
+    /// Without normalisation the effective gradient step is `batch_size × lr`, not
+    /// `lr`.  Scaling each per-state delta by `1 / batch.len()` makes the aggregate
+    /// weight change equal the mean gradient times `lr`.  The GRAD_CLIP clamp is
+    /// applied BEFORE the `1/n` scaling so the restoring force is preserved at its
+    /// full strength; the scaling only prevents the sum from inflating the effective
+    /// step size.
+    ///
+    /// # Fresh ε — canonical SAC
+    ///
+    /// Canonical SAC draws `ε ~ N(0, I)` fresh for each state during the actor
+    /// update, so the pathwise gradient is evaluated at an on-policy sample rather
+    /// than the (potentially stale) stored action.  The replay-stored `a_raw` is
+    /// NOT used for the actor update; it is used only by the critic update (which
+    /// correctly trains Q at the executed stored action).
+    ///
     /// # Borrow-checker strategy (two-pass)
     ///
     /// `apply_actor_update_and_bookkeeping` needs `&infer` (an `InferResult<L>`)
@@ -313,10 +334,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// approach matching `sac_critic_update` (T10):
     ///
     /// 1. **Compute pass** — for each transition, run inference (`&self.actor`),
+    ///    sample fresh action (`&mut self.rng` — separate field, no conflict),
     ///    evaluate Q-values and gradients (`&self.q1`, `&self.q2`), and compute
     ///    the delta.  Collect `(InferResult, y_conv_vec, delta, logp)` tuples by
     ///    *cloning* the `InferResult` (`InferResult<L>: Clone`).  No `&mut self`
-    ///    borrows in this pass.
+    ///    (other than `rng`) borrows in this pass.
     /// 2. **Apply pass** — iterate the collected tuples and call
     ///    `apply_actor_update_and_bookkeeping` with `&collected_infer`.
     ///
@@ -333,9 +355,21 @@ impl<L: LinAlg> PcActorCritic<L> {
             None => return (0.0, 0.0),
         };
         let alpha = self.alpha();
+        // Batch-averaging scale: divide each per-state delta by the full batch
+        // length (not the number of non-skipped transitions) so that a consistent
+        // 1/n normalisation holds regardless of how many transitions are skipped.
+        // Using `batch.len()` matches the SAC convention of computing the gradient
+        // mean over the sampled mini-batch.
+        let inv_n = if batch.is_empty() {
+            return (0.0, 0.0);
+        } else {
+            1.0 / batch.len() as f64
+        };
 
-        // --- Pass 1: compute per-transition data (only immutable borrows) ---
-        // Each entry: (InferResult clone, y_conv_vec, delta, logp, state clone).
+        // --- Pass 1: compute per-transition data ---
+        // Borrows: &self.actor (infer), &mut self.rng (fresh sample),
+        //          &self.q1 / &self.q2 (forward + action_gradient).
+        // All of these are separate fields → Rust NLL allows them concurrently.
         struct TransitionData<L: crate::linalg::LinAlg> {
             infer: crate::pc_actor::InferResult<L>,
             y_conv_vec: Vec<f64>,
@@ -347,56 +381,54 @@ impl<L: LinAlg> PcActorCritic<L> {
         let mut collected: Vec<TransitionData<L>> = Vec::with_capacity(batch.len());
 
         for t in batch {
-            let a_raw_stored = match &t.action {
-                Action::Continuous(v) => v.clone(),
-                Action::Discrete(_) => {
-                    self.sac_skipped_actor_updates += 1;
-                    continue;
-                }
-            };
+            // Only process Continuous transitions for the actor update.
+            if matches!(&t.action, Action::Discrete(_)) {
+                self.sac_skipped_actor_updates += 1;
+                continue;
+            }
 
-            // Inference on current state (immutable borrow of self.actor).
+            // Step 1 — actor PC inference on state (immutable borrow of self.actor).
             let infer = self.actor.infer(&t.state);
             let y_conv_vec = self.backend.vec_to_vec(&infer.y_conv);
 
-            // Split actor output into (μ, log_σ).
+            // Step 2 — split actor output into (μ, log_σ).
             let (mu, log_sigma) = super::split_mu_log_sigma(&y_conv_vec, action_dim);
 
-            // Reconstruct ε from the replay-stored a_raw and the CURRENT (μ, σ).
-            // Canonical SAC draws a fresh ε~N(0,I) per actor update; here we
-            // reconstruct ε = (a_raw − μ_current) / σ_current so the pathwise
-            // gradient is evaluated at the stored action rather than a new sample.
-            // Algebraically a_raw = μ_current + σ_current·ε reproduces the stored
-            // pre-squash value; the gradient is exact at that point but is computed
-            // at the off-policy stored action, not a fresh on-policy draw.
-            // Deterministic convergence is validated downstream (B10).
-            let eps: Vec<f64> = (0..action_dim)
-                .map(|j| (a_raw_stored[j] - mu[j]) / log_sigma[j].exp())
+            // Step 2 (cont.) — draw FRESH reparameterisation noise ε ~ N(0, I).
+            // sample_squashed_action internally samples ε and returns
+            // (a_raw, a) where a_raw = μ + σ·ε_fresh, a = tanh(a_raw).
+            // We recover ε_fresh exactly as (a_raw − μ) / σ to pass to
+            // sac_actor_delta (which needs the actual ε used for the log_σ gradient).
+            let (a_raw_fresh, a_fresh) =
+                super::sample_squashed_action(&mu, &log_sigma, &mut self.rng);
+            let eps_fresh: Vec<f64> = (0..action_dim)
+                .map(|j| (a_raw_fresh[j] - mu[j]) / log_sigma[j].exp())
                 .collect();
 
-            // Squashed action for Q-gradient evaluation.
-            let a_squashed: Vec<f64> = a_raw_stored.iter().map(|x| x.tanh()).collect();
+            // Step 3 — log-probability at the FRESH sample (feeds temperature update).
+            let logp = super::squashed_log_prob(&mu, &log_sigma, &a_raw_fresh);
 
-            // Pick the critic with the smaller Q-value for the conservative gradient.
+            // Step 4 — pick the critic with the smaller Q-value (clipped double-Q).
+            // Q is evaluated at the FRESH squashed action a_fresh.
             let q1_val = match &self.q1 {
-                Some(q) => q.forward(&t.state, &a_squashed),
+                Some(q) => q.forward(&t.state, &a_fresh),
                 None => {
                     self.sac_skipped_actor_updates += 1;
                     continue;
                 }
             };
             let q2_val = match &self.q2 {
-                Some(q) => q.forward(&t.state, &a_squashed),
+                Some(q) => q.forward(&t.state, &a_fresh),
                 None => {
                     self.sac_skipped_actor_updates += 1;
                     continue;
                 }
             };
 
-            // ∂ min(Q1,Q2) / ∂a from the critic with the smaller Q-value.
+            // ∂ min(Q1,Q2) / ∂a at the FRESH squashed action.
             let g_a = if q1_val <= q2_val {
                 match &self.q1 {
-                    Some(q) => q.action_gradient(&t.state, &a_squashed),
+                    Some(q) => q.action_gradient(&t.state, &a_fresh),
                     None => {
                         self.sac_skipped_actor_updates += 1;
                         continue;
@@ -404,7 +436,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 }
             } else {
                 match &self.q2 {
-                    Some(q) => q.action_gradient(&t.state, &a_squashed),
+                    Some(q) => q.action_gradient(&t.state, &a_fresh),
                     None => {
                         self.sac_skipped_actor_updates += 1;
                         continue;
@@ -412,26 +444,27 @@ impl<L: LinAlg> PcActorCritic<L> {
                 }
             };
 
-            // Log-probability under current policy.
-            let logp = super::squashed_log_prob(&mu, &log_sigma, &a_raw_stored);
-
-            // Reparameterised descent delta (FD-verified formula, T11).
+            // Step 5 — reparameterised descent delta (FD-verified formula, T11).
             let mut delta =
-                super::sac_actor_delta(&mu, &log_sigma, &a_raw_stored, &eps, &g_a, alpha);
+                super::sac_actor_delta(&mu, &log_sigma, &a_raw_fresh, &eps_fresh, &g_a, alpha);
 
-            // GRAD_CLIP-survival: clamp the whole delta to ±GRAD_CLIP.
-            // Mirrors the v5 entropy arm's headroom approach:
-            //   the entropy part (|jac_ent| ≤ 2) and Q-gradient are already
-            //   combined in sac_actor_delta; clamping to ±GRAD_CLIP ensures
-            //   the combined delta survives layer.backward's clip.
+            // GRAD_CLIP-survival: clamp each component to ±GRAD_CLIP BEFORE
+            // batch-averaging so the restoring force is preserved at full
+            // strength in the saturated region (mirrors the v5 entropy arm).
             for d in &mut delta {
                 *d = d.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
             }
 
-            // Non-finite guard: skip if any delta component is non-finite.
+            // Non-finite guard: skip if any delta component or logp is non-finite.
             if delta.iter().any(|d| !d.is_finite()) || !logp.is_finite() {
                 self.sac_skipped_actor_updates += 1;
                 continue;
+            }
+
+            // Step 5 (cont.) — batch averaging: scale by 1/n so the sequential
+            // sum of per-state updates equals the mean gradient, not the sum.
+            for d in &mut delta {
+                *d *= inv_n;
             }
 
             collected.push(TransitionData {
@@ -453,7 +486,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         let mut total_logp = 0.0_f64;
 
         for td in collected {
-            // Mean |delta| over all delta components (μ and log_σ halves).
+            // Mean |delta| over all delta components (μ and log_σ halves),
+            // before the 1/n scaling is applied — report the per-state magnitude
+            // so the reported metric is comparable across batch sizes.
             let mean_abs: f64 =
                 td.delta.iter().map(|d| d.abs()).sum::<f64>() / td.delta.len().max(1) as f64;
             total_delta_abs += mean_abs;
