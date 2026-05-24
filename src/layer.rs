@@ -186,6 +186,30 @@ impl<L: LinAlg> Layer<L> {
         let wt = self.backend.mat_transpose(&self.weights);
         self.backend.mat_vec_mul(&wt, &grad)
     }
+
+    /// Gradient of the layer output w.r.t. its input, given upstream `delta`
+    /// (∂loss/∂output). Computes `Wᵀ·(delta ⊙ activation'(output))` from the
+    /// CURRENT weights WITHOUT mutating any state. Used for backprop-to-input
+    /// (e.g. `∇_a Q`); distinct from [`Layer::backward`], which performs a weight update.
+    ///
+    /// # Arguments
+    ///
+    /// * `output` - This layer's post-activation output from the forward pass.
+    /// * `delta` - Upstream gradient w.r.t. this layer's output (length = output_size).
+    ///
+    /// # Returns
+    ///
+    /// Gradient w.r.t. this layer's input (length = input_size).
+    ///
+    /// # Panics
+    ///
+    /// Panics on dimension mismatch (`delta.len() != output_size`).
+    pub fn input_gradient(&self, output: &L::Vector, delta: &L::Vector) -> L::Vector {
+        let deriv = self.backend.apply_derivative(output, self.activation);
+        let grad = self.backend.vec_hadamard(delta, &deriv);
+        let wt = self.backend.mat_transpose(&self.weights);
+        self.backend.mat_vec_mul(&wt, &grad)
+    }
 }
 
 #[cfg(test)]
@@ -468,14 +492,16 @@ mod tests {
     fn test_input_gradient_does_not_mutate_weights() {
         let mut rng = make_rng();
         let backend = make_backend();
-        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
+        let layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
         let before = layer.weights.clone();
         let output = layer.forward(&vec![0.5, -0.5, 0.1, 0.0]);
         let _ = layer.input_gradient(&output, &vec![0.1, -0.2, 0.3]);
         for r in 0..3 {
             for c in 0..4 {
-                assert!((layer.weights.get(r, c) - before.get(r, c)).abs() < 1e-15,
-                    "input_gradient must not mutate weights");
+                assert!(
+                    (layer.weights.get(r, c) - before.get(r, c)).abs() < 1e-15,
+                    "input_gradient must not mutate weights"
+                );
             }
         }
     }
