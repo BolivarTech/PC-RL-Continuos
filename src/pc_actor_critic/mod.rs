@@ -343,6 +343,11 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// target). Each skipped transition increments this by one; the counter
     /// never resets. Exposed for diagnostics.
     pub(crate) sac_skipped_critic_updates: u64,
+    /// Monotonic counter of SAC actor update steps skipped due to non-finite
+    /// delta values (non-finite Q-gradient, log-prob, or intermediate values).
+    /// Each skipped transition increments this by one; the counter never resets.
+    /// Exposed for diagnostics (T11/T12).
+    pub(crate) sac_skipped_actor_updates: u64,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -410,7 +415,6 @@ fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
 /// correction remains finite even when `|a_raw|` is very large (tanh ≈ ±1).
 /// Must equal `1e-6` — pinned by [`test_squashed_log_prob_matches_reference`].
 // wired in T10/T11
-#[allow(dead_code)]
 const SQUASH_JAC_EPS: f64 = 1e-6;
 
 /// Log-probability of the tanh-squashed diagonal Gaussian policy at `a = tanh(a_raw)`,
@@ -440,7 +444,6 @@ const SQUASH_JAC_EPS: f64 = 1e-6;
 ///
 /// The scalar `logπ(a|s)` summed over all action components.
 // wired in T10/T11
-#[allow(dead_code)]
 fn squashed_log_prob(mu_raw: &[f64], log_sigma: &[f64], a_raw: &[f64]) -> f64 {
     let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
     let mut lp = 0.0;
@@ -452,6 +455,58 @@ fn squashed_log_prob(mu_raw: &[f64], log_sigma: &[f64], a_raw: &[f64]) -> f64 {
         lp -= (1.0 - t * t + SQUASH_JAC_EPS).ln();
     }
     lp
+}
+
+/// Reparameterized SAC actor DESCENT delta on `(mu_raw, log_sigma_raw)`,
+/// of length `2 * action_dim`, minimising `L = α·logπ(a|s) − min(Q1,Q2)(s,a)`.
+///
+/// Under reparameterisation the Gaussian score terms cancel (ε is constant
+/// in μ and log σ). The entropy gradient uses the ε_stab-consistent
+/// tanh-Jacobian derivative so the formula is exact at saturation.
+///
+/// Descent direction per component `j` (n = action_dim):
+///
+/// ```text
+/// jac     = 1 − tanh²(a_raw[j])
+/// jac_ent = 2·t·jac / (jac + ε_stab)   where t = tanh(a_raw[j])
+/// σ       = exp(log_sigma[j])
+/// δμ[j]      = α·jac_ent − g_a[j]·jac
+/// δlog_σ[j]  = α·(−1 + jac_ent·σ·ε[j]) − g_a[j]·jac·σ·ε[j]
+/// ```
+///
+/// # Arguments
+///
+/// * `mu` — unbounded policy mean μ_raw, length `n`.
+/// * `log_sigma` — log standard deviation (clamped), length `n`.
+/// * `a_raw` — pre-squash sample `μ + σ·ε`, length `n`.
+/// * `eps` — the fixed reparameterisation noise `ε = (a_raw − μ) / σ`, length `n`.
+/// * `g_a` — `∂ min(Q1,Q2) / ∂a` evaluated at the squashed action, length `n`.
+/// * `alpha` — SAC entropy temperature `α ≥ 0`.
+///
+/// # Returns
+///
+/// Descent delta of length `2n`: first `n` entries are `δμ`, next `n` are `δlog_σ`.
+pub(crate) fn sac_actor_delta(
+    mu: &[f64],
+    log_sigma: &[f64],
+    a_raw: &[f64],
+    eps: &[f64],
+    g_a: &[f64],
+    alpha: f64,
+) -> Vec<f64> {
+    let n = mu.len();
+    let mut delta = vec![0.0; 2 * n];
+    for j in 0..n {
+        let t = a_raw[j].tanh();
+        let jac = 1.0 - t * t;
+        let sigma = log_sigma[j].exp();
+        let jac_ent = 2.0 * t * jac / (jac + SQUASH_JAC_EPS);
+        // μ-half: entropy gradient − Q pathwise gradient
+        delta[j] = alpha * jac_ent - g_a[j] * jac;
+        // log_σ-half: entropy gradient − Q pathwise gradient
+        delta[n + j] = alpha * (-1.0 + jac_ent * sigma * eps[j]) - g_a[j] * jac * sigma * eps[j];
+    }
+    delta
 }
 
 /// Sample one standard-normal variate via Box–Muller (cosine half).
@@ -1695,6 +1750,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q1_target,
             q2_target,
             sac_skipped_critic_updates: 0,
+            sac_skipped_actor_updates: 0,
         })
     }
 
@@ -1824,6 +1880,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q1_target: None,
             q2_target: None,
             sac_skipped_critic_updates: 0,
+            sac_skipped_actor_updates: 0,
         })
     }
 
@@ -1888,6 +1945,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             q1_target: None,
             q2_target: None,
             sac_skipped_critic_updates: 0,
+            sac_skipped_actor_updates: 0,
         }
     }
 
@@ -14720,8 +14778,8 @@ mod tests {
         let s = [0.3_f64, -0.4];
         let alpha = 0.4_f64;
         for (mu, log_sigma) in [
-            (vec![0.1_f64, -0.2], vec![-0.3_f64, 0.1]),  // mid-range
-            (vec![3.0_f64, -3.0], vec![0.0_f64, 0.0]),   // SATURATED (|a_raw|≈3, tanh≈±0.995)
+            (vec![0.1_f64, -0.2], vec![-0.3_f64, 0.1]), // mid-range
+            (vec![3.0_f64, -3.0], vec![0.0_f64, 0.0]),  // SATURATED (|a_raw|≈3, tanh≈±0.995)
         ] {
             let eps = [0.7_f64, -0.3]; // FIXED reparam noise
             let n = mu.len();

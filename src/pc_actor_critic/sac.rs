@@ -290,6 +290,194 @@ impl<L: LinAlg> PcActorCritic<L> {
         total / n
     }
 
+    /// SAC reparameterised actor update over a replay batch.
+    ///
+    /// For each transition in `batch`:
+    ///
+    /// 1. Run PC inference on `state` to get `y_conv` (unbounded μ‖log_σ).
+    /// 2. Split into `(μ, log_σ)`; reconstruct the fixed ε from the stored
+    ///    `a_raw` so the reparameterisation noise is consistent with the
+    ///    Q-gradient evaluation.
+    /// 3. Evaluate `∂ min(Q1,Q2)(s,a) / ∂a` via the critic with the smaller
+    ///    Q-value.
+    /// 4. Compute the descent delta via [`sac_actor_delta`] (FD-verified formula).
+    /// 5. Apply GRAD_CLIP headroom (mirror of v5 entropy arm): clip the combined
+    ///    delta to `±GRAD_CLIP` so the restoring force survives `layer.backward`.
+    ///    Non-finite deltas are skipped (`sac_skipped_actor_updates += 1`).
+    /// 6. Apply via `apply_actor_update_and_bookkeeping` with empty mask and
+    ///    `action=0` (no discrete KL / EWC logit-reversal; continuous-only path).
+    ///
+    /// Returns `(mean |delta|, mean logπ)` over non-skipped transitions.
+    /// The mean logπ is consumed by [`sac_temperature_update`](Self::sac_temperature_update)
+    /// (caller, T12). Returns `(0.0, 0.0)` when the entire batch is skipped.
+    ///
+    /// # Borrow-checker strategy (two-pass)
+    ///
+    /// `apply_actor_update_and_bookkeeping` needs `&infer` (an `InferResult<L>`)
+    /// and `&mut self` simultaneously.  To avoid the conflict we use a two-pass
+    /// approach matching `sac_critic_update` (T10):
+    ///
+    /// 1. **Compute pass** — for each transition, run inference (`&self.actor`),
+    ///    evaluate Q-values and gradients (`&self.q1`, `&self.q2`), and compute
+    ///    the delta.  Collect `(InferResult, y_conv_vec, delta, logp)` tuples by
+    ///    *cloning* the `InferResult` (`InferResult<L>: Clone`).  No `&mut self`
+    ///    borrows in this pass.
+    /// 2. **Apply pass** — iterate the collected tuples and call
+    ///    `apply_actor_update_and_bookkeeping` with `&collected_infer`.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` — slice of replay transitions (SAC uses Continuous actions).
+    ///
+    /// # Returns
+    ///
+    /// `(mean |delta|, mean logπ)`.
+    #[allow(dead_code)] // wired in T12
+    pub(crate) fn sac_actor_update(&mut self, batch: &[ReplayTransition]) -> (f64, f64) {
+        let action_dim = match self.config.q_critic.as_ref() {
+            Some(q) => q.action_dim,
+            None => return (0.0, 0.0),
+        };
+        let alpha = self.alpha();
+
+        // --- Pass 1: compute per-transition data (only immutable borrows) ---
+        // Each entry: (InferResult clone, y_conv_vec, delta, logp, state clone).
+        struct TransitionData<L: crate::linalg::LinAlg> {
+            infer: crate::pc_actor::InferResult<L>,
+            y_conv_vec: Vec<f64>,
+            delta: Vec<f64>,
+            logp: f64,
+            state: Vec<f64>,
+        }
+
+        let mut collected: Vec<TransitionData<L>> = Vec::with_capacity(batch.len());
+
+        for t in batch {
+            let a_raw_stored = match &t.action {
+                Action::Continuous(v) => v.clone(),
+                Action::Discrete(_) => {
+                    self.sac_skipped_actor_updates += 1;
+                    continue;
+                }
+            };
+
+            // Inference on current state (immutable borrow of self.actor).
+            let infer = self.actor.infer(&t.state);
+            let y_conv_vec = self.backend.vec_to_vec(&infer.y_conv);
+
+            // Split actor output into (μ, log_σ).
+            let (mu, log_sigma) = super::split_mu_log_sigma(&y_conv_vec, action_dim);
+
+            // Reconstruct fixed ε from stored a_raw (ε = (a_raw − μ) / σ).
+            let eps: Vec<f64> = (0..action_dim)
+                .map(|j| (a_raw_stored[j] - mu[j]) / log_sigma[j].exp())
+                .collect();
+
+            // Squashed action for Q-gradient evaluation.
+            let a_squashed: Vec<f64> = a_raw_stored.iter().map(|x| x.tanh()).collect();
+
+            // Pick the critic with the smaller Q-value for the conservative gradient.
+            let q1_val = match &self.q1 {
+                Some(q) => q.forward(&t.state, &a_squashed),
+                None => {
+                    self.sac_skipped_actor_updates += 1;
+                    continue;
+                }
+            };
+            let q2_val = match &self.q2 {
+                Some(q) => q.forward(&t.state, &a_squashed),
+                None => {
+                    self.sac_skipped_actor_updates += 1;
+                    continue;
+                }
+            };
+
+            // ∂ min(Q1,Q2) / ∂a from the critic with the smaller Q-value.
+            let g_a = if q1_val <= q2_val {
+                match &self.q1 {
+                    Some(q) => q.action_gradient(&t.state, &a_squashed),
+                    None => {
+                        self.sac_skipped_actor_updates += 1;
+                        continue;
+                    }
+                }
+            } else {
+                match &self.q2 {
+                    Some(q) => q.action_gradient(&t.state, &a_squashed),
+                    None => {
+                        self.sac_skipped_actor_updates += 1;
+                        continue;
+                    }
+                }
+            };
+
+            // Log-probability under current policy.
+            let logp = super::squashed_log_prob(&mu, &log_sigma, &a_raw_stored);
+
+            // Reparameterised descent delta (FD-verified formula, T11).
+            let mut delta =
+                super::sac_actor_delta(&mu, &log_sigma, &a_raw_stored, &eps, &g_a, alpha);
+
+            // GRAD_CLIP-survival: clamp the whole delta to ±GRAD_CLIP.
+            // Mirrors the v5 entropy arm's headroom approach:
+            //   the entropy part (|jac_ent| ≤ 2) and Q-gradient are already
+            //   combined in sac_actor_delta; clamping to ±GRAD_CLIP ensures
+            //   the combined delta survives layer.backward's clip.
+            for d in &mut delta {
+                *d = d.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
+            }
+
+            // Non-finite guard: skip if any delta component is non-finite.
+            if delta.iter().any(|d| !d.is_finite()) || !logp.is_finite() {
+                self.sac_skipped_actor_updates += 1;
+                continue;
+            }
+
+            collected.push(TransitionData {
+                infer,
+                y_conv_vec,
+                delta,
+                logp,
+                state: t.state.clone(),
+            });
+        }
+
+        if collected.is_empty() {
+            return (0.0, 0.0);
+        }
+
+        // --- Pass 2: apply updates (mutable borrows of self via apply_*) ---
+        let n = collected.len() as f64;
+        let mut total_delta_abs = 0.0_f64;
+        let mut total_logp = 0.0_f64;
+
+        for td in collected {
+            // Mean |delta| over all delta components (μ and log_σ halves).
+            let mean_abs: f64 =
+                td.delta.iter().map(|d| d.abs()).sum::<f64>() / td.delta.len().max(1) as f64;
+            total_delta_abs += mean_abs;
+            total_logp += td.logp;
+
+            // td_error and loss are not meaningful for SAC actor update;
+            // pass 0.0 to mirror how the old continuous arm used placeholder values.
+            // The bookkeeping (surprise, td_error buffer) is gated on is_online;
+            // here we use LearnMode::Replay to skip online-only side effects.
+            self.apply_actor_update_and_bookkeeping(
+                &td.delta,
+                &td.infer,
+                &td.state,
+                &td.y_conv_vec,
+                &[], // empty mask: discrete KL / EWC logit-reversal skipped
+                0,   // action index: unused for continuous path
+                0.0, // td_error placeholder
+                0.0, // loss placeholder
+                super::LearnMode::Replay,
+            );
+        }
+
+        (total_delta_abs / n, total_logp / n)
+    }
+
     /// Blends one target layer toward a live layer with Polyak rate `tau`.
     ///
     /// ```text
