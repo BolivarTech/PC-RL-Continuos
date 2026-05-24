@@ -14989,4 +14989,107 @@ mod tests {
              mu_bump={mu_bump:.6} must be < mu_control={mu_control:.6}"
         );
     }
+
+    /// Off-policy PC-inference compute spike.
+    ///
+    /// Simulates the inference load of 100 SAC updates over a batch of 64
+    /// states. Each simulated update calls `act_continuous` 2 × 64 = 128 times
+    /// (actor-state + critic-next-state inference). Prints total elapsed,
+    /// per-update milliseconds, and a projected B10 wall-clock assuming
+    /// ~200 updates/episode × 500 episodes × 10 seeds.
+    ///
+    /// Run with:
+    /// ```text
+    /// cargo nextest run --release --run-ignored all test_sac_compute_spike --no-capture
+    /// ```
+    #[test]
+    #[ignore = "benchmark — run with --run-ignored"]
+    fn test_sac_compute_spike() {
+        // ── Build a continuous agent sized like the planned SAC actor ──────
+        // Actor: input=3, hidden=[32,32] Tanh, output=2 Linear, max_steps=20.
+        // Critic: input = 3 + 32 + 32 = 67 (latent concat from two hidden
+        // layers), one hidden layer of 64 Tanh, Linear output.
+        let mut cfg = default_config();
+        cfg.actor.input_size = 3;
+        cfg.actor.hidden_layers = vec![
+            LayerDef {
+                size: 32,
+                activation: Activation::Tanh,
+            },
+            LayerDef {
+                size: 32,
+                activation: Activation::Tanh,
+            },
+        ];
+        cfg.actor.output_size = 2;
+        cfg.actor.output_activation = Activation::Linear;
+        cfg.actor.max_steps = 20;
+        cfg.critic.input_size = 3 + 32 + 32; // state + latent concat
+        cfg.critic.hidden_layers = vec![LayerDef {
+            size: 64,
+            activation: Activation::Tanh,
+        }];
+        cfg.critic.output_activation = Activation::Linear;
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.policy_sigma = 0.3;
+
+        let mut agent: PcActorCritic =
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).expect("agent construction must succeed");
+
+        // ── Benchmark parameters ───────────────────────────────────────────
+        const N_UPDATES: u32 = 100;
+        const BATCH_SIZE: u32 = 64;
+        // 2× = actor-state inference + critic-next-state inference per item.
+        const INFERENCES_PER_UPDATE: u32 = 2 * BATCH_SIZE;
+
+        // ── Time the inference loop ────────────────────────────────────────
+        let start = std::time::Instant::now();
+
+        for update in 0..N_UPDATES {
+            for item in 0..INFERENCES_PER_UPDATE {
+                // Vary inputs so the compiler cannot constant-fold across iters.
+                let seed = f64::from(update * INFERENCES_PER_UPDATE + item);
+                let state = [
+                    (seed * 0.017).sin(),
+                    (seed * 0.031).cos(),
+                    (seed * 0.007).sin() * 0.5,
+                ];
+                let _ = agent
+                    .act_continuous(&state, SelectionMode::Training)
+                    .expect("act_continuous must not fail during benchmark");
+            }
+        }
+
+        let elapsed = start.elapsed();
+
+        // ── Compute and print timings ──────────────────────────────────────
+        let total_ms = elapsed.as_secs_f64() * 1000.0;
+        let per_update_ms = total_ms / f64::from(N_UPDATES);
+
+        // Projected B10 wall-clock: 200 updates/episode × 500 episodes × 10 seeds.
+        const UPDATES_PER_EPISODE: f64 = 200.0;
+        const EPISODES: f64 = 500.0;
+        const SEEDS: f64 = 10.0;
+        let total_updates_b10 = UPDATES_PER_EPISODE * EPISODES * SEEDS;
+        let projected_total_ms = per_update_ms * total_updates_b10;
+        let projected_minutes = projected_total_ms / 60_000.0;
+        let projected_hours = projected_minutes / 60.0;
+
+        let elapsed_secs = elapsed.as_secs_f64();
+        println!(
+            "\n=== SAC compute spike (release build) ===\
+             \n  Total elapsed:          {total_ms:.1} ms ({elapsed_secs:.2} s)\
+             \n  Per-update:             {per_update_ms:.3} ms  ({N_UPDATES} updates × {INFERENCES_PER_UPDATE} inferences)\
+             \n  Projected B10 total:    {projected_minutes:.1} min  ({projected_hours:.2} h)\
+             \n    (assumes {UPDATES_PER_EPISODE} updates/ep × {EPISODES} eps × {SEEDS} seeds)\
+             \n========================================="
+        );
+
+        // Only assert that it completes within a generous budget.
+        assert!(
+            elapsed.as_secs() < 120,
+            "compute spike must complete within 120 s; took {:.1} s",
+            elapsed.as_secs_f64()
+        );
+    }
 }
