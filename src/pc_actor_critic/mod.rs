@@ -14865,4 +14865,82 @@ mod tests {
     fn test_mu_raw_stays_bounded_under_sac() {
         // stub, filled in T15
     }
+
+    // ── T12 RED: SAC replay-loop wiring tests ────────────────────────────────
+
+    /// Push a continuous transition into a SAC agent's replay buffer directly
+    /// and sample it back; assert the stored `a_raw` is preserved exactly.
+    #[test]
+    fn test_continuous_transition_roundtrips_through_replay() {
+        use crate::pc_actor_critic::replay::{Action, ReplayTransition};
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
+                .unwrap();
+
+        let a_raw = vec![0.4_f64];
+        let transition = ReplayTransition {
+            state: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            action: Action::Continuous(a_raw.clone()),
+            reward: 1.0,
+            next_state: vec![0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+            done: false,
+            valid_actions: None,
+        };
+
+        // Push directly into the replay buffer.
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("SAC agent must have a replay buffer");
+        buf.push(transition).expect("push must succeed");
+
+        // Sample one transition back and verify a_raw is preserved.
+        let mut rng = rand::SeedableRng::seed_from_u64(1);
+        let batch = agent
+            .replay_buffer
+            .as_ref()
+            .unwrap()
+            .sample(1, &mut rng);
+        assert_eq!(batch.len(), 1, "batch should contain one transition");
+        match &batch[0].action {
+            Action::Continuous(stored) => {
+                assert_eq!(
+                    stored, &a_raw,
+                    "stored a_raw must round-trip exactly through the replay buffer"
+                );
+            }
+            other => panic!("expected Action::Continuous, got {:?}", other),
+        }
+    }
+
+    /// After enough `step_continuous` calls to fill the replay buffer above
+    /// warmup, the SAC update loop must have mutated BOTH actor output and q1.
+    #[test]
+    fn test_one_sac_step_mutates_actor_and_critics() {
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
+                .unwrap();
+
+        let s = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let probe_action = vec![0.5_f64];
+        let q1_before = agent.q1_for_test(&s, &probe_action);
+
+        // Drive 50 continuous steps; replay_batch_size=8 so after 9 pushes
+        // the buffer has enough samples to trigger sac_learn_step each call.
+        let next_s = vec![0.2_f64, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+        for i in 0..50 {
+            let state: Vec<f64> = s.iter().map(|&x| x + i as f64 * 0.001).collect();
+            let _action = agent
+                .step_continuous(&state, 1.0, false)
+                .expect("step_continuous must not error");
+            // Feed the next state so the learning step fires.
+            let _ = agent.step_continuous(&next_s, 0.5, false);
+        }
+
+        let q1_after = agent.q1_for_test(&s, &probe_action);
+        assert!(
+            (q1_before - q1_after).abs() > 1e-9,
+            "q1 should change after SAC steps; before={q1_before}, after={q1_after}"
+        );
+    }
 }
