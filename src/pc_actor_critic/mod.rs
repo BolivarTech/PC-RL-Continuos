@@ -2275,19 +2275,25 @@ impl<L: LinAlg> PcActorCritic<L> {
                     grad_direction.iter().map(|&g| td_error * g).collect()
                 };
 
-                // Entropy regularization (v4.2.0): the UNSQUASHED Gaussian
-                // entropy is θ-independent, but the executed policy is
-                // tanh-SQUASHED, whose entropy carries the Jacobian term
-                // −Σlog(1−tanh²(a_raw)) and DOES depend on μ. Its μ-gradient is
-                // a restoring force that bounds μ_raw at the squash boundary
-                // (closes H-A). Added AFTER the GAE trace decay/accumulate/clamp
-                // above, so it is excluded from the eligibility trace (B12) and
-                // not subject to the trace's GRAD_CLIP — the restoring force is
-                // preserved in the saturated regime. Bounded by 2α (|tanh|<1).
-                // α = 0 ⇒ exact v4.1.0 behavior.
-                let entropy = squashed_entropy_delta(self.config.policy_entropy_coeff, a_taken);
+                // Entropy regularization (v4.2.0): the tanh-squashed Gaussian
+                // entropy's μ-gradient is a restoring force that bounds μ_raw at
+                // the squash boundary (closes H-A). Added AFTER the GAE trace
+                // decay/accumulate/clamp (excluded from the trace, B12).
+                //
+                // GRAD_CLIP-survival (C4): the score-function advantage routinely
+                // exceeds ±GRAD_CLIP, and layer.backward clips grad=delta·deriv to
+                // ±GRAD_CLIP — which would erase the small entropy term. Reserve
+                // headroom: clip the advantage to ±(GRAD_CLIP − 2α) FIRST, then add
+                // the entropy (|entropy_j| ≤ 2α), so |delta_j| ≤ GRAD_CLIP and the
+                // Linear-output grad is not truncated. α = 0 ⇒ headroom = GRAD_CLIP
+                // and entropy = 0 → advantage clamped to ±GRAD_CLIP, identical to
+                // v4.1.0 (layer.backward, deriv=1, would clamp to the same value).
+                let alpha = self.config.policy_entropy_coeff;
+                let entropy = squashed_entropy_delta(alpha, a_taken);
+                let headroom =
+                    (crate::matrix::GRAD_CLIP - 2.0 * alpha).max(crate::matrix::GRAD_CLIP * 0.1);
                 for (d, e) in delta.iter_mut().zip(entropy.iter()) {
-                    *d += *e;
+                    *d = d.clamp(-headroom, headroom) + *e;
                 }
 
                 // Use shared bookkeeping. Pass an empty mask and action=0
