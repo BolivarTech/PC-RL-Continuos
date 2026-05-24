@@ -333,7 +333,7 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
     g
 }
 
-/// v4.2.0 — per-component DESCENT-delta contribution of the entropy regularizer
+/// v5.0.0 — per-component DESCENT-delta contribution of the entropy regularizer
 /// for the tanh-squashed Gaussian policy.
 ///
 /// The squashed-Gaussian differential entropy carries the Jacobian term
@@ -748,7 +748,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.policy_sigma, config.policy_sigma
                 )));
             }
-            // v4.2.0 — continuous entropy temperature must be non-negative and
+            // v5.0.0 — continuous entropy temperature must be non-negative and
             // finite. α = 0 is the v4.1.0-compatibility no-op; α > 0 enables the
             // entropy regularizer that bounds μ_raw (closes H-A).
             if !config.policy_entropy_coeff.is_finite() || config.policy_entropy_coeff < 0.0 {
@@ -775,7 +775,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                 )));
             }
             // Discrete `entropy_coeff` stays silently inert in continuous; the
-            // continuous entropy temperature is `policy_entropy_coeff` (v4.2.0).
+            // continuous entropy temperature is `policy_entropy_coeff` (v5.0.0).
 
             // GAE(λ) IS supported in continuous as of v4.1.0 — no rejection here.
 
@@ -2275,7 +2275,7 @@ impl<L: LinAlg> PcActorCritic<L> {
                     grad_direction.iter().map(|&g| td_error * g).collect()
                 };
 
-                // Entropy regularization (v4.2.0): the tanh-squashed Gaussian
+                // Entropy regularization (v5.0.0): the tanh-squashed Gaussian
                 // entropy's μ-gradient is a restoring force that bounds μ_raw at
                 // the squash boundary (closes H-A). Added AFTER the GAE trace
                 // decay/accumulate/clamp (excluded from the trace, B12).
@@ -14329,7 +14329,7 @@ mod tests {
         );
     }
 
-    // ── v4.2.0 policy_entropy_coeff validation ───────────────────────────
+    // ── v5.0.0 policy_entropy_coeff validation ───────────────────────────
 
     #[test]
     fn test_continuous_rejects_negative_entropy_coeff() {
@@ -14481,7 +14481,7 @@ mod tests {
         terminal_only_reward: bool,
         seed: u64,
         episodes: usize,
-        entropy: f64, // v4.2.0: continuous entropy temperature α (0.0 = v4.1.0 path)
+        entropy: f64, // v5.0.0: continuous entropy temperature α (0.0 = v4.1.0 path)
     ) -> (f64, f64) {
         use rand::{rngs::StdRng, Rng, SeedableRng};
         let mut cfg = continuous_base_config();
@@ -14698,7 +14698,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 4 (v4.2.0): continuous entropy gradient wiring tests
+    // Task 4 (v5.0.0): continuous entropy gradient wiring tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -14920,7 +14920,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 5 (v4.2.0): runtime mutability of policy_entropy_coeff (B6)
+    // Task 5 (v5.0.0): runtime mutability of policy_entropy_coeff (B6)
     // -----------------------------------------------------------------------
 
     #[test]

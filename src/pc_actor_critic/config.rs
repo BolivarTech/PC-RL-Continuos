@@ -85,7 +85,7 @@ fn default_entropy_coeff() -> f64 {
     0.01
 }
 
-/// Default continuous-policy entropy temperature `α` (v4.2.0).
+/// Default continuous-policy entropy temperature `α` (v5.0.0).
 ///
 /// Default-ON: a positive value so deserialized configs get the
 /// deterministic-convergence fix without opt-in (spec decision A). The exact
@@ -628,7 +628,7 @@ pub struct PcActorCriticConfig {
     /// Default 0.1.
     #[serde(default = "default_policy_sigma")]
     pub policy_sigma: f64,
-    /// v4.2.0 — continuous-policy entropy temperature `α`. Ignored when
+    /// v5.0.0 — continuous-policy entropy temperature `α`. Ignored when
     /// `action_space == Discrete` (discrete uses the separate `entropy_coeff`
     /// with a different, softmax-based estimator — do NOT conflate). Scales the
     /// tanh-squashed Gaussian entropy regularizer whose `μ`-gradient bounds
