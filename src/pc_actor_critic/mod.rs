@@ -46,6 +46,8 @@ pub mod replay;
 
 mod control;
 
+mod sac;
+
 /// Default cooldown (in learning steps) between consecutive `rollback_hard()` calls.
 ///
 /// Prevents thrashing when the caller repeatedly reverts the actor to the
@@ -311,6 +313,23 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// clamp was binding (MAGI R5 W5). Exposed via
     /// [`PcActorCritic::replay_clamp_count`].
     pub(crate) replay_clamp_count: u64,
+    /// SAC twin Q-critics (v6.0.0). `Some` in continuous SAC mode
+    /// (`action_space == Continuous && q_critic.is_some()`). `None`
+    /// for discrete agents and pre-v6 continuous agents without
+    /// `q_critic` config. Wired into the soft-Bellman target in T10.
+    #[allow(dead_code)] // wired in T10-T13
+    pub(crate) q1: Option<crate::q_critic::QCritic<L>>,
+    /// SAC twin Q-critic 2 (v6.0.0). See [`Self::q1`].
+    #[allow(dead_code)] // wired in T10-T13
+    pub(crate) q2: Option<crate::q_critic::QCritic<L>>,
+    /// Polyak-averaged soft target copy of `q1` (v6.0.0). Updated via
+    /// `polyak_update_targets()` after every critic update. `None`
+    /// when `q1` is `None`. Wired in T10.
+    #[allow(dead_code)] // wired in T10-T13
+    pub(crate) q1_target: Option<crate::q_critic::QCritic<L>>,
+    /// Polyak-averaged soft target copy of `q2` (v6.0.0). See [`Self::q1_target`].
+    #[allow(dead_code)] // wired in T10-T13
+    pub(crate) q2_target: Option<crate::q_critic::QCritic<L>>,
 }
 
 /// A single buffered transition for TD(n) computation.
@@ -508,6 +527,50 @@ fn sample_squashed_action(
 }
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Builds the four SAC Q-critic slots (`q1`, `q2`, `q1_target`, `q2_target`).
+    ///
+    /// Returns `(None, None, None, None)` when `q_critic_cfg` is `None` (discrete
+    /// mode or pre-v6 continuous without SAC). When `Some`, constructs two
+    /// independent critics from separate RNG draws and clones each to a matching
+    /// target via `from_weights`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any `PcError` from `QCritic::new` or `QCritic::from_weights`.
+    // Four Option<QCritic<L>> in the return tuple is intentional — each slot has
+    // a distinct role (live q1/q2, target q1/q2) and will be accessed individually.
+    #[allow(clippy::type_complexity)]
+    fn build_sac_critics(
+        backend: &L,
+        q_critic_cfg: Option<crate::q_critic::QCriticConfig>,
+        rng: &mut impl rand::Rng,
+    ) -> Result<
+        (
+            Option<crate::q_critic::QCritic<L>>,
+            Option<crate::q_critic::QCritic<L>>,
+            Option<crate::q_critic::QCritic<L>>,
+            Option<crate::q_critic::QCritic<L>>,
+        ),
+        PcError,
+    > {
+        let cfg = match q_critic_cfg {
+            Some(c) => c,
+            None => return Ok((None, None, None, None)),
+        };
+
+        let q1 = crate::q_critic::QCritic::new(backend.clone(), cfg.clone(), rng)?;
+        let q2 = crate::q_critic::QCritic::new(backend.clone(), cfg.clone(), rng)?;
+
+        // Clone targets from live critics via round-trip through weights —
+        // QCritic has no Clone impl, so from_weights is the safe copy path.
+        let q1_target =
+            crate::q_critic::QCritic::from_weights(backend.clone(), cfg.clone(), q1.to_weights())?;
+        let q2_target =
+            crate::q_critic::QCritic::from_weights(backend.clone(), cfg, q2.to_weights())?;
+
+        Ok((Some(q1), Some(q2), Some(q1_target), Some(q2_target)))
+    }
+
     /// Returns the eligibility trace length: output_size when GAE enabled, 0 otherwise.
     fn gae_trace_len(config: &PcActorCriticConfig) -> usize {
         if config.gae_lambda.is_some() {
@@ -1496,6 +1559,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.replay_clamp_count = 0;
         self.rollback_hard_cooldown_steps = DEFAULT_ROLLBACK_HARD_COOLDOWN;
         self.steps_since_last_rollback_hard = u64::MAX;
+        // SAC twin Q critics are not rebuilt on apply_config — they survive
+        // config changes (T13 handles serialization/restore).
+        // Leave q1/q2/q1_target/q2_target as-is.
 
         Ok(())
     }
@@ -1566,6 +1632,12 @@ impl<L: LinAlg> PcActorCritic<L> {
             None
         };
 
+        // SAC twin Q critics + Polyak targets (v6.0.0).
+        // Built only in continuous SAC mode (q_critic config present).
+        // q1 and q2 get separate rng draws so they initialise differently.
+        let (q1, q2, q1_target, q2_target) =
+            Self::build_sac_critics(&backend, config.q_critic.clone(), &mut rng)?;
+
         Ok(Self {
             actor,
             critic,
@@ -1601,6 +1673,10 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer,
             replay_clamp_count: 0,
+            q1,
+            q2,
+            q1_target,
+            q2_target,
         })
     }
 
@@ -1723,6 +1799,11 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer: None,
             replay_clamp_count: 0,
+            // SAC twin Q critics not transferred through crossover (T13).
+            q1: None,
+            q2: None,
+            q1_target: None,
+            q2_target: None,
         })
     }
 
@@ -1780,6 +1861,11 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer: None,
             replay_clamp_count: 0,
+            // SAC twin Q critics restored separately in T13.
+            q1: None,
+            q2: None,
+            q1_target: None,
+            q2_target: None,
         }
     }
 
@@ -4581,6 +4667,32 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// pass through the clamp unchanged.
     pub fn replay_clamp_count(&self) -> u64 {
         self.replay_clamp_count
+    }
+
+    // ── T8 test shims ─────────────────────────────────────────────────────────
+
+    /// Drive `q1` with one supervised update (test helper only).
+    ///
+    /// Calls `q1.update(state, action, target)` so the live critic
+    /// diverges from its target copy.  Panics when `q1` is absent.
+    #[cfg(test)]
+    pub(crate) fn train_q1_for_test(&mut self, state: &[f64], action: &[f64], target: f64) {
+        self.q1
+            .as_mut()
+            .expect("train_q1_for_test: q1 must be Some")
+            .update(state, action, target);
+    }
+
+    /// Forward the target Q-critic `q1_target` at `(state, action)` (test helper only).
+    ///
+    /// Returns the scalar Q-value from the frozen target copy.
+    /// Panics when `q1_target` is absent.
+    #[cfg(test)]
+    pub(crate) fn q1_target_probe(&self, state: &[f64], action: &[f64]) -> f64 {
+        self.q1_target
+            .as_ref()
+            .expect("q1_target_probe: q1_target must be Some")
+            .forward(state, action)
     }
 }
 
@@ -14410,8 +14522,7 @@ mod tests {
     #[test]
     fn test_sac_agent_builds_twin_q() {
         let agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
         assert!(agent.has_sac_critics());
     }
 
@@ -14425,8 +14536,7 @@ mod tests {
     #[test]
     fn test_polyak_update_moves_target_toward_live() {
         let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
         // continuous_sac_config: state_dim=9, action_dim=1
         let s = [0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
         let a = [0.5_f64];
