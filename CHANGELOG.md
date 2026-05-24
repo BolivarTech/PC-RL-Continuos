@@ -78,6 +78,18 @@
   Discrete consumers are unaffected at runtime and only see new optional JSON fields
   on load.
 
+- **Known downstream-tuning notes (B10/harness, not in-library bugs):**
+  - The in-library σ-narrowing guard (B7) validates `σ < σ_init` on a no-hidden-layer
+    actor to isolate the σ head. Under the production shared-trunk actor the μ-gradient
+    couples into the `log_σ` output weights (standard multi-head shared-trunk behavior);
+    B7 does not test this coupling, which remains a harness-side concern.
+  - The effective SAC warmup floor is `max(replay_batch_size, learning_starts)`.
+    `learning_starts` (new in MAGI gate iteration 2) is configurable; its default of `0`
+    preserves the original `replay_batch_size`-only behavior exactly.
+  - Deterministic-policy convergence on Pendulum-v1 is validated authoritatively by the
+    downstream B10 harness (`multi_seed` 10×500, ≥ 5/10 seeds > −400). No in-library
+    convergence test is shipped; B10 is the only convergence evidence.
+
 ## [5.0.0] - 2026-05-23
 
 ### Breaking
