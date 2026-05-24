@@ -14694,4 +14694,117 @@ mod tests {
             "Q should rank good action above bad: {q_good} vs {q_bad}"
         );
     }
+
+    // ── T11 RED: SAC reparameterized actor delta tests ─────────────────────
+
+    /// FD-verified correctness gate for `sac_actor_delta`.
+    ///
+    /// Checks both a mid-range point (|a_raw| ≈ 0.1–0.5) and a saturated point
+    /// (|a_raw| ≈ 3.0, tanh ≈ ±0.995) where ε_stab matters.  The FD tolerance
+    /// is 1e-3 (tight for f64 central differences at h=1e-6).
+    #[test]
+    fn test_sac_actor_delta_matches_finite_difference_both_heads() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let qcfg = crate::q_critic::QCriticConfig {
+            state_dim: 2,
+            action_dim: 2,
+            hidden_layers: vec![LayerDef {
+                size: 12,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.0,
+        };
+        let q: crate::q_critic::QCritic =
+            crate::q_critic::QCritic::new(CpuLinAlg::new(), qcfg, &mut rng).unwrap();
+        let s = [0.3_f64, -0.4];
+        let alpha = 0.4_f64;
+        for (mu, log_sigma) in [
+            (vec![0.1_f64, -0.2], vec![-0.3_f64, 0.1]),  // mid-range
+            (vec![3.0_f64, -3.0], vec![0.0_f64, 0.0]),   // SATURATED (|a_raw|≈3, tanh≈±0.995)
+        ] {
+            let eps = [0.7_f64, -0.3]; // FIXED reparam noise
+            let n = mu.len();
+            let a_raw: Vec<f64> = (0..n)
+                .map(|j| mu[j] + log_sigma[j].exp() * eps[j])
+                .collect();
+            let a: Vec<f64> = a_raw.iter().map(|x| x.tanh()).collect();
+            let g_a = q.action_gradient(&s, &a);
+            let delta = sac_actor_delta(&mu, &log_sigma, &a_raw, &eps, &g_a, alpha);
+            assert_eq!(delta.len(), 2 * n);
+
+            // Numerical gradient of L(mu, log_sigma) = alpha*logpi - Q(s,a), eps FIXED.
+            let l = |mu: &[f64], ls: &[f64]| -> f64 {
+                let ar: Vec<f64> = (0..n).map(|j| mu[j] + ls[j].exp() * eps[j]).collect();
+                let aa: Vec<f64> = ar.iter().map(|x| x.tanh()).collect();
+                alpha * squashed_log_prob(mu, ls, &ar) - q.forward(&s, &aa)
+            };
+            let h = 1e-6;
+            for j in 0..n {
+                let mut mp = mu.clone();
+                let mut mm = mu.clone();
+                mp[j] += h;
+                mm[j] -= h;
+                let num_mu = (l(&mp, &log_sigma) - l(&mm, &log_sigma)) / (2.0 * h);
+                assert!(
+                    (delta[j] - num_mu).abs() < 1e-3,
+                    "mu[{j}] delta={} vs num={num_mu} (mu={:?}, log_sigma={:?})",
+                    delta[j],
+                    mu,
+                    log_sigma
+                );
+                let mut lp = log_sigma.clone();
+                let mut lm = log_sigma.clone();
+                lp[j] += h;
+                lm[j] -= h;
+                let num_ls = (l(&mu, &lp) - l(&mu, &lm)) / (2.0 * h);
+                assert!(
+                    (delta[n + j] - num_ls).abs() < 1e-3,
+                    "log_sigma[{j}] delta={} vs num={num_ls} (mu={:?}, log_sigma={:?})",
+                    delta[n + j],
+                    mu,
+                    log_sigma
+                );
+            }
+        }
+    }
+
+    /// Consistency anchor: with g_a=0 the mu-half reduces to alpha*jac_ent,
+    /// confirming the Gaussian score terms cancelled (reparameterization) and
+    /// a_raw ≠ mu (non-vacuous test).
+    #[test]
+    fn test_entropy_grad_reduces_to_v5_when_sigma_fixed_eps_nonzero() {
+        let mu = vec![0.5_f64];
+        let log_sigma = vec![0.0_f64];
+        let eps = vec![0.8_f64];
+        let a_raw = vec![mu[0] + log_sigma[0].exp() * eps[0]];
+        let g_a = vec![0.0_f64]; // no Q gradient → pure entropy
+        let alpha = 0.3_f64;
+        let delta = sac_actor_delta(&mu, &log_sigma, &a_raw, &eps, &g_a, alpha);
+        let t = a_raw[0].tanh();
+        let jac_ent = 2.0 * t * (1.0 - t * t) / (1.0 - t * t + 1e-6);
+        assert!(
+            (delta[0] - alpha * jac_ent).abs() < 1e-9,
+            "mu-half should equal alpha*jac_ent={} but got {}",
+            alpha * jac_ent,
+            delta[0]
+        );
+        // Confirm a_raw != mu (so the score-function cancellation is non-vacuous).
+        assert!(
+            (a_raw[0] - mu[0]).abs() > 1e-6,
+            "a_raw must differ from mu for a non-vacuous test"
+        );
+    }
+
+    #[test]
+    #[ignore = "B4 pathwise direction — completed in T15"]
+    fn test_pathwise_moves_mu_toward_saturated_optimum() {
+        // stub, filled in T15
+    }
+
+    #[test]
+    #[ignore = "B5 mu_raw bounded — completed in T15"]
+    fn test_mu_raw_stays_bounded_under_sac() {
+        // stub, filled in T15
+    }
 }
