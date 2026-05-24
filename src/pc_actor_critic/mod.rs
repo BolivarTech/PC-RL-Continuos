@@ -2988,28 +2988,31 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(self.backend.vec_from_slice(&action))
     }
 
-    /// v4.0.0 — Continuous-mode inference with `SelectionMode` control.
+    /// v6.0.0 — Continuous-mode inference with `SelectionMode` control (SAC dual-head).
     ///
-    /// Runs actor inference to obtain the mean `μ(s)` for the current
-    /// state, then produces an action according to the caller's mode:
+    /// Runs actor inference to obtain the raw actor output `[μ_raw | log_σ_raw]`
+    /// (length `2 * action_dim`) for the current state, then produces an action
+    /// according to the caller's mode:
     ///
     /// | `mode` | Action returned | Side-effect on RNG |
     /// |---|---|---|
-    /// | `SelectionMode::Play` | Deterministic `tanh(μ(s))` — no noise | None (RNG not advanced) |
-    /// | `SelectionMode::Training` | `tanh(μ(s) + σ·ε)`, `ε ~ N(0, I)` via Box-Muller | One draw per output dimension |
+    /// | `SelectionMode::Play` | Deterministic `tanh(μ_raw)` — no noise | None (RNG not advanced) |
+    /// | `SelectionMode::Training` | `tanh(μ_raw + σ·ε)`, `ε ~ N(0, I)` reparameterized | One draw per action dimension |
     ///
-    /// `σ = config.policy_sigma`.
+    /// `σ = exp(log_σ_raw)` (learned per action dimension, from the actor dual-head).
     ///
     /// This is the inference-only counterpart of
     /// [`step_continuous`](Self::step_continuous): it does not perform a
     /// learning update or modify any stored state. Use it for evaluation
-    /// rollouts or action collection inside a REINFORCE loop.
+    /// rollouts or action collection inside a policy-gradient loop.
     ///
-    /// **Determinism:** Under `Training` mode, the Box-Muller samples come
-    /// from the agent's internal `StdRng`. The same seed at construction
-    /// combined with the same sequence of calls yields identical actions.
+    /// **Determinism:** Under `Training` mode, the samples come from the agent's
+    /// internal `StdRng`. The same seed at construction combined with the same
+    /// sequence of calls yields identical actions.
     ///
     /// **Precondition:** `config.action_space == ActionSpace::Continuous`.
+    /// `q_critic` is guaranteed `Some` for all continuous agents (enforced at
+    /// construction by `validate_config`).
     ///
     /// # Arguments
     ///
@@ -3049,43 +3052,24 @@ impl<L: LinAlg> PcActorCritic<L> {
         let infer = self.actor.infer(state);
         let y_conv = self.backend.vec_to_vec(&infer.y_conv);
 
-        let action = if let Some(q_cfg) = &self.config.q_critic {
-            // SAC dual-head path: actor output = [μ_raw | log_σ_raw], length 2 * action_dim.
-            let action_dim = q_cfg.action_dim;
-            let (mu, log_sigma) = split_mu_log_sigma(&y_conv, action_dim);
-            match mode {
-                crate::pc_actor::SelectionMode::Play => {
-                    // Deterministic: tanh(μ_raw), no RNG advance.
-                    deterministic_squashed_action(&mu)
-                }
-                crate::pc_actor::SelectionMode::Training => {
-                    // Reparameterized sample: tanh(μ_raw + exp(log_σ)·ε).
-                    let (_, a) = sample_squashed_action(&mu, &log_sigma, &mut self.rng);
-                    a
-                }
+        // Continuous mode is canonical SAC (v6.0.0): q_critic is guaranteed Some by
+        // validate_config at construction. The actor output is [μ_raw | log_σ_raw].
+        let action_dim = self
+            .config
+            .q_critic
+            .as_ref()
+            .expect("continuous agent always has q_critic (enforced at construction)")
+            .action_dim;
+        let (mu, log_sigma) = split_mu_log_sigma(&y_conv, action_dim);
+        let action = match mode {
+            crate::pc_actor::SelectionMode::Play => {
+                // Deterministic: tanh(μ_raw), no RNG advance.
+                deterministic_squashed_action(&mu)
             }
-        } else {
-            // v4.1.0 fixed-σ path (non-SAC continuous): preserved bit-for-bit.
-            let mu = y_conv;
-            match mode {
-                crate::pc_actor::SelectionMode::Play => {
-                    // Play: deterministic tanh(μ_raw), no RNG advance.
-                    mu.iter().map(|&m| m.tanh()).collect::<Vec<f64>>()
-                }
-                crate::pc_actor::SelectionMode::Training => {
-                    // Training: tanh(μ_raw + σ·ε), RNG advances. Box-Muller per dim.
-                    use rand::Rng;
-                    let sigma = self.config.policy_sigma;
-                    mu.iter()
-                        .map(|m| {
-                            let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
-                            let u2: f64 = self.rng.gen_range(0.0..1.0);
-                            let eps =
-                                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                            (m + sigma * eps).tanh()
-                        })
-                        .collect::<Vec<f64>>()
-                }
+            crate::pc_actor::SelectionMode::Training => {
+                // Reparameterized sample: tanh(μ_raw + exp(log_σ)·ε).
+                let (_, a) = sample_squashed_action(&mu, &log_sigma, &mut self.rng);
+                a
             }
         };
 
