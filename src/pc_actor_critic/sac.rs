@@ -265,20 +265,29 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         // --- Pass 2: update live Q-critics with collected targets ---
-        let mut total = 0.0_f64;
+        //
+        // Batch-averaging: the actor update already scales each per-state delta
+        // by `1/batch_len` so the aggregate weight change equals the mean
+        // gradient, not the sum (effective lr = `lr / n` per transition).
+        // The critic must be consistent: we use `update_scaled(…, 1/n)` so
+        // both networks operate at the same effective learning rate per batch.
+        // Using plain `update()` (lr_scale=1.0) would give effective lr = n×lr,
+        // an inflated step inconsistent with the actor's 1/n normalisation.
         let n = targets.len() as f64;
+        let lr_scale = 1.0 / n;
+        let mut total = 0.0_f64;
 
         for (state, a_squashed, y) in &targets {
             let l1 = self
                 .q1
                 .as_mut()
                 .expect("sac_critic_update: q1 must be Some in SAC mode")
-                .update(state, a_squashed, *y);
+                .update_scaled(state, a_squashed, *y, lr_scale);
             let l2 = self
                 .q2
                 .as_mut()
                 .expect("sac_critic_update: q2 must be Some in SAC mode")
-                .update(state, a_squashed, *y);
+                .update_scaled(state, a_squashed, *y, lr_scale);
             total += 0.5 * (l1 + l2);
         }
 
@@ -304,9 +313,11 @@ impl<L: LinAlg> PcActorCritic<L> {
     /// 6. Apply via `apply_actor_update_and_bookkeeping` with empty mask and
     ///    `action=0` (no discrete KL / EWC logit-reversal; continuous-only path).
     ///
-    /// Returns `(mean |delta|, mean logπ)` over non-skipped transitions.
+    /// Returns `(mean |delta|, Option<mean logπ>)` over non-skipped transitions.
     /// The mean logπ is consumed by [`sac_temperature_update`](Self::sac_temperature_update)
-    /// (caller, T12). Returns `(0.0, 0.0)` when the entire batch is skipped.
+    /// (caller, T12). Returns `(0.0, None)` when the entire batch is skipped —
+    /// the `None` signals the caller to skip the temperature update rather than
+    /// drift `log_alpha` on a garbage zero logp (Fix 5).
     ///
     /// # Batch averaging
     ///
@@ -348,11 +359,12 @@ impl<L: LinAlg> PcActorCritic<L> {
     ///
     /// # Returns
     ///
-    /// `(mean |delta|, mean logπ)`.
-    pub(crate) fn sac_actor_update(&mut self, batch: &[ReplayTransition]) -> (f64, f64) {
+    /// `(mean |delta|, Option<mean logπ>)`. `None` logπ means no transitions
+    /// were applied; the caller must skip `sac_temperature_update` in that case.
+    pub(crate) fn sac_actor_update(&mut self, batch: &[ReplayTransition]) -> (f64, Option<f64>) {
         let action_dim = match self.config.q_critic.as_ref() {
             Some(q) => q.action_dim,
-            None => return (0.0, 0.0),
+            None => return (0.0, None),
         };
         let alpha = self.alpha();
         // Batch-averaging scale: divide each per-state delta by the full batch
@@ -361,7 +373,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         // Using `batch.len()` matches the SAC convention of computing the gradient
         // mean over the sampled mini-batch.
         let inv_n = if batch.is_empty() {
-            return (0.0, 0.0);
+            return (0.0, None);
         } else {
             1.0 / batch.len() as f64
         };
@@ -477,7 +489,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         if collected.is_empty() {
-            return (0.0, 0.0);
+            // Return None logπ: signals the caller to skip temperature update
+            // rather than drift `log_alpha` on garbage (Fix 5).
+            return (0.0, None);
         }
 
         // --- Pass 2: apply updates (mutable borrows of self via apply_*) ---
@@ -511,7 +525,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             );
         }
 
-        (total_delta_abs / n, total_logp / n)
+        (total_delta_abs / n, Some(total_logp / n))
     }
 
     /// Blends one target layer toward a live layer with Polyak rate `tau`.
@@ -590,8 +604,13 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         let _loss = self.sac_critic_update(&batch);
-        let (_mean_delta, logp_mean) = self.sac_actor_update(&batch);
-        self.sac_temperature_update(logp_mean);
+        let (_mean_delta, logp_mean_opt) = self.sac_actor_update(&batch);
+        // Fix 5: skip the temperature update when no actor transitions were
+        // applied (fully-skipped batch).  `None` means collected was empty —
+        // updating with a garbage 0.0 would silently drift `log_alpha`.
+        if let Some(logp_mean) = logp_mean_opt {
+            self.sac_temperature_update(logp_mean);
+        }
         self.polyak_update_targets();
     }
 }
