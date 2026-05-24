@@ -317,8 +317,10 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     ///
     /// `α = exp(log_alpha)` is guaranteed `> 0`. Initialized from
     /// `config.log_alpha_init` in `new()` for SAC mode (else `0.0`).
-    /// Updated by `sac_temperature_update()`. Not serialized — treated
-    /// as transient training state (restored to init on deserialize).
+    /// Updated by `sac_temperature_update()`. Serialized as
+    /// `Option<f64>` in the save file (present for SAC agents, absent
+    /// for discrete / pre-v6 files); restored directly on load, falling
+    /// back to `config.log_alpha_init` when absent.
     pub(crate) log_alpha: f64,
     /// SAC twin Q-critics (v6.0.0). `Some` in continuous SAC mode
     /// (`action_space == Continuous && q_critic.is_some()`). `None`
@@ -974,6 +976,20 @@ impl<L: LinAlg> PcActorCritic<L> {
             return Err(PcError::ConfigValidation(
                 "replay_batch_size must be > 0 when replay buffer is enabled".to_string(),
             ));
+        }
+        // If the batch is larger than the buffer it can never be filled → silent
+        // no-learning.  Reject early so the misconfiguration is surfaced at
+        // construction rather than discovered at the first sac_learn_step call.
+        if config.replay_training_capacity > 0
+            && config.replay_batch_size > config.replay_training_capacity
+        {
+            return Err(PcError::ConfigValidation(format!(
+                "replay_batch_size ({}) exceeds replay_training_capacity ({}); \
+                 the buffer can never accumulate a full batch and will never \
+                 produce a learning update. Reduce replay_batch_size or \
+                 increase replay_training_capacity.",
+                config.replay_batch_size, config.replay_training_capacity,
+            )));
         }
 
         // v6.0.0 — canonical SAC continuous-mode rules (replaces v4/v5 on-policy rules).
@@ -1654,10 +1670,20 @@ impl<L: LinAlg> PcActorCritic<L> {
         let new_trace_len = Self::gae_trace_len(&config);
         let (polyak_target, frozen_champion) = Self::allocate_anchor_slots(&config, &actor);
         let replay_buffer = if config.replay_training_capacity > 0 {
+            // SAC (continuous) is an off-policy algorithm and must retain ALL
+            // transitions regardless of sign — Pendulum-v1 rewards are always
+            // ≤ 0, so positive_only=true would leave the buffer permanently
+            // empty and prevent any learning.  Force false for continuous SAC;
+            // discrete agents honour config.replay_positive_only unchanged.
+            let positive_only = if config.action_space == ActionSpace::Continuous {
+                false
+            } else {
+                config.replay_positive_only
+            };
             Some(crate::pc_actor_critic::replay::ReplayBuffer::new(
                 config.replay_training_capacity,
                 config.replay_recent_capacity,
-                config.replay_positive_only,
+                positive_only,
                 config.action_space,
             ))
         } else {
@@ -2507,12 +2533,14 @@ impl<L: LinAlg> PcActorCritic<L> {
                 // The on-policy score-function continuous path (v5.0.0) has been
                 // removed in v6.0.0. Continuous mode now uses SAC (off-policy twin
                 // Q-critics via sac_learn_step), which bypasses learn_continuous_inner
-                // entirely. Reaching this arm indicates a logic error in the caller.
-                unreachable!(
+                // entirely. Return a clean error instead of panicking so the host
+                // process does not crash if this invariant is violated by a caller.
+                Err(PcError::ConfigValidation(
                     "learn_continuous_inner must not be called with StepAction::Continuous \
-                     in v6.0.0 SAC mode; the continuous learning path runs through \
-                     sac_learn_step in step_continuous instead."
-                )
+                     in v6.0.0 SAC mode; continuous learning runs through sac_learn_step \
+                     in step_continuous instead."
+                        .to_string(),
+                ))
             }
         }
     }
@@ -13479,6 +13507,68 @@ mod tests {
         assert!(
             PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).is_ok(),
             "a fully-valid SAC continuous config must construct without error"
+        );
+    }
+
+    /// Fix 1 (B10-BLOCKER): continuous SAC replay buffer must be constructed
+    /// with `positive_only = false` regardless of `config.replay_positive_only`.
+    ///
+    /// Pendulum-v1 rewards are always ≤ 0; a positive-only filter would leave
+    /// the buffer permanently empty and prevent all learning.
+    #[test]
+    fn test_sac_replay_buffer_forces_positive_only_false() {
+        // Build a SAC agent with replay_positive_only = true in config.
+        // The default for continuous_sac_config already has replay_positive_only
+        // at the global default (true via default_replay_positive_only).
+        // We set it explicitly here to document the intent.
+        let mut cfg = continuous_sac_config();
+        cfg.replay_positive_only = true; // would block all Pendulum-v1 transitions
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Push a transition with reward ≤ 0 (typical for Pendulum-v1).
+        use crate::pc_actor_critic::replay::{Action, ReplayTransition};
+        let buf = agent
+            .replay_buffer
+            .as_mut()
+            .expect("SAC agent must have a replay buffer");
+        buf.push(ReplayTransition {
+            state: vec![0.0; 9],
+            action: Action::Continuous(vec![0.5]),
+            reward: -1.5, // negative — would be rejected by positive_only=true
+            next_state: vec![0.1; 9],
+            done: false,
+            valid_actions: None, // N/A for continuous
+        })
+        .expect("push must succeed for a non-full buffer");
+
+        // The buffer must hold the transition; if positive_only were true
+        // the push would have been silently dropped and len() == 0.
+        assert_eq!(
+            buf.total_len(),
+            1,
+            "SAC replay buffer must retain transitions with reward ≤ 0 \
+             (positive_only must be forced false for continuous SAC)"
+        );
+    }
+
+    /// Fix 3 (robustness): constructing a SAC agent with
+    /// `replay_batch_size > replay_training_capacity` must return
+    /// `Err(PcError::ConfigValidation)` naming both fields.
+    #[test]
+    fn test_sac_rejects_batch_size_exceeding_capacity() {
+        let mut cfg = continuous_sac_config();
+        // batch_size intentionally larger than capacity → buffer can never fill.
+        cfg.replay_training_capacity = 10;
+        cfg.replay_batch_size = 20;
+        let result = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(
+                result,
+                Err(PcError::ConfigValidation(ref m))
+                    if m.contains("replay_batch_size") && m.contains("replay_training_capacity")
+            ),
+            "replay_batch_size > replay_training_capacity must be rejected with \
+             ConfigValidation naming both fields, got: {result:?}"
         );
     }
 
