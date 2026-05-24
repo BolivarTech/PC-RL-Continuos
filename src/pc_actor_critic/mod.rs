@@ -14328,4 +14328,30 @@ mod tests {
             assert!(a[0] > -1.0 && a[0] < 1.0, "action {} not in (-1,1)", a[0]);
         }
     }
+
+    #[test]
+    fn test_squashed_log_prob_matches_reference() {
+        let mu = [0.2_f64];
+        let log_sigma = [0.0_f64]; // σ = 1
+        let a_raw = [0.5_f64];
+        let lp = squashed_log_prob(&mu, &log_sigma, &a_raw);
+        let sigma = 1.0_f64;
+        let gauss = -0.5 * ((a_raw[0] - mu[0]) / sigma).powi(2)
+            - sigma.ln()
+            - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        let jac = (1.0 - a_raw[0].tanh().powi(2) + 1e-6).ln();
+        let reference = gauss - jac;
+        assert!(
+            (lp - reference).abs() < 1e-9,
+            "logπ {lp} vs ref {reference}"
+        );
+    }
+
+    #[test]
+    fn test_squashed_log_prob_finite_at_boundary() {
+        let mu = [0.0];
+        let log_sigma = [0.0];
+        let a_raw = [50.0]; // tanh≈1
+        assert!(squashed_log_prob(&mu, &log_sigma, &a_raw).is_finite());
+    }
 }
