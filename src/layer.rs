@@ -33,7 +33,12 @@ pub(crate) fn layer_to_cpu<L: LinAlg>(layer: &Layer<L>, backend: &L) -> Layer {
     let mut cpu_weights = cpu.zeros_mat(rows, cols);
     for r in 0..rows {
         for c in 0..cols {
-            cpu.mat_set(&mut cpu_weights, r, c, backend.mat_get(&layer.weights, r, c));
+            cpu.mat_set(
+                &mut cpu_weights,
+                r,
+                c,
+                backend.mat_get(&layer.weights, r, c),
+            );
         }
     }
     let cpu_bias = backend.vec_to_vec(&layer.bias);
