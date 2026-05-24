@@ -23,6 +23,77 @@ use crate::linalg::LinAlg;
 use crate::pc_actor_critic::PcActorCritic;
 
 impl<L: LinAlg> PcActorCritic<L> {
+    /// Current SAC entropy temperature `α = exp(log_alpha)`.
+    ///
+    /// Always `> 0` by construction (`exp` is strictly positive).
+    /// Used as the entropy coefficient in the SAC policy-loss and
+    /// temperature-update rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// // α = exp(0.0) = 1.0 initially (log_alpha_init = 0.0 default).
+    /// ```
+    #[allow(dead_code)] // wired in T10-T12
+    pub(crate) fn alpha(&self) -> f64 {
+        self.log_alpha.exp()
+    }
+
+    /// Automatic temperature update toward the target entropy `H_target`.
+    ///
+    /// Updates `log_alpha` by gradient descent on the dual objective
+    /// `J(α) = −α · (logp_mean + H_target)`, where
+    /// `H_target = config.target_entropy.unwrap_or(-(action_dim as f64))`.
+    ///
+    /// Update rule:
+    /// ```text
+    /// grad     = −α · (logp_mean + H_target)
+    /// log_alpha -= alpha_lr · grad
+    /// log_alpha  = clamp(log_alpha, LOG_ALPHA_MIN, LOG_ALPHA_MAX)
+    /// ```
+    ///
+    /// When entropy `= −logp_mean < H_target` (i.e. `logp_mean + H_target > 0`),
+    /// `grad < 0` → `log_alpha` increases → `α` rises to encourage exploration.
+    /// When entropy `> H_target`, `α` falls to let the policy sharpen.
+    ///
+    /// `log_alpha` is clamped to `[LOG_ALPHA_MIN, LOG_ALPHA_MAX]` after each step
+    /// to keep `α = exp(log_alpha)` numerically finite under extreme inputs.
+    /// Non-finite gradients are silently dropped (NaN-safety).
+    ///
+    /// # Arguments
+    ///
+    /// * `logp_mean` — mean log-probability of sampled actions under the
+    ///   current policy (batch average of `log π(a|s)`).
+    #[allow(dead_code)] // wired in T10-T12
+    pub(crate) fn sac_temperature_update(&mut self, logp_mean: f64) {
+        /// Lower bound on `log_alpha`; `exp(-20) ≈ 2e-9` (effectively zero temperature).
+        const LOG_ALPHA_MIN: f64 = -20.0;
+        /// Upper bound on `log_alpha`; `exp(20) ≈ 4.9e8` (very high entropy pressure).
+        const LOG_ALPHA_MAX: f64 = 20.0;
+
+        let action_dim = self
+            .config
+            .q_critic
+            .as_ref()
+            .map(|q| q.action_dim)
+            .unwrap_or(0);
+        let h_target = self.config.target_entropy.unwrap_or(-(action_dim as f64));
+        let grad = -(self.log_alpha.exp()) * (logp_mean + h_target);
+        if grad.is_finite() {
+            self.log_alpha -= self.config.alpha_lr * grad;
+            self.log_alpha = self.log_alpha.clamp(LOG_ALPHA_MIN, LOG_ALPHA_MAX);
+        }
+    }
+
+    /// Test helper: returns current `α = exp(log_alpha)`.
+    ///
+    /// Thin wrapper around [`alpha`](Self::alpha) so tests can call it without
+    /// the `#[allow(dead_code)]` suppression.
+    #[cfg(test)]
+    pub(crate) fn alpha_for_test(&self) -> f64 {
+        self.alpha()
+    }
+
     /// Returns `true` when SAC twin Q-critics are present (continuous SAC mode).
     ///
     /// Equivalent to `self.q1.is_some()`.  Used by tests and future task

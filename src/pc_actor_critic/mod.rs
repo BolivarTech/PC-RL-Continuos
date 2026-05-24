@@ -313,6 +313,14 @@ pub struct PcActorCritic<L: LinAlg = CpuLinAlg> {
     /// clamp was binding (MAGI R5 W5). Exposed via
     /// [`PcActorCritic::replay_clamp_count`].
     pub(crate) replay_clamp_count: u64,
+    /// Log-temperature for SAC automatic entropy tuning (v6.0.0).
+    ///
+    /// `α = exp(log_alpha)` is guaranteed `> 0`. Initialized from
+    /// `config.log_alpha_init` in `new()` for SAC mode (else `0.0`).
+    /// Updated by `sac_temperature_update()`. Not serialized — treated
+    /// as transient training state (restored to init on deserialize).
+    #[allow(dead_code)] // wired in T10-T12
+    pub(crate) log_alpha: f64,
     /// SAC twin Q-critics (v6.0.0). `Some` in continuous SAC mode
     /// (`action_space == Continuous && q_critic.is_some()`). `None`
     /// for discrete agents and pre-v6 continuous agents without
@@ -1638,6 +1646,9 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (q1, q2, q1_target, q2_target) =
             Self::build_sac_critics(&backend, config.q_critic.clone(), &mut rng)?;
 
+        // Cache log_alpha_init before config is moved into Self.
+        let log_alpha_init = config.log_alpha_init;
+
         Ok(Self {
             actor,
             critic,
@@ -1673,6 +1684,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer,
             replay_clamp_count: 0,
+            log_alpha: log_alpha_init,
             q1,
             q2,
             q1_target,
@@ -1799,6 +1811,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer: None,
             replay_clamp_count: 0,
+            log_alpha: 0.0,
             // SAC twin Q critics not transferred through crossover (T13).
             q1: None,
             q2: None,
@@ -1861,6 +1874,7 @@ impl<L: LinAlg> PcActorCritic<L> {
             steps_since_last_rollback_hard: u64::MAX,
             replay_buffer: None,
             replay_clamp_count: 0,
+            log_alpha: 0.0,
             // SAC twin Q critics restored separately in T13.
             q1: None,
             q2: None,
@@ -14521,26 +14535,40 @@ mod tests {
 
     #[test]
     fn test_alpha_increases_when_entropy_below_target() {
-        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
         let before = agent.alpha_for_test();
         agent.sac_temperature_update(5.0); // logp_mean=5 → entropy=−5 < H_target(−1) → α rises
-        assert!(agent.alpha_for_test() > before, "alpha should rise when entropy below target");
+        assert!(
+            agent.alpha_for_test() > before,
+            "alpha should rise when entropy below target"
+        );
     }
 
     #[test]
     fn test_alpha_decreases_when_entropy_above_target() {
-        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
         let before = agent.alpha_for_test();
         agent.sac_temperature_update(-5.0); // logp_mean=−5 → entropy=5 > H_target(−1) → α falls
-        assert!(agent.alpha_for_test() < before, "alpha should fall when entropy above target");
+        assert!(
+            agent.alpha_for_test() < before,
+            "alpha should fall when entropy above target"
+        );
     }
 
     #[test]
     fn test_alpha_stays_positive_and_finite() {
-        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
-        for _ in 0..1000 { agent.sac_temperature_update(100.0); }
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        for _ in 0..1000 {
+            agent.sac_temperature_update(100.0);
+        }
         let a = agent.alpha_for_test();
-        assert!(a.is_finite() && a > 0.0, "alpha must stay finite and positive, got {a}");
+        assert!(
+            a.is_finite() && a > 0.0,
+            "alpha must stay finite and positive, got {a}"
+        );
     }
 
     // ── T8: Twin Q critics + Polyak target tests ──────────────────────
