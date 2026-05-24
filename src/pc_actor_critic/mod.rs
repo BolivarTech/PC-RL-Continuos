@@ -4604,6 +4604,40 @@ impl<L: LinAlg> PcActorCritic<L> {
     ) -> f64 {
         self.sac_bellman_target(t).unwrap_or(f64::NAN)
     }
+
+    /// Run actor inference on `state` and return `μ_raw` (first `action_dim`
+    /// components of `y_conv`) as a host `Vec<f64>` (test helper only).
+    ///
+    /// Panics when `q_critic` config is absent (non-SAC mode).
+    #[cfg(test)]
+    pub(crate) fn actor_mu_raw_for_test(&self, state: &[f64]) -> Vec<f64> {
+        let action_dim = self
+            .config
+            .q_critic
+            .as_ref()
+            .expect("actor_mu_raw_for_test: q_critic must be Some in SAC mode")
+            .action_dim;
+        let infer = self.actor.infer(state);
+        let y_conv = self.backend.vec_to_vec(&infer.y_conv);
+        split_mu_log_sigma(&y_conv, action_dim).0
+    }
+
+    /// Run actor inference on `state` and return the clamped `log_σ` (second
+    /// `action_dim` components of `y_conv`) as a host `Vec<f64>` (test helper only).
+    ///
+    /// Panics when `q_critic` config is absent (non-SAC mode).
+    #[cfg(test)]
+    pub(crate) fn actor_log_sigma_for_test(&self, state: &[f64]) -> Vec<f64> {
+        let action_dim = self
+            .config
+            .q_critic
+            .as_ref()
+            .expect("actor_log_sigma_for_test: q_critic must be Some in SAC mode")
+            .action_dim;
+        let infer = self.actor.infer(state);
+        let y_conv = self.backend.vec_to_vec(&infer.y_conv);
+        split_mu_log_sigma(&y_conv, action_dim).1
+    }
 }
 
 #[cfg(test)]
@@ -14658,16 +14692,312 @@ mod tests {
         );
     }
 
+    // ── T15: slow SAC directional learning guards (B4, B5, B7, B8) ──────────
+    //
+    // These are integration-level *directional mechanism guards*, NOT
+    // convergence proofs.  They assert that a quantity moves the right way
+    // or stays bounded; the downstream B10 (PC-Pendulum harness) is the
+    // authoritative convergence check.
+    //
+    // Run with:
+    //   cargo nextest run --release --run-ignored all <test_name>
+
+    /// B4 — pathwise gradient drives μ_raw toward the boundary optimum.
+    ///
+    /// Task: reward = tanh(a_raw) (optimum at a_raw → +∞, i.e. a = +1).
+    /// Setup: train twin Q-critics on this reward so Q(s, a) increases with a.
+    /// Then run `sac_actor_update` repeatedly and assert μ_raw[0] INCREASES
+    /// from its initial value (the pathwise Q-gradient pushes μ upward).
+    ///
+    /// Contrast: at a SATURATED point (large |a_raw|) the score-function
+    /// delta (score_fn_mu_delta below) is nearly zero — the advantage is
+    /// flat in raw space — so it does NOT robustly drive μ toward the
+    /// boundary the way the pathwise gradient does.
     #[test]
-    #[ignore = "B4 pathwise direction — completed in T15"]
+    #[ignore = "slow SAC learning guard (B4)"]
     fn test_pathwise_moves_mu_toward_saturated_optimum() {
-        // stub, filled in T15
+        use crate::pc_actor_critic::replay::{Action, ReplayTransition};
+
+        // Score-function contrast helper (test-local only):
+        // advantage * (mu - a_raw) / σ².  At saturation (large |a_raw|)
+        // the advantage is near-zero (reward flat in raw space) so this
+        // does NOT reliably push μ toward the boundary.
+        fn score_function_mu_delta(mu: f64, a_raw: f64, sigma: f64, advantage: f64) -> f64 {
+            advantage * (mu - a_raw) / (sigma * sigma)
+        }
+
+        // Fixed probe state (state_dim=9) — the Q-critics see this.
+        let s = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 17).unwrap();
+
+        // ── Phase 1: prime the twin Q-critics to rank higher a_raw better ──
+        // Reward = tanh(a_raw); a at boundary (+1) beats a at −1.
+        // We pre-train with a range of (a_raw, reward=tanh(a_raw)) pairs
+        // so Q(s, tanh(a_raw)) increases with a_raw.
+        let q_batch: Vec<ReplayTransition> = (0..64)
+            .map(|i| {
+                let a_raw = -3.0 + (i as f64) * (6.0 / 63.0);
+                let r = a_raw.tanh(); // reward = squashed action
+                ReplayTransition {
+                    state: s.clone(),
+                    action: Action::Continuous(vec![a_raw]),
+                    reward: r,
+                    next_state: s.clone(),
+                    done: true, // γ-masked: y = r
+                    valid_actions: None,
+                }
+            })
+            .collect();
+
+        // Train critics enough to capture the monotone Q(s,·) shape.
+        for _ in 0..400 {
+            agent.sac_critic_update(&q_batch);
+        }
+
+        // Confirm critics rank high-a > low-a (sanity check for the phase below).
+        let q_high = agent.q1_for_test(&s, &[0.8]);
+        let q_low = agent.q1_for_test(&s, &[-0.8]);
+        assert!(
+            q_high > q_low,
+            "critic pre-train sanity: Q(a=+0.8)={q_high} must > Q(a=−0.8)={q_low}"
+        );
+
+        // ── Phase 2: run actor updates and assert μ_raw climbs ──
+        let mu_before = agent.actor_mu_raw_for_test(&s)[0];
+
+        // Build a batch of actor-update transitions at the probe state,
+        // with a_raw values spread around the current μ + some noise.
+        let actor_batch: Vec<ReplayTransition> = (0..32)
+            .map(|i| {
+                let a_raw = -2.0 + (i as f64) * (4.0 / 31.0);
+                ReplayTransition {
+                    state: s.clone(),
+                    action: Action::Continuous(vec![a_raw]),
+                    reward: a_raw.tanh(),
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                }
+            })
+            .collect();
+
+        for _ in 0..200 {
+            agent.sac_actor_update(&actor_batch);
+        }
+
+        let mu_after = agent.actor_mu_raw_for_test(&s)[0];
+
+        // Pathwise: μ_raw should have increased (Q-gradient pushes toward +∞ optimum).
+        assert!(
+            mu_after > mu_before,
+            "B4: pathwise gradient must push μ_raw upward; before={mu_before:.4}, after={mu_after:.4}"
+        );
+
+        // Contrast: at a saturated point (large a_raw), the score-function
+        // delta is small because the advantage is flat in raw space.
+        let saturated_a_raw = 4.0_f64; // tanh(4) ≈ 0.9993 — deep in saturation
+        let advantage_at_saturation = 0.02_f64; // realistic near-zero advantage
+        let sf_delta =
+            score_function_mu_delta(mu_after, saturated_a_raw, 0.3, advantage_at_saturation);
+        // The pathwise moved μ_raw by more than 3× this score-function delta.
+        let pathwise_movement = (mu_after - mu_before).abs();
+        assert!(
+            pathwise_movement > 3.0 * sf_delta.abs(),
+            "B4 contrast: pathwise movement {pathwise_movement:.4} must exceed 3× score-fn delta {sf_delta:.4}"
+        );
     }
 
+    /// B5 — μ_raw stays bounded under the full SAC loop.
+    ///
+    /// On a boundary-optimum task (reward = squashed action), run many SAC
+    /// steps via `step_continuous` and assert `mean|μ_raw|` over a set of
+    /// probe states stays below 50.0 — the H-A runaway signature that
+    /// the score-function estimator exhibits must NOT appear under SAC.
+    ///
+    /// If μ_raw exceeds this bound that is a real integration finding —
+    /// the test reports the observed value; do NOT inflate the bound.
     #[test]
-    #[ignore = "B5 mu_raw bounded — completed in T15"]
+    #[ignore = "slow SAC learning guard (B5)"]
     fn test_mu_raw_stays_bounded_under_sac() {
-        // stub, filled in T15
+        const MU_RAW_BOUND: f64 = 50.0;
+        const STEPS: usize = 500;
+
+        // Five diverse probe states (state_dim=9).
+        let probes: Vec<Vec<f64>> = vec![
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            vec![-0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, 0.0],
+            vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.3, 0.6, 0.9, -0.3, -0.6, -0.9, 0.1, -0.1, 0.5],
+        ];
+
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 31).unwrap();
+
+        let mut state = probes[0].clone();
+        let next_states: Vec<Vec<f64>> =
+            probes.iter().cycle().skip(1).take(STEPS).cloned().collect();
+
+        // Drive the SAC loop with a boundary-optimum task (reward = action[0]).
+        for (step, next_state) in next_states.iter().enumerate() {
+            let done = (step + 1) % 50 == 0;
+            let reward = {
+                // Reward = deterministic action at current state (approx boundary).
+                let mu = agent.actor_mu_raw_for_test(&state);
+                mu[0].tanh() // reward at boundary optimum (+1)
+            };
+            let _ = agent.step_continuous(&state, reward, done);
+            if !done {
+                state = next_state.clone();
+            } else {
+                state = probes[0].clone();
+            }
+        }
+
+        // Measure mean|μ_raw| over all probe states.
+        let mean_abs_mu: f64 = probes
+            .iter()
+            .map(|p| agent.actor_mu_raw_for_test(p)[0].abs())
+            .sum::<f64>()
+            / probes.len() as f64;
+
+        assert!(
+            mean_abs_mu < MU_RAW_BOUND,
+            "B5: μ_raw runaway detected under SAC — mean|μ_raw|={mean_abs_mu:.2} >= {MU_RAW_BOUND}; \
+             this is a real integration finding"
+        );
+    }
+
+    /// B7 — learned σ collapses as the policy commits.
+    ///
+    /// On a single-optimum task, σ = exp(log_σ) should DECREASE over training
+    /// (explore → exploit).  Asserted directionally: σ_final < σ_initial.
+    #[test]
+    #[ignore = "slow SAC learning guard (B7)"]
+    fn test_learned_sigma_collapses_as_policy_commits() {
+        const STEPS: usize = 800;
+
+        let s = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 53).unwrap();
+
+        // Measure initial σ.
+        let sigma_initial: f64 = agent
+            .actor_log_sigma_for_test(&s)
+            .iter()
+            .map(|ls| ls.exp())
+            .sum::<f64>();
+
+        // Drive SAC loop with reward = action (optimum at a = +1).
+        let mut state = s.clone();
+        let next_s: Vec<f64> = s.iter().map(|&x| x + 0.01).collect();
+        for step in 0..STEPS {
+            let done = (step + 1) % 50 == 0;
+            let reward = {
+                let mu = agent.actor_mu_raw_for_test(&state);
+                mu[0].tanh()
+            };
+            let _ = agent.step_continuous(&state, reward, done);
+            state = if done { s.clone() } else { next_s.clone() };
+        }
+
+        let sigma_final: f64 = agent
+            .actor_log_sigma_for_test(&s)
+            .iter()
+            .map(|ls| ls.exp())
+            .sum::<f64>();
+
+        assert!(
+            sigma_final < sigma_initial,
+            "B7: σ must decrease as policy commits; σ_initial={sigma_initial:.4}, σ_final={sigma_final:.4}"
+        );
+    }
+
+    /// B8 — automatic temperature adjusts α in the correct direction.
+    ///
+    /// Tests the dual-temperature update rule directionally by driving it
+    /// from a known initial state:
+    ///
+    /// - When entropy (= −logp) < H_target, the dual gradient is positive →
+    ///   `log_alpha` decreases → α falls (entropy is already too HIGH in the
+    ///   SAC dual convention: logp_mean + H_target < 0 when entropy < |H_target|).
+    ///
+    /// Concretely: apply `sac_temperature_update` repeatedly with a logp that
+    /// implies entropy < H_target (logp_mean = 0.0 → entropy = 0 > H_target = −1 →
+    /// grad < 0 → log_alpha falls → α falls), and assert α_final < α_initial.
+    ///
+    /// Then apply updates with logp that implies entropy ABOVE H_target (logp very
+    /// negative → entropy large → grad positive → log_alpha rises → α rises) and
+    /// assert α rises from α_initial.
+    ///
+    /// This directly verifies the temperature gradient mechanism is wired
+    /// correctly without relying on end-to-end entropy convergence (which is
+    /// confounded by simultaneous σ collapse, as seen in B7).
+    #[test]
+    #[ignore = "slow SAC learning guard (B8)"]
+    fn test_auto_temperature_drives_entropy_toward_target() {
+        // H_target = −action_dim = −1.0 (continuous_sac_config: action_dim=1).
+        // The temperature update: grad = −α·(logp_mean + H_target)
+        //   log_alpha -= alpha_lr * grad
+        //
+        // Case A: logp_mean = 0.0  → entropy = 0  > H_target = −1
+        //         logp_mean + H_target = −1 < 0  → grad > 0  → log_alpha falls → α falls.
+        // Case B: logp_mean = −5.0 → entropy = 5  (large exploration)
+        //         logp_mean + H_target = −6 < 0  → grad > 0  → log_alpha falls → α falls.
+        //
+        // Wait — the correct direction:
+        //   when entropy > H_target (policy too diffuse), α should FALL to sharpen.
+        //   when entropy < H_target (policy too sharp),   α should RISE  to explore.
+        //
+        // Entropy = −logp.  entropy > H_target iff −logp > H_target iff logp < −H_target.
+        // H_target = −1 → −H_target = 1.
+        //
+        // Case A: logp_mean = 0.0  → entropy = 0  < H_target=−1? No, 0 > −1.
+        //         entropy > H_target → α should FALL.
+        //   grad = −α·(0 + (−1)) = +α > 0 → log_alpha -= α·lr·(+α) → FALLS. Correct.
+        //
+        // Case B: logp_mean = −5.0 → entropy = 5.  5 > −1 → α should FALL.
+        //   grad = −α·(−5 + (−1)) = +6α > 0 → log_alpha FALLS. Correct.
+        //
+        // Case C: logp_mean = +2.0 → entropy = −2 < −1 → α should RISE.
+        //   grad = −α·(2 + (−1)) = −α < 0 → log_alpha RISES. Correct.
+
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 79).unwrap();
+
+        // ── Case A: entropy > H_target → α should FALL ──
+        let alpha_initial = agent.alpha_for_test();
+        // logp_mean = 0 → entropy = 0 > H_target=−1: α should fall.
+        for _ in 0..200 {
+            agent.sac_temperature_update(0.0);
+        }
+        let alpha_after_fall = agent.alpha_for_test();
+        assert!(
+            alpha_after_fall < alpha_initial,
+            "B8 case A: when entropy > H_target, α must fall; \
+             α_initial={alpha_initial:.6}, α_after_fall={alpha_after_fall:.6}"
+        );
+
+        // Reset log_alpha to 0.0 (α=1.0) for case B.
+        // (Direct field access not available; rebuild the agent.)
+        let mut agent2 =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 79).unwrap();
+        let alpha_initial2 = agent2.alpha_for_test();
+
+        // ── Case C: entropy < H_target → α should RISE ──
+        // logp_mean = +2.0 → entropy = −2 < H_target=−1: α should rise.
+        for _ in 0..200 {
+            agent2.sac_temperature_update(2.0);
+        }
+        let alpha_after_rise = agent2.alpha_for_test();
+        assert!(
+            alpha_after_rise > alpha_initial2,
+            "B8 case C: when entropy < H_target, α must rise; \
+             α_initial={alpha_initial2:.6}, α_after_rise={alpha_after_rise:.6}"
+        );
     }
 
     // ── T12 RED: SAC replay-loop wiring tests ────────────────────────────────

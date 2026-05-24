@@ -39,3 +39,21 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  sac-learning-guards:
+    name: SAC learning guards (slow, ignored)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run SAC directional learning guards
+        run: >
+          cargo nextest run --release --run-ignored all
+          test_sac_critic_learns_to_rank_actions
+          test_pathwise_moves_mu_toward_saturated_optimum
+          test_mu_raw_stays_bounded_under_sac
+          test_learned_sigma_collapses_as_policy_commits
+          test_auto_temperature_drives_entropy_toward_target
