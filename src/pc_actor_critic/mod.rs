@@ -14337,9 +14337,13 @@ mod tests {
     fn test_continuous_rejects_nonfinite_entropy_coeff() {
         let mut c = continuous_base_config();
         c.policy_entropy_coeff = f64::NAN;
-        assert!(PcActorCritic::new(CpuLinAlg::new(), c, 1)
+        let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
             .map(|_: PcActorCritic| ())
-            .is_err());
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("policy_entropy_coeff"),
+            "nonfinite error must name policy_entropy_coeff, got: {err}"
+        );
     }
 
     #[test]
