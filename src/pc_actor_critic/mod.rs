@@ -746,26 +746,17 @@ impl<L: LinAlg> PcActorCritic<L> {
             ));
         }
 
-        // v4.0.0 — continuous-mode rules. Brainstorm Q1, spec §5.5, §6.
+        // v6.0.0 — canonical SAC continuous-mode rules (replaces v4/v5 on-policy rules).
         if config.action_space == ActionSpace::Continuous {
-            // policy_sigma must be > 0 and finite when continuous.
-            if !config.policy_sigma.is_finite() || config.policy_sigma <= 0.0 {
+            // policy_sigma is IGNORED by SAC (σ is learned from the dual-head actor)
+            // but the field must remain finite to pass the general f64 check.
+            if !config.policy_sigma.is_finite() {
                 return Err(PcError::ConfigValidation(format!(
-                    "policy_sigma ({}) must be > 0 and finite when \
-                     action_space == Continuous. Got {}.",
-                    config.policy_sigma, config.policy_sigma
+                    "policy_sigma ({}) must be finite when action_space == Continuous.",
+                    config.policy_sigma
                 )));
             }
-            // v5.0.0 — continuous entropy temperature must be non-negative and
-            // finite. α = 0 is the v4.1.0-compatibility no-op; α > 0 enables the
-            // entropy regularizer that bounds μ_raw (closes H-A).
-            if !config.policy_entropy_coeff.is_finite() || config.policy_entropy_coeff < 0.0 {
-                return Err(PcError::ConfigValidation(format!(
-                    "policy_entropy_coeff ({}) must be >= 0.0 and finite when \
-                     action_space == Continuous.",
-                    config.policy_entropy_coeff
-                )));
-            }
+
             // KL distillation is undefined for raw continuous output.
             if config.distillation_lambda_polyak > 0.0 {
                 return Err(PcError::ConfigValidation(format!(
@@ -782,41 +773,106 @@ impl<L: LinAlg> PcActorCritic<L> {
                     config.distillation_lambda_frozen
                 )));
             }
-            // Discrete `entropy_coeff` stays silently inert in continuous; the
-            // continuous entropy temperature is `policy_entropy_coeff` (v5.0.0).
 
-            // GAE(λ) IS supported in continuous as of v4.1.0 — no rejection here.
-
-            // TD(n) flush is not yet implemented for continuous mode in v4.0.0.
+            // TD(n) flush is not supported for continuous mode.
             if config.td_steps != 0 {
                 return Err(PcError::ConfigValidation(format!(
-                    "td_steps ({}) > 0 is not supported in continuous action space \
-                     in v4.0.0. Set to 0 or use ActionSpace::Discrete. Continuous \
-                     TD(n) is tracked for v4.x.",
+                    "td_steps ({}) > 0 is not supported in continuous action space. \
+                     Set to 0 or use ActionSpace::Discrete.",
                     config.td_steps
                 )));
             }
-            // v4.1.0: actions are tanh-squashed internally, so the actor must
-            // output the UNBOUNDED pre-squash mean. A bounded output activation
-            // re-introduces the vanishing-gradient trap.
+
+            // SAC requires Linear output — the actor emits unbounded μ and log_σ;
+            // a bounded activation re-introduces the vanishing-gradient trap.
             if config.actor.output_activation != crate::activation::Activation::Linear {
                 return Err(PcError::ConfigValidation(format!(
                     "continuous action space requires actor.output_activation == Linear \
-                     (the policy mean μ is unbounded; actions are tanh-squashed internally). \
+                     (the actor emits μ and log_σ; actions are tanh-squashed internally). \
                      Got {:?}.",
                     config.actor.output_activation
                 )));
             }
-            // replay_learn hard-rejects Continuous transitions; buffer would be
-            // write-only. Reject at construction instead of silently accumulating
-            // transitions that can never be trained on.
-            if config.replay_training_capacity > 0 || config.replay_recent_capacity > 0 {
+
+            // SAC requires a Q-critic.
+            let q_cfg = match &config.q_critic {
+                Some(q) => q,
+                None => {
+                    return Err(PcError::ConfigValidation(
+                        "continuous action space (SAC) requires q_critic to be Some(..). \
+                         Set q_critic with a valid QCriticConfig."
+                            .to_string(),
+                    ));
+                }
+            };
+
+            // actor.output_size must equal 2 * action_dim (μ head + log_σ head).
+            let action_dim = q_cfg.action_dim;
+            let expected_output = 2 * action_dim;
+            if config.actor.output_size != expected_output {
                 return Err(PcError::ConfigValidation(format!(
-                    "replay_training_capacity ({}) and replay_recent_capacity ({}) \
-                     must be 0 in continuous action space in v4.0.0 — replay_learn \
-                     does not yet support Continuous transitions. Tracked for v4.x. \
-                     Set both to 0 or use ActionSpace::Discrete.",
-                    config.replay_training_capacity, config.replay_recent_capacity
+                    "continuous SAC requires actor.output_size == 2 * q_critic.action_dim \
+                     = 2 * {action_dim} = {expected_output}, got {} (actor emits μ and \
+                     log_σ heads).",
+                    config.actor.output_size
+                )));
+            }
+
+            // q_critic.state_dim must match actor.input_size.
+            if q_cfg.state_dim != config.actor.input_size {
+                return Err(PcError::ConfigValidation(format!(
+                    "q_critic.state_dim ({}) must equal actor.input_size ({}) so the \
+                     Q-critic receives the same observation as the actor.",
+                    q_cfg.state_dim, config.actor.input_size
+                )));
+            }
+
+            // SAC requires a replay buffer.
+            if config.replay_training_capacity == 0 {
+                return Err(PcError::ConfigValidation(
+                    "continuous action space (SAC) requires replay_training_capacity > 0. \
+                     SAC is an off-policy algorithm and needs a replay buffer."
+                        .to_string(),
+                ));
+            }
+            if config.replay_batch_size == 0 {
+                return Err(PcError::ConfigValidation(
+                    "continuous action space (SAC) requires replay_batch_size > 0 when \
+                     replay buffer is enabled."
+                        .to_string(),
+                ));
+            }
+
+            // Validate target_entropy if provided.
+            if let Some(te) = config.target_entropy {
+                if !te.is_finite() {
+                    return Err(PcError::ConfigValidation(format!(
+                        "target_entropy ({te}) must be finite when set. \
+                         Use None to let the library use the −action_dim heuristic."
+                    )));
+                }
+            }
+
+            // Validate polyak_tau (must be strictly > 0 for SAC soft target updates).
+            if config.polyak_tau <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "polyak_tau ({}) must be > 0.0 in continuous SAC mode \
+                     (soft target network updates require a positive mixing rate).",
+                    config.polyak_tau
+                )));
+            }
+
+            // Validate temperature learning rate and initial log-temperature.
+            if !config.alpha_lr.is_finite() || config.alpha_lr <= 0.0 {
+                return Err(PcError::ConfigValidation(format!(
+                    "alpha_lr ({}) must be finite and > 0.0 in continuous SAC mode.",
+                    config.alpha_lr
+                )));
+            }
+            if !config.log_alpha_init.is_finite() {
+                return Err(PcError::ConfigValidation(format!(
+                    "log_alpha_init ({}) must be finite in continuous SAC mode.",
+                    config.log_alpha_init
                 )));
             }
         }
@@ -13121,37 +13177,6 @@ mod tests {
     // ── v4.0.0 continuous-mode validation rules ───────────────────────
 
     #[test]
-    fn test_continuous_with_invalid_sigma_rejected() {
-        // Brainstorm Q1/spec §6: continuous mode requires policy_sigma > 0
-        // and finite. NaN/Inf/<=0 must be rejected at construction.
-        let invalid_sigmas = [0.0_f64, -0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
-        for &sigma in &invalid_sigmas {
-            let mut cfg = default_config();
-            cfg.action_space = ActionSpace::Continuous;
-            cfg.policy_sigma = sigma;
-            // Continuous requires distillation off (separate rule, also v4) —
-            // pre-disable here so this test isolates the sigma rule.
-            cfg.distillation_lambda_polyak = 0.0;
-            cfg.distillation_lambda_frozen = 0.0;
-            let result: Result<PcActorCritic, PcError> =
-                PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
-            assert!(
-                result.is_err(),
-                "policy_sigma = {sigma} must be rejected in Continuous mode"
-            );
-            match result.unwrap_err() {
-                PcError::ConfigValidation(msg) => {
-                    assert!(
-                        msg.contains("policy_sigma"),
-                        "error must mention field name, got: {msg}"
-                    );
-                }
-                other => panic!("expected ConfigValidation, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
     fn test_continuous_with_polyak_distillation_rejected() {
         // Brainstorm/spec §5.5: KL is undefined for raw continuous output.
         // distillation_lambda_polyak > 0 in Continuous mode → reject.
@@ -13187,67 +13212,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_continuous_with_valid_config_accepted() {
-        // Smoke: continuous + sigma=0.1 + distillation off + entropy=0
-        // must construct without error.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        cfg.entropy_coeff = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let result: Result<PcActorCritic, PcError> = PcActorCritic::new(CpuLinAlg::new(), cfg, 42);
-        assert!(
-            result.is_ok(),
-            "valid Continuous config must construct, got {:?}",
-            result.err()
-        );
-    }
-
     // ── v4.0.0 entry-point precondition guards (Brainstorm Q6) ─────────
-
-    #[test]
-    fn test_step_masked_rejects_continuous_config() {
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-
-        let state = vec![0.0; 9];
-        let valid: Vec<usize> = (0..9).collect();
-        let result = agent.step_masked(&state, &valid, 0.0, false);
-        assert!(result.is_err(), "step_masked on Continuous must reject");
-        match result.unwrap_err() {
-            PcError::ConfigValidation(msg) => {
-                assert!(msg.contains("Discrete") || msg.contains("Continuous"));
-                assert!(msg.contains("step_masked") || msg.contains("step_continuous"));
-            }
-            other => panic!("expected ConfigValidation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_act_rejects_continuous_config() {
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.0; 9];
-        let valid: Vec<usize> = (0..9).collect();
-        let result = agent.act(&state, &valid, crate::pc_actor::SelectionMode::Play);
-        assert!(result.is_err(), "act on Continuous must reject");
-    }
 
     #[test]
     fn test_step_continuous_rejects_discrete_config() {
@@ -14065,259 +14030,6 @@ mod tests {
     }
 
     #[test]
-    fn test_continuous_gradient_direction_1d() {
-        // Phase 4.1 — empirical verification of the Gaussian-policy
-        // gradient sign convention. With `policy_sigma=0.1`, a positive
-        // advantage (reward > V(s)), and Box-Muller-sampled action
-        // around μ, the descent-direction delta is
-        //   δ = td_error · (μ − a) / σ²
-        // and the bias update `b ← b − lr·δ` pulls μ toward the rewarded
-        // action. Across many calls μ drifts measurably; we only assert
-        // non-zero finite drift here (the deeper sign-convention
-        // validation lives in Task 3.3 unit tests on the gradient
-        // computation itself).
-        use crate::activation::Activation;
-        use crate::layer::LayerDef;
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        cfg.entropy_coeff = 0.0;
-        // 1-D linear-output network for an unbounded μ.
-        cfg.actor.input_size = 4;
-        cfg.actor.output_size = 1;
-        cfg.actor.output_activation = Activation::Linear;
-        cfg.actor.hidden_layers = vec![LayerDef {
-            size: 4,
-            activation: Activation::Tanh,
-        }];
-        // Critic input = state(4) + latent_concat(4 hidden) = 8.
-        cfg.critic.input_size = 4 + 4;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-
-        let state = vec![0.5, 0.3, 0.1, 0.2];
-        let mu_initial = agent.actor.infer(&state).y_conv;
-        let mu_initial_host = agent.backend.vec_to_vec(&mu_initial)[0];
-
-        // Drive 50 step_continuous calls with reward=1.0 (positive advantage).
-        for _ in 0..50 {
-            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
-        }
-
-        let mu_final_host = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv)[0];
-
-        let drift = (mu_final_host - mu_initial_host).abs();
-        assert!(
-            drift > 1e-6,
-            "μ should drift under continuous learning, drift={drift}, \
-             mu_initial={mu_initial_host}, mu_final={mu_final_host}"
-        );
-        assert!(
-            mu_initial_host.is_finite() && mu_final_host.is_finite(),
-            "μ must stay finite: initial={mu_initial_host}, final={mu_final_host}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_gradient_direction_4d() {
-        // Phase 4.1 — multi-dim sanity. 4-D action space, every output
-        // dim should accumulate non-trivial drift across 50 reward=1
-        // calls. Final weights must remain finite.
-        use crate::activation::Activation;
-        use crate::layer::LayerDef;
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        cfg.entropy_coeff = 0.0;
-        cfg.actor.input_size = 4;
-        cfg.actor.output_size = 4;
-        // Linear output required for continuous mode (Task 0 migration;
-        // previously Tanh — unbounded μ is correct for Gaussian policy).
-        cfg.actor.output_activation = Activation::Linear;
-        cfg.actor.hidden_layers = vec![LayerDef {
-            size: 8,
-            activation: Activation::Tanh,
-        }];
-        // Critic input = state(4) + latent_concat(8 hidden) = 12.
-        cfg.critic.input_size = 4 + 8;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-
-        let state = vec![0.5, 0.3, 0.1, 0.2];
-        let mu_initial = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv);
-
-        for _ in 0..50 {
-            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
-        }
-
-        let mu_final = agent.backend.vec_to_vec(&agent.actor.infer(&state).y_conv);
-
-        let total_drift: f64 = mu_initial
-            .iter()
-            .zip(mu_final.iter())
-            .map(|(i, f)| (f - i).abs())
-            .sum();
-
-        assert!(
-            total_drift > 1e-6,
-            "4-D μ should drift, total_drift={total_drift}, \
-             mu_initial={mu_initial:?}, mu_final={mu_final:?}"
-        );
-        assert!(
-            mu_final.iter().all(|x| x.is_finite()),
-            "all μ components must stay finite: {mu_final:?}"
-        );
-    }
-
-    #[test]
-    fn test_act_continuous_play_deterministic() {
-        // Brainstorm Q5+Q7: Play mode returns tanh(μ) deterministically,
-        // does not advance RNG.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
-
-        let (action_a, _) = agent
-            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
-            .unwrap();
-        let (action_b, _) = agent
-            .act_continuous(&state, crate::pc_actor::SelectionMode::Play)
-            .unwrap();
-
-        assert_eq!(action_a, action_b, "Play must be deterministic");
-    }
-
-    #[test]
-    fn test_act_continuous_training_advances_rng() {
-        // Brainstorm Q5+Q7: Training mode samples; two consecutive calls
-        // produce different actions.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.5, 0.3, 0.1, 0.2, 0.4, 0.6, 0.8, 0.7, 0.9];
-
-        let (action_a, _) = agent
-            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
-            .unwrap();
-        let (action_b, _) = agent
-            .act_continuous(&state, crate::pc_actor::SelectionMode::Training)
-            .unwrap();
-
-        assert_ne!(
-            action_a, action_b,
-            "Training must advance RNG (different samples)"
-        );
-    }
-
-    #[test]
-    fn test_continuous_hysteresis_activates_within_200_steps() {
-        // Brainstorm Q4: with action_space=Continuous and actor_hysteresis=true,
-        // the state machine must produce at least one FROZEN ↔ PLASTIC transition
-        // under continuous-mode dynamics. The test pre-seeds the actor in FROZEN
-        // with EWMAs warmed up past min_initial_plastic and wake_fraction=0.01 so
-        // any non-trivial surprise from the PC actor will trigger the wake
-        // (FROZEN → PLASTIC) on the very first step that carries a prior transition.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        cfg.actor_hysteresis = true;
-        cfg.adaptive_surprise = true; // explicit (default is true)
-        cfg.actor_wake_fraction = 0.01; // wake on any 1% surprise spike above slow
-        cfg.actor_wakes_critic = false; // avoid cross-coupling side effects
-        cfg.critic_wakes_actor = false;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-
-        // Pre-seed actor hysteresis: FROZEN, past warmup guard, slow EWMA
-        // at a tiny baseline. Any PC surprise from real inference will be
-        // well above slow * (1 + 0.01) = 0.0001, triggering an immediate wake.
-        {
-            let hyst = agent.actor_hysteresis.as_mut().unwrap();
-            hyst.state = PlasticityState::Frozen;
-            hyst.slow.value = 0.0001;
-            hyst.slow.k = 200; // past min_initial_plastic guard
-            hyst.fast.value = 0.0001;
-            hyst.fast.k = 200;
-        }
-
-        let mut transitions_observed = 0;
-        let mut last_state = agent.actor_hysteresis.as_ref().unwrap().state.clone();
-        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-
-        // Two steps minimum: first step buffers; second step triggers learning
-        // + hysteresis update from surprise_score of the first inference.
-        for _ in 0..10 {
-            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
-            let cur_state = agent.actor_hysteresis.as_ref().unwrap().state.clone();
-            if cur_state != last_state {
-                transitions_observed += 1;
-                last_state = cur_state;
-            }
-        }
-
-        assert!(
-            transitions_observed >= 1,
-            "Hysteresis must produce at least 1 transition under continuous \
-             mode; observed {transitions_observed}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_weight_clip_non_saturation() {
-        // Brainstorm Q3: 100 continuous steps with σ=0.1 must keep
-        // weights finite and avoid clip saturation.
-        //
-        // Task 0 migration note: switched output_activation Tanh→Linear.
-        // With Tanh the output-layer gradient was attenuated by (1−tanh²);
-        // Linear passes full-magnitude gradients so weights grow faster.
-        // The old bound of 4.5 can be exceeded, so the assertion is relaxed
-        // to a finiteness + WEIGHT_CLIP (5.0) ceiling check, which remains
-        // a meaningful non-saturation guarantee.
-        let mut cfg = default_config();
-        cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.1;
-        cfg.distillation_lambda_polyak = 0.0;
-        cfg.distillation_lambda_frozen = 0.0;
-        // Linear output required for continuous mode (Task 0 migration).
-        cfg.actor.output_activation = Activation::Linear;
-        let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 42).unwrap();
-        let state = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
-        for _ in 0..100 {
-            let _ = agent.step_continuous(&state, 1.0, false).unwrap();
-        }
-        // Weights finite.
-        let actor_w = &agent.actor.layers[0].weights.data;
-        assert!(actor_w.iter().all(|w| w.is_finite()));
-        let critic_w = &agent.critic.layers[0].weights.data;
-        assert!(critic_w.iter().all(|w| w.is_finite()));
-        // Magnitude sanity: weights must stay within WEIGHT_CLIP=5.0.
-        // Linear output passes full-magnitude gradients (no tanh attenuation),
-        // so the tighter 4.5 bound from the Tanh era is replaced by the
-        // hard clip ceiling, which is the ultimate non-saturation guarantee.
-        let max_abs_w = actor_w.iter().map(|w| w.abs()).fold(0.0, f64::max);
-        assert!(
-            max_abs_w <= 5.0,
-            "actor weights exceed WEIGHT_CLIP=5.0, max_abs={max_abs_w}"
-        );
-    }
-
-    #[test]
     fn test_continuous_td_n_5_no_clip_saturation() {
         // W2 validation lock: td_steps > 0 + Continuous is rejected at
         // construction. Continuous TD(n) is unsupported in v4.0.0 — the
@@ -14344,38 +14056,14 @@ mod tests {
         }
     }
 
-    // ── v4.1.0 continuous validation rules ───────────────────────────────
-
-    /// Shared fixture for v4.1.0 continuous-mode validation tests.
-    ///
-    /// Produces a minimal valid continuous config: 3-input actor with one
-    /// 8-unit hidden layer, Linear output; matching critic; policy_sigma=0.3.
-    fn continuous_base_config() -> PcActorCriticConfig {
-        let mut c = default_config();
-        c.actor.input_size = 3;
-        c.actor.hidden_layers = vec![LayerDef {
-            size: 8,
-            activation: Activation::Tanh,
-        }];
-        c.actor.output_size = 1;
-        c.actor.output_activation = Activation::Linear;
-        c.critic.input_size = 3 + 8;
-        c.critic.hidden_layers = vec![LayerDef {
-            size: 16,
-            activation: Activation::Tanh,
-        }];
-        c.critic.output_activation = Activation::Linear;
-        c.action_space = ActionSpace::Continuous;
-        c.policy_sigma = 0.3;
-        c
-    }
+    // ── continuous-mode validation rules (v6.0.0 SAC) ───────────────────
 
     #[test]
     fn test_continuous_requires_linear_output() {
-        // v4.1.0: Continuous actors must use Linear output — actions are
-        // tanh-squashed internally, so a bounded activation reintroduces
-        // the vanishing-gradient trap.
-        let mut c = continuous_base_config();
+        // SAC (v6.0.0): Continuous actors must use Linear output — the actor
+        // emits μ and log_σ (unbounded); a bounded activation reintroduces the
+        // vanishing-gradient trap.
+        let mut c = continuous_sac_config();
         c.actor.output_activation = Activation::Tanh;
         let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
             .map(|_: PcActorCritic| ())
@@ -14383,722 +14071,6 @@ mod tests {
         assert!(
             format!("{err}").contains("output_activation"),
             "error must mention output_activation, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_allows_gae_lambda() {
-        // v4.1.0: GAE(λ) is now supported in continuous mode.
-        let mut c = continuous_base_config();
-        c.gae_lambda = Some(0.95);
-        assert!(
-            PcActorCritic::new(CpuLinAlg::new(), c, 1)
-                .map(|_: PcActorCritic| ())
-                .is_ok(),
-            "continuous + gae_lambda=0.95 must construct without error"
-        );
-    }
-
-    #[test]
-    fn test_continuous_gae_trace_accumulates() {
-        let mut cfg = continuous_base_config();
-        cfg.gae_lambda = Some(0.95);
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 11).unwrap();
-        let s = [0.3, 0.2, 0.1];
-        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
-        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
-        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
-        let n: f64 = agent.actor_trace.iter().map(|t| t * t).sum::<f64>().sqrt();
-        assert!(
-            n > 0.0,
-            "continuous GAE trace must be non-zero after learning"
-        );
-    }
-
-    #[test]
-    fn test_continuous_gae_trace_resets_on_terminal() {
-        let mut cfg = continuous_base_config();
-        cfg.gae_lambda = Some(0.95);
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, 11).unwrap();
-        let s = [0.3, 0.2, 0.1];
-        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
-        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
-        let _ = agent.step_continuous(&s, 1.0, true).unwrap();
-        let n: f64 = agent.actor_trace.iter().map(|t| t * t).sum::<f64>().sqrt();
-        assert!(n < 1e-12, "trace must reset on terminal, got {n}");
-    }
-
-    #[test]
-    fn test_continuous_still_rejects_replay() {
-        // Replay is still unsupported in continuous mode in v4.1.0.
-        let mut c = continuous_base_config();
-        c.replay_training_capacity = 8;
-        assert!(
-            PcActorCritic::new(CpuLinAlg::new(), c, 1)
-                .map(|_: PcActorCritic| ())
-                .is_err(),
-            "continuous + replay_training_capacity=8 must be rejected"
-        );
-    }
-
-    // ── v5.0.0 policy_entropy_coeff validation ───────────────────────────
-
-    #[test]
-    fn test_continuous_rejects_negative_entropy_coeff() {
-        let mut c = continuous_base_config();
-        c.policy_entropy_coeff = -0.1;
-        let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
-            .map(|_: PcActorCritic| ())
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("policy_entropy_coeff"),
-            "error must name policy_entropy_coeff, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_rejects_nonfinite_entropy_coeff() {
-        let mut c = continuous_base_config();
-        c.policy_entropy_coeff = f64::NAN;
-        let err = PcActorCritic::new(CpuLinAlg::new(), c, 1)
-            .map(|_: PcActorCritic| ())
-            .unwrap_err();
-        assert!(
-            format!("{err}").contains("policy_entropy_coeff"),
-            "nonfinite error must name policy_entropy_coeff, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_accepts_zero_and_positive_entropy_coeff() {
-        for a in [0.0, 0.1, 1.0] {
-            let mut c = continuous_base_config();
-            c.policy_entropy_coeff = a;
-            assert!(
-                PcActorCritic::new(CpuLinAlg::new(), c, 1)
-                    .map(|_: PcActorCritic| ())
-                    .is_ok(),
-                "α={a} must construct"
-            );
-        }
-    }
-
-    #[test]
-    fn test_continuous_action_is_squashed_to_unit_interval() {
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 7).unwrap();
-        for _ in 0..200 {
-            let a = agent
-                .step_continuous(&[0.5, -0.3, 0.1], 0.0, false)
-                .unwrap();
-            assert_eq!(a.len(), 1);
-            assert!(a[0] > -1.0 && a[0] < 1.0, "action {} not in (-1,1)", a[0]);
-        }
-    }
-
-    #[test]
-    fn test_act_continuous_play_returns_tanh_of_mean() {
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 7).unwrap();
-        let s = [0.2, 0.4, -0.1];
-        let (a, infer) = agent
-            .act_continuous(&s, crate::pc_actor::SelectionMode::Play)
-            .unwrap();
-        let mu_raw = agent.backend.vec_to_vec(&infer.y_conv)[0];
-        assert!(
-            (a[0] - mu_raw.tanh()).abs() < 1e-12,
-            "Play must return tanh(μ_raw)"
-        );
-        assert!(a[0] > -1.0 && a[0] < 1.0);
-    }
-
-    #[test]
-    fn test_continuous_gradient_does_not_vanish_at_large_mu() {
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 3).unwrap();
-        let s = [1.0, 0.0, 0.0];
-        let n = agent.actor.layers.len() - 1;
-        agent.actor.layers[n].bias = agent.backend.vec_from_slice(&[5.0]); // large |μ_raw|
-
-        let mu_before = agent.backend.vec_to_vec(&agent.actor.infer(&s).y_conv)[0];
-        let _ = agent.step_continuous(&s, 0.0, false).unwrap();
-        let _ = agent.step_continuous(&s, 1.0, false).unwrap();
-        let mu_after = agent.backend.vec_to_vec(&agent.actor.infer(&s).y_conv)[0];
-
-        let moved = (mu_after - mu_before).abs();
-        assert!(
-            moved > 1e-4,
-            "Linear μ_raw must move (no vanishing): Δ={moved}"
-        );
-
-        // Contrast: a Tanh output layer at the same pre-activation (~5) would scale
-        // the gradient by (1 − tanh²(5)) ≈ 1.8e-4 → effectively frozen.
-        let tanh_deriv_at_5 = 1.0 - (5.0_f64).tanh().powi(2);
-        assert!(
-            tanh_deriv_at_5 < 1e-3,
-            "demonstrates the saturation trap Linear avoids"
-        );
-    }
-
-    // v4.1.0: continuous mode must bypass surprise→LR modulation and always
-    // return 1.0, regardless of surprise / td_error magnitude.
-    #[test]
-    fn test_continuous_actor_scale_is_constant() {
-        let agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 1).unwrap();
-        for s in [0.0, 0.01, 0.5, 5.0] {
-            let sc = agent.effective_actor_scale_for_mode(s, LearnMode::Online);
-            assert!(
-                (sc - 1.0).abs() < 1e-12,
-                "continuous actor scale must be 1.0, got {sc}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_continuous_critic_scale_is_constant() {
-        let agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 1).unwrap();
-        for td in [0.0, 0.01, 0.5, 5.0] {
-            let sc = agent.effective_critic_scale_for_mode(td, LearnMode::Online);
-            assert!(
-                (sc - 1.0).abs() < 1e-12,
-                "continuous critic scale must be 1.0, got {sc}"
-            );
-        }
-    }
-
-    // ── v4.1.0 continuous learning smoke tests ───────────────────────────
-    //
-    // End-to-end proof that the continuous policy actually learns a tiny 1-D
-    // regulation task (state x, force action, reward −x²; optimal: drive
-    // x → 0). The DELAYED-credit variant (reward only at the terminal step)
-    // is the falsifiable contrast: TD(0) cannot propagate one terminal reward
-    // back ten steps, but GAE(λ) eligibility traces can.
-
-    /// Train the continuous policy on a 1-D regulation task and return the
-    /// deterministic mean action μ at x=−1 and x=+1.
-    ///
-    /// A healthy regulator pushes x toward 0, so it produces a positive force
-    /// at x=−1 and a negative force at x=+1 — i.e. `μ(−1) > μ(+1)`.
-    ///
-    /// CRITICAL: the terminal reward is delivered on a final terminal CLOSER
-    /// call, not by passing `done` on the action-taking call. `step_continuous`
-    /// credits the reward of the PREVIOUS action on the FOLLOWING call, so the
-    /// last transition (and, in terminal-only mode, the ONLY reward) would
-    /// never be credited without the closer.
-    ///
-    /// `gae` selects the eligibility-trace λ (`None` = TD(0)).
-    /// `terminal_only_reward` switches between immediate (`−x²` each step) and
-    /// delayed (`−x²` only at the final step) credit.
-    /// `entropy` sets `policy_entropy_coeff` (α); pass `0.0` for the v4.1.0
-    /// baseline path (no entropy regularization).
-    fn train_regulation(
-        gae: Option<f64>,
-        terminal_only_reward: bool,
-        seed: u64,
-        episodes: usize,
-        entropy: f64, // v5.0.0: continuous entropy temperature α (0.0 = v4.1.0 path)
-    ) -> (f64, f64) {
-        use rand::{rngs::StdRng, Rng, SeedableRng};
-        let mut cfg = continuous_base_config();
-        cfg.actor.input_size = 1;
-        cfg.actor.hidden_layers = vec![LayerDef {
-            size: 8,
-            activation: Activation::Tanh,
-        }];
-        cfg.critic.input_size = 1 + 8;
-        cfg.actor.lr_weights = 0.01;
-        cfg.critic.lr = 0.01;
-        cfg.gamma = 0.97;
-        cfg.gae_lambda = gae;
-        cfg.policy_entropy_coeff = entropy;
-        cfg.policy_sigma = 0.5; // relieve GRAD_CLIP: g=(μ_raw−a_raw)/σ²=−ε/σ; σ=0.5 keeps |g| mostly < 5
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), cfg, seed).unwrap();
-        let mut rng = StdRng::seed_from_u64(seed ^ 0x9E37);
-        for _ in 0..episodes {
-            let mut x: f64 = rng.gen_range(-1.0..1.0);
-            let mut r = 0.0;
-            for t in 0..10 {
-                // never pass done on the action-taking call; reward is delivered next call.
-                let a = agent.step_continuous(&[x], r, false).unwrap();
-                x = (x + 0.4 * a[0]).clamp(-1.5, 1.5);
-                r = if terminal_only_reward {
-                    if t == 9 {
-                        -(x * x)
-                    } else {
-                        0.0
-                    }
-                } else {
-                    -(x * x)
-                };
-            }
-            // terminal closer: delivers the final reward and closes the episode so the
-            // last transition (and, in terminal-only mode, the ONLY reward) is credited.
-            let _ = agent.step_continuous(&[x], r, true).unwrap();
-        }
-        let mu = |ag: &mut PcActorCritic, px: f64| {
-            ag.act_continuous(&[px], crate::pc_actor::SelectionMode::Play)
-                .unwrap()
-                .0[0]
-        };
-        (mu(&mut agent, -1.0), mu(&mut agent, 1.0))
-    }
-
-    #[test]
-    #[ignore = "slow learning-validation (~30s); run on demand: cargo test -- --ignored"]
-    fn test_continuous_learns_immediate_credit_regulation() {
-        let mut wins = 0;
-        for seed in [42u64, 43, 44, 45, 46] {
-            let (m_neg, m_pos) = train_regulation(None, false, seed, 2500, 0.0);
-            if m_neg > m_pos + 0.1 {
-                wins += 1;
-            }
-        }
-        assert!(
-            wins >= 4,
-            "immediate-credit must learn on >=4/5 seeds, got {wins}"
-        );
-    }
-
-    /// GAE(λ) robustly learns a DELAYED-credit task (reward only at the terminal
-    /// step). Accepted deviation from the original R8/B4 "TD(0) must FAIL" contrast:
-    /// a white-box sweep (~60 runs via systematic-debugging) showed TD(0) ALSO
-    /// solves a 1-D toy task on all seeds — its one-step bootstrap plus function-
-    /// approximation generalization suffices for smooth short-horizon regulation
-    /// regardless of horizon. GAE's advantage over TD(0) is a genuinely long-
-    /// horizon / high-variance phenomenon (Pendulum) and is validated by the
-    /// downstream harness (B10), NOT this smoke test. So this asserts the true,
-    /// valuable property: GAE handles delayed credit. (TD(0) arm dropped — it
-    /// asserted nothing realizable here and only doubled runtime.)
-    #[test]
-    #[ignore = "slow learning-validation (~60s); run on demand: cargo test -- --ignored"]
-    fn test_continuous_gae_learns_delayed_credit() {
-        let mut gae_learn = 0;
-        for seed in [42u64, 43, 44, 45, 46] {
-            let (g_neg, g_pos) = train_regulation(Some(0.95), true, seed, 5000, 0.0);
-            if g_neg > g_pos + 0.1 {
-                gae_learn += 1;
-            }
-        }
-        assert!(
-            gae_learn >= 4,
-            "GAE must learn delayed credit on >=4/5 seeds, got {gae_learn}"
-        );
-    }
-
-    #[test]
-    #[ignore = "slow learning-validation (~30s); run on demand: cargo test -- --ignored"]
-    fn test_continuous_entropy_bounds_mu_raw() {
-        // B1 (DIRECTIONAL MECHANISM GUARD, not a convergence proof — B10 is
-        // authoritative). With α>0 the entropy restoring force must cut the α=0
-        // μ_raw runaway by a clear margin and keep μ_raw within a few × the tanh
-        // saturation scale (|a_raw|~3–5). The criterion is RELATIVE (with <
-        // 0.5·without) plus a saturation-anchored sanity cap (with < 10), NOT the
-        // loose absolute 15 (MAGI C2). Do NOT raise α so high that μ_raw is
-        // crushed toward 0 just to pass the cap — that is over-regularization;
-        // B10 tunes the harness α and remains authoritative.
-        use rand::{rngs::StdRng, Rng, SeedableRng};
-        fn max_abs_mu(alpha: f64, seed: u64) -> f64 {
-            let mut c = continuous_base_config();
-            c.actor.input_size = 1;
-            c.actor.hidden_layers = vec![LayerDef {
-                size: 8,
-                activation: Activation::Tanh,
-            }];
-            c.critic.input_size = 1 + 8;
-            c.actor.lr_weights = 0.01;
-            c.critic.lr = 0.01;
-            c.gamma = 0.97;
-            c.policy_sigma = 0.3;
-            c.policy_entropy_coeff = alpha;
-            let mut agent = PcActorCritic::new(CpuLinAlg::new(), c, seed).unwrap();
-            let mut rng = StdRng::seed_from_u64(seed ^ 0xD1A6);
-            let draw = |r: &mut StdRng| {
-                let s = if r.gen::<bool>() { 1.0 } else { -1.0 };
-                s * r.gen_range(0.3_f64..1.0)
-            };
-            let mut peak = 0.0_f64;
-            for ep in 0..4000 {
-                let mut x = draw(&mut rng);
-                let mut rwd = 0.0;
-                for _ in 0..8 {
-                    let a = agent.step_continuous(&[x], rwd, false).unwrap();
-                    rwd = a[0] * x.signum();
-                    x = draw(&mut rng);
-                }
-                let _ = agent.step_continuous(&[x], rwd, true).unwrap();
-                if ep % 200 == 0 || ep == 3999 {
-                    for px in [-1.0, 1.0] {
-                        let m = agent
-                            .act_continuous(&[px], crate::pc_actor::SelectionMode::Play)
-                            .unwrap()
-                            .1
-                            .y_conv[0]
-                            .abs();
-                        peak = peak.max(m);
-                    }
-                }
-            }
-            peak
-        }
-        let a_def = crate::pc_actor_critic::config::default_policy_entropy_coeff();
-        let mut ok = 0;
-        for seed in [42u64, 43, 44] {
-            let with = max_abs_mu(a_def, seed);
-            let without = max_abs_mu(0.0, seed);
-            // BASELINE-RUNAWAY GUARD (MAGI iter-2 D5): only count a seed where the
-            // α=0 baseline ACTUALLY ran away — otherwise the relative criterion is
-            // trivially true and proves nothing.
-            // RELATIVE: entropy at least halves the runaway. SANITY: within a few ×
-            // the saturation scale (≤ 10, not 15).
-            if without > 6.0 && with < 0.5 * without && with < 10.0 {
-                ok += 1;
-            }
-        }
-        assert!(
-            ok >= 2,
-            "α>0 must halve a genuine α=0 runaway (without>6) and stay < 10 on >=2/3 seeds, got {ok}"
-        );
-    }
-
-    #[test]
-    #[ignore = "slow learning-validation (~30s); run on demand: cargo test -- --ignored"]
-    fn test_continuous_default_entropy_does_not_regress_stochastic() {
-        // R11 / B11 (MAGI iter-1 Caspar critical): with α = default (>0), the
-        // STOCHASTIC continuous policy must still LEARN the immediate-credit
-        // regulation task (μ(−1) > μ(+1)) on ≥4/5 seeds — entropy must not
-        // over-regularize and degrade the v4.1.0 stochastic path. Reuses the same
-        // train_regulation helper as the v4.1.0 immediate-credit smoke test (D4),
-        // only changing α from 0.0 to the default.
-        let alpha = crate::pc_actor_critic::config::default_policy_entropy_coeff();
-        let mut wins = 0;
-        for seed in [42u64, 43, 44, 45, 46] {
-            let (m_neg, m_pos) = train_regulation(None, false, seed, 2500, alpha);
-            if m_neg > m_pos + 0.1 {
-                wins += 1;
-            }
-        }
-        assert!(
-            wins >= 4,
-            "default-on α must NOT regress stochastic learning (>=4/5), got {wins}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_nonfinite_sigma_does_not_corrupt_weights() {
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
-        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 0.0, false).unwrap();
-        agent.config.policy_sigma = 0.0; // illegal post-construction mutation
-                                         // must not panic / NaN-corrupt
-        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 1.0, false);
-        // No bulk matrix→Vec accessor on LinAlg; read CpuLinAlg's concrete field.
-        let w = &agent.actor.layers[0].weights.data;
-        assert!(
-            w.iter().all(|x| x.is_finite()),
-            "weights must stay finite under sigma=0"
-        );
-    }
-
-    #[test]
-    fn test_continuous_nonfinite_entropy_coeff_does_not_corrupt_weights() {
-        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
-        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 0.0, false).unwrap();
-        agent.config.policy_entropy_coeff = f64::NAN; // illegal post-construction mutation
-                                                      // must not panic / NaN-corrupt
-        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 1.0, false);
-        let w = &agent.actor.layers[0].weights.data;
-        assert!(
-            w.iter().all(|x| x.is_finite()),
-            "weights must stay finite under non-finite policy_entropy_coeff"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Task 4 (v5.0.0): continuous entropy gradient wiring tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_continuous_entropy_pulls_mu_down_vs_alpha_zero() {
-        // Verify that entropy (α > 0) pulls μ_raw toward 0 relative to α = 0.
-        //
-        // Design constraints:
-        // • bias += 3.0: output bias starts near 3.0, well below WEIGHT_CLIP
-        //   (5.0) so the weight-clip in layer.backward does not fire and erase
-        //   the entropy contribution.
-        // • policy_sigma = 1.0 (larger than default 0.3): reduces the
-        //   score-function gradient magnitude (delta ≈ −eps / σ² ≈ −eps)
-        //   so it stays well within GRAD_CLIP (5.0), leaving room for the
-        //   entropy term to produce a measurably different result.
-        // • Both agents share seed 7 → identical initial weights; the ONLY
-        //   difference after the two learning steps is the entropy delta.
-        fn agent_with_alpha(alpha: f64) -> PcActorCritic {
-            let mut c = continuous_base_config();
-            c.actor.input_size = 1;
-            c.actor.hidden_layers = vec![LayerDef {
-                size: 4,
-                activation: Activation::Tanh,
-            }];
-            c.critic.input_size = 1 + 4;
-            c.policy_entropy_coeff = alpha;
-            // Large sigma keeps score-function delta well within GRAD_CLIP
-            // so entropy's additive contribution is not erased by the clip.
-            c.policy_sigma = 1.0;
-            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 7).unwrap();
-            let last = a.actor.layers.len() - 1;
-            // bias += 3.0 keeps total bias below WEIGHT_CLIP so the
-            // backward clip does not zero out the entropy difference.
-            for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 3.0;
-            }
-            a
-        }
-        let mu = |ag: &mut PcActorCritic| {
-            ag.act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
-                .unwrap()
-                .1
-                .y_conv[0]
-        };
-        let mut a0 = agent_with_alpha(0.0);
-        let mut a1 = agent_with_alpha(0.2);
-        let _ = a0.step_continuous(&[0.5], 0.0, false).unwrap();
-        let _ = a0.step_continuous(&[0.5], 1.0, false).unwrap();
-        let _ = a1.step_continuous(&[0.5], 0.0, false).unwrap();
-        let _ = a1.step_continuous(&[0.5], 1.0, false).unwrap();
-        assert!(
-            mu(&mut a1) < mu(&mut a0),
-            "entropy (α>0) must pull μ_raw lower than α=0: a1={}, a0={}",
-            mu(&mut a1),
-            mu(&mut a0)
-        );
-    }
-
-    #[test]
-    fn test_continuous_entropy_excluded_from_gae_trace() {
-        fn trace_after(alpha: f64) -> Vec<f64> {
-            let mut c = continuous_base_config();
-            c.actor.input_size = 1;
-            c.actor.hidden_layers = vec![LayerDef {
-                size: 4,
-                activation: Activation::Tanh,
-            }];
-            c.critic.input_size = 1 + 4;
-            c.gae_lambda = Some(0.95);
-            c.policy_entropy_coeff = alpha;
-            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 9).unwrap();
-            let last = a.actor.layers.len() - 1;
-            for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 6.0;
-            }
-            let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            a.actor_trace.clone()
-        }
-        assert_eq!(
-            trace_after(0.0),
-            trace_after(0.5),
-            "entropy must NOT enter the GAE eligibility trace"
-        );
-    }
-
-    #[test]
-    fn test_continuous_y_conv_is_pre_squash_mu_raw() {
-        let mut c = continuous_base_config();
-        c.actor.input_size = 1;
-        c.actor.hidden_layers = vec![LayerDef {
-            size: 4,
-            activation: Activation::Tanh,
-        }];
-        c.critic.input_size = 1 + 4;
-        let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 1).unwrap();
-        let last = a.actor.layers.len() - 1;
-        for b in a.actor.layers[last].bias.iter_mut() {
-            *b += 6.0;
-        }
-        let y = a
-            .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
-            .unwrap()
-            .1
-            .y_conv[0];
-        assert!(
-            y.abs() > 1.0,
-            "y_conv must be the unbounded pre-squash μ_raw (|y|>1 possible), got {y}"
-        );
-    }
-
-    #[test]
-    fn test_continuous_entropy_survives_saturated_trace() {
-        // C4 regression: layer.backward clips grad=delta*deriv to ±GRAD_CLIP=5.0.
-        // For a Linear output layer deriv=1, so the clip applies directly to
-        // delta. When the advantage part (td_error * GAE-trace) already saturates
-        // ±GRAD_CLIP, the entropy term (≤2α) appended afterward is erased by the
-        // clip — the restoring force disappears exactly in the saturated regime.
-        //
-        // This test reproduces the saturation condition and asserts that entropy
-        // still produces a measurably larger downward drift than α=0 after the
-        // fix (GRAD_CLIP headroom reserved before the entropy add).
-        //
-        // Design:
-        // • bias += 3.0 (below WEIGHT_CLIP=5.0): actor output μ_raw starts at ≈3
-        //   so tanh(μ_raw) ≈ 0.995 — squash boundary, entropy term near maximum.
-        // • policy_sigma = 0.3: score-function gradient g = (μ_raw − a_raw)/σ²
-        //   is large (σ small), so the GAE trace quickly reaches GRAD_CLIP=5.0.
-        // • reward = 50.0: td_error >> 1 → td_error * trace >> GRAD_CLIP,
-        //   ensuring the advantage delta saturates layer.backward's clip.
-        // • Two steps: step 1 accumulates the trace; step 2 fires the large
-        //   td_error. On current code (no headroom reserved) the clip erases the
-        //   entropy, so drift(0.3) ≈ drift(0.0) and the assertion fails (Red).
-        //   After the fix (headroom reserved) drift(0.3) > drift(0.0) (Green).
-        fn drift(alpha: f64) -> f64 {
-            let mut c = continuous_base_config();
-            c.actor.input_size = 1;
-            c.actor.hidden_layers = vec![LayerDef {
-                size: 4,
-                activation: Activation::Tanh,
-            }];
-            c.critic.input_size = 1 + 4;
-            c.gae_lambda = Some(0.95);
-            c.policy_entropy_coeff = alpha;
-            // Small sigma → large score-function gradient → trace saturates GRAD_CLIP.
-            c.policy_sigma = 0.3;
-            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 5).unwrap();
-            let last = a.actor.layers.len() - 1;
-            // Bias into saturation band: μ_raw ≈ 3 → tanh(μ_raw) ≈ 0.995.
-            // Entropy delta ≈ 2α*0.995 ≈ 0.597 for α=0.3 — near maximum.
-            for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 3.0;
-            }
-            let before = a
-                .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
-                .unwrap()
-                .1
-                .y_conv[0];
-            // Step 1: zero reward — accumulate GAE trace without firing a large update.
-            let _ = a.step_continuous(&[0.5], 0.0, false).unwrap();
-            // Step 2: large reward → td_error >> 1 → td_error*trace >> GRAD_CLIP.
-            // On current code this saturates layer.backward's clip and erases entropy.
-            let _ = a.step_continuous(&[0.5], 50.0, false).unwrap();
-            let after = a
-                .act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
-                .unwrap()
-                .1
-                .y_conv[0];
-            before - after
-        }
-        let d0 = drift(0.0);
-        let d3 = drift(0.3);
-        assert!(
-            d3 > d0 + 1e-6,
-            "entropy (α=0.3) must survive GRAD_CLIP saturation and add measurable \
-             downward drift: α=0.3 drift={d3:.6} must exceed α=0 drift={d0:.6} by >1e-6"
-        );
-    }
-
-    #[test]
-    fn test_squashed_entropy_delta_is_bounded_restoring_force() {
-        // descent-delta contribution = +2α·tanh(a_raw); with θ←θ−lr·delta this
-        // pulls μ_raw toward 0 — a restoring force that does NOT vanish at
-        // saturation (contrast: the score-function advantage term vanishes).
-        let d = squashed_entropy_delta(0.1, &[5.0]);
-        assert!(
-            (d[0] - 0.2 * (5.0_f64).tanh()).abs() < 1e-12,
-            "got {}",
-            d[0]
-        );
-        assert!(
-            d[0] > 0.19,
-            "positive saturated μ_raw → positive delta, got {}",
-            d[0]
-        );
-
-        let d_neg = squashed_entropy_delta(0.1, &[-5.0]);
-        assert!(
-            d_neg[0] < -0.19,
-            "negative saturated μ_raw → negative delta, got {}",
-            d_neg[0]
-        );
-
-        // non-vanishing at deep saturation (the H-A-relevant property)
-        let d_deep = squashed_entropy_delta(0.1, &[20.0]);
-        assert!(
-            d_deep[0].abs() > 0.19,
-            "must not vanish at saturation, got {}",
-            d_deep[0]
-        );
-    }
-
-    #[test]
-    fn test_squashed_entropy_delta_alpha_zero_is_noop() {
-        // α = 0 → exactly zero contribution → bit-identical to v4.1.0.
-        assert_eq!(
-            squashed_entropy_delta(0.0, &[5.0, -3.0, 0.0]),
-            vec![0.0, 0.0, 0.0]
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Task 5 (v5.0.0): runtime mutability of policy_entropy_coeff (B6)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_continuous_entropy_coeff_is_read_per_step() {
-        // Verify that mutating `agent.config.policy_entropy_coeff` between
-        // steps takes effect on the very next learning step (B6).
-        //
-        // Design:
-        // • 1-input agent; bias += 3.0 (below WEIGHT_CLIP=5.0) so μ_raw ≈ 3
-        //   (tanh(μ_raw) ≈ 0.995).  The entropy restoring force at this
-        //   saturation point is near-maximum (≈ 2α).
-        // • policy_sigma = 1.0: keeps the score-function gradient within
-        //   GRAD_CLIP so the entropy additive term is not erased by clipping.
-        // • Both runs share seed 11 and are identical for steps 1-2
-        //   (α = 0.0 in both).  At step 3 the "bump" run sets α = 0.5; the
-        //   control stays at α = 0.0.  Steps 3-6 use a moderate positive
-        //   reward (1.0) so the entropy restoring force is relevant.
-        // • With positive μ_raw the entropy delta (+2α·tanh(a_raw) > 0)
-        //   causes the weight update (θ ← θ − lr·delta) to pull μ_raw DOWN.
-        //   The control (no entropy) is not subject to this pull, so after
-        //   the bump the control's μ_raw ends strictly higher.
-        // • Assertion: mu_bump < mu_control (entropy proved to be read
-        //   per-step, not cached at construction time).
-        fn run(mutate_alpha_at_step_3: bool) -> f64 {
-            let mut c = continuous_base_config();
-            c.actor.input_size = 1;
-            c.actor.hidden_layers = vec![LayerDef {
-                size: 4,
-                activation: Activation::Tanh,
-            }];
-            c.critic.input_size = 1 + 4;
-            // Large sigma keeps the score-function gradient within GRAD_CLIP
-            // so the entropy contribution is additive and not erased.
-            c.policy_sigma = 1.0;
-            c.policy_entropy_coeff = 0.0;
-            let mut a = PcActorCritic::new(CpuLinAlg::new(), c, 11).unwrap();
-            let last = a.actor.layers.len() - 1;
-            // Moderate bias bump: μ_raw ≈ 3, well below WEIGHT_CLIP (5.0).
-            // Keeps the entropy restoring force near-maximum while avoiding
-            // the WEIGHT_CLIP pitfall that erases the entropy difference.
-            for b in a.actor.layers[last].bias.iter_mut() {
-                *b += 3.0;
-            }
-            // Steps 1-2: identical in both runs (α = 0.0).
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            // Mid-stream mutation at step 3.
-            if mutate_alpha_at_step_3 {
-                a.config.policy_entropy_coeff = 0.5;
-            }
-            // Steps 3-6: diverge only if entropy is read per-step.
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            let _ = a.step_continuous(&[0.5], 1.0, false).unwrap();
-            a.act_continuous(&[0.5], crate::pc_actor::SelectionMode::Play)
-                .unwrap()
-                .1
-                .y_conv[0]
-        }
-        let mu_bump = run(true);
-        let mu_control = run(false);
-        assert!(
-            mu_bump < mu_control,
-            "mid-stream α=0.5 must pull μ_raw down vs α=0 control: \
-             mu_bump={mu_bump:.6} must be < mu_control={mu_control:.6}"
         );
     }
 
@@ -15121,6 +14093,8 @@ mod tests {
         // Actor: input=3, hidden=[32,32] Tanh, output=2 Linear, max_steps=20.
         // Critic: input = 3 + 32 + 32 = 67 (latent concat from two hidden
         // layers), one hidden layer of 64 Tanh, Linear output.
+        // Updated for v6.0.0 SAC: actor must emit μ + log_σ (output_size = 2 *
+        // action_dim); q_critic and replay_training_capacity required.
         let mut cfg = default_config();
         cfg.actor.input_size = 3;
         cfg.actor.hidden_layers = vec![
@@ -15133,7 +14107,7 @@ mod tests {
                 activation: Activation::Tanh,
             },
         ];
-        cfg.actor.output_size = 2;
+        cfg.actor.output_size = 2; // 2 * action_dim(=1): μ head + log_σ head
         cfg.actor.output_activation = Activation::Linear;
         cfg.actor.max_steps = 20;
         cfg.critic.input_size = 3 + 32 + 32; // state + latent concat
@@ -15143,7 +14117,20 @@ mod tests {
         }];
         cfg.critic.output_activation = Activation::Linear;
         cfg.action_space = ActionSpace::Continuous;
-        cfg.policy_sigma = 0.3;
+        cfg.policy_sigma = 0.3; // ignored by SAC but must be finite
+        cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+            state_dim: 3,
+            action_dim: 1,
+            hidden_layers: vec![LayerDef {
+                size: 64,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.001,
+        });
+        cfg.replay_training_capacity = 10_000;
+        cfg.replay_batch_size = 64;
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
 
         let mut agent: PcActorCritic =
             PcActorCritic::new(CpuLinAlg::new(), cfg, 42).expect("agent construction must succeed");
