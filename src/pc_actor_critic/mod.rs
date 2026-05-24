@@ -15674,4 +15674,119 @@ mod tests {
              error mentioning 'crossover' and 'continuous'; got: {result:?}"
         );
     }
+
+    // ── Fix 1: episode-boundary replay bridging ──────────────────────────
+
+    /// Verify that `step_continuous` does NOT buffer a cross-episode transition
+    /// linking the terminal state of episode N to the initial state of episode N+1.
+    ///
+    /// Drive the agent across one episode boundary: a few intra-episode steps,
+    /// one terminal step (`done=true`), then a few steps of a new episode.
+    /// Assert that:
+    /// 1. The count of buffered transitions equals the number of VALID intra-episode
+    ///    step pairs (i.e. no spurious cross-episode entry).
+    /// 2. None of the buffered transitions has its `state` equal to the terminal
+    ///    state vector (the terminal state must appear only as `next_state` in the
+    ///    terminal transition, never as the `state` of a subsequent transition).
+    ///
+    /// A failure here means `state_prev` was NOT cleared on `done=true`, so the
+    /// first step of the new episode incorrectly built a transition bridging the
+    /// episode boundary.
+    #[test]
+    fn test_no_cross_episode_transition_buffered() {
+        // Use a large-capacity buffer so no eviction occurs during the test.
+        let mut cfg = continuous_sac_config();
+        cfg.replay_training_capacity = 500;
+        cfg.replay_recent_capacity = 500;
+        // Disable batch-triggered learning so buffer contents are not consumed.
+        cfg.replay_batch_size = 499;
+        let mut agent = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        // Use clearly distinguishable state vectors so we can identify them.
+        let ep1_states: Vec<Vec<f64>> = (0..5_usize)
+            .map(|i| vec![1.0 + i as f64 * 0.1; 9])
+            .collect();
+        // Terminal state for episode 1 (last element of ep1_states).
+        let terminal_state = ep1_states[4].clone();
+        // First state of episode 2 — clearly different.
+        let ep2_reset: Vec<f64> = vec![-9.0; 9];
+        let ep2_second: Vec<f64> = vec![-8.0; 9];
+
+        // ── Episode 1 ──
+        // Step 0: first call — no prev, stashes s0. No transition buffered.
+        let _ = agent
+            .step_continuous(&ep1_states[0], 0.0, false)
+            .expect("step 0");
+        // Steps 1-3: intra-episode transitions (s_{i-1}, a_{i-1}, r, s_i, done=false).
+        for state_i in ep1_states.iter().take(4).skip(1) {
+            let _ = agent
+                .step_continuous(state_i, 0.1, false)
+                .expect("step intra");
+        }
+        // Step 4: terminal. Transition (s3, a3, r, terminal_state, done=true) pushed.
+        // state_prev must be cleared afterwards.
+        let _ = agent
+            .step_continuous(&terminal_state, 1.0, true)
+            .expect("terminal step");
+
+        // ── Episode 2 ──
+        // Step 5 (reset): first step of new episode. state_prev was cleared → NO
+        // transition is pushed. state_prev is now set to ep2_reset.
+        let _ = agent
+            .step_continuous(&ep2_reset, 0.0, false)
+            .expect("ep2 reset step");
+        // Step 6: second step of new episode → ONE transition
+        // (ep2_reset, ..., ep2_second, false).
+        let _ = agent
+            .step_continuous(&ep2_second, 0.2, false)
+            .expect("ep2 second step");
+
+        // ── Assertions ──
+        // Expected transitions:
+        //   ep1: steps 1-3 intra = 3, step 4 terminal = 1  → 4 total from ep1
+        //   ep2: step 6 (links reset→second) = 1            → 1 from ep2
+        //   NO cross-episode transition (would be step 5 pushing (terminal, ...))
+        // Total expected = 5.
+        let buffer = agent
+            .replay_buffer
+            .as_ref()
+            .expect("replay buffer must be present for SAC agent");
+        let all_transitions: Vec<&crate::pc_actor_critic::replay::ReplayTransition> = buffer
+            .training_memories
+            .iter()
+            .chain(buffer.recent_memories.iter())
+            .collect();
+
+        assert_eq!(
+            all_transitions.len(),
+            5,
+            "expected exactly 5 valid transitions (4 ep1 + 1 ep2); \
+             got {}. A count of 6 indicates a spurious cross-episode transition was buffered.",
+            all_transitions.len()
+        );
+
+        // None of the transitions must use terminal_state as the `state` field.
+        // The terminal state must appear only as `next_state` in the terminal
+        // transition (done=true), never as the source of a new transition.
+        for t in &all_transitions {
+            assert_ne!(
+                t.state, terminal_state,
+                "found a transition whose `state` equals the terminal state — \
+                 this is a cross-episode bridging transition that must not exist. \
+                 state_prev was not cleared on done=true."
+            );
+        }
+
+        // Verify the terminal transition itself is correctly recorded.
+        let terminal_t = all_transitions
+            .iter()
+            .find(|t| t.done)
+            .expect("exactly one terminal transition (done=true) must be in the buffer");
+        assert_eq!(
+            terminal_t.next_state, terminal_state,
+            "terminal transition must have next_state = terminal_state; \
+             got {:?}",
+            terminal_t.next_state
+        );
+    }
 }
