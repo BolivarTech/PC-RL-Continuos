@@ -14404,4 +14404,42 @@ mod tests {
         let a_raw = [50.0]; // tanh≈1
         assert!(squashed_log_prob(&mu, &log_sigma, &a_raw).is_finite());
     }
+
+    // ── T8: Twin Q critics + Polyak target tests ──────────────────────
+
+    #[test]
+    fn test_sac_agent_builds_twin_q() {
+        let agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
+                .unwrap();
+        assert!(agent.has_sac_critics());
+    }
+
+    #[test]
+    fn test_discrete_agent_has_no_sac_critics() {
+        let agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+        assert!(!agent.has_sac_critics());
+    }
+
+    #[test]
+    fn test_polyak_update_moves_target_toward_live() {
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
+                .unwrap();
+        // continuous_sac_config: state_dim=9, action_dim=1
+        let s = [0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let a = [0.5_f64];
+        // Diverge live q1 from its target by many gradient updates.
+        for _ in 0..30 {
+            agent.train_q1_for_test(&s, &a, 5.0);
+        }
+        let before = agent.q1_target_probe(&s, &a);
+        agent.polyak_update_targets();
+        let after = agent.q1_target_probe(&s, &a);
+        assert!(
+            (after - before).abs() > 1e-9,
+            "target must move toward live after polyak; before={before}, after={after}"
+        );
+    }
 }
