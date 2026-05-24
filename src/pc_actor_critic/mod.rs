@@ -14191,4 +14191,36 @@ mod tests {
             elapsed.as_secs_f64()
         );
     }
+
+    #[test]
+    fn test_split_mu_log_sigma_halves_y_conv() {
+        let y = vec![0.5, -0.2, -1.0, 3.0];
+        let (mu, log_sigma) = split_mu_log_sigma(&y, 2);
+        assert_eq!(mu, vec![0.5, -0.2]);
+        assert!((log_sigma[0] - (-1.0)).abs() < 1e-12);
+        assert!((log_sigma[1] - 2.0).abs() < 1e-12); // clamped to LOG_SIG_MAX=2.0
+    }
+
+    #[test]
+    fn test_deterministic_squashed_action_is_tanh_mu() {
+        let mu = vec![10.0, -0.5];
+        let a = deterministic_squashed_action(&mu);
+        assert!((a[0] - 10.0_f64.tanh()).abs() < 1e-12);
+        assert!((a[1] - (-0.5_f64).tanh()).abs() < 1e-12);
+        assert!(a[0] > -1.0 && a[0] < 1.0);
+    }
+
+    #[test]
+    fn test_sample_squashed_action_in_open_interval() {
+        use rand::SeedableRng;
+        let mu = vec![0.0];
+        let log_sigma = vec![0.0]; // σ = 1
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        for _ in 0..1000 {
+            let (a_raw, a) = sample_squashed_action(&mu, &log_sigma, &mut rng);
+            assert_eq!(a_raw.len(), 1);
+            assert_eq!(a.len(), 1);
+            assert!(a[0] > -1.0 && a[0] < 1.0, "action {} not in (-1,1)", a[0]);
+        }
+    }
 }
