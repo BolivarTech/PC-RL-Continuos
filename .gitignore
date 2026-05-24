@@ -33,3 +33,11 @@ scripts/ralph/runs/
 
 # MAGI review reports
 .magi-reports/
+
+# Local investigation / results docs (developer-local, not shared)
+docs/experiment-linear-constant-lr-test-protocol.md
+docs/finding-continuous-gradient-no-learning.md
+docs/results_constlr.md
+docs/results_solution_a.md
+docs/results_v410.md
+docs/solution-a-linear-output-test-protocol.md
