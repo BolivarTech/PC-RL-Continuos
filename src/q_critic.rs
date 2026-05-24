@@ -250,6 +250,32 @@ impl<L: LinAlg> QCritic<L> {
         loss
     }
 
+    /// `∇_a Q(s, a)` — gradient of the scalar Q output w.r.t. the action slice
+    /// of the input. Non-mutating. Length = `action_dim`.
+    ///
+    /// Runs a forward pass storing per-layer outputs, then backpropagates a
+    /// unit seed delta `[1.0]` through each layer via [`Layer::input_gradient`]
+    /// (non-mutating — no weight update). The resulting input-gradient has length
+    /// `state_dim + action_dim`; the last `action_dim` components are returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - State observation vector of length `config.state_dim`.
+    /// * `action` - Action vector of length `config.action_dim`.
+    ///
+    /// # Returns
+    ///
+    /// Gradient `∂Q/∂a` as a `Vec<f64>` of length `action_dim`.
+    pub fn action_gradient(&self, state: &[f64], action: &[f64]) -> Vec<f64> {
+        let (_v, _inputs, outputs) = self.forward_with_io(state, action);
+        let mut delta = self.backend.vec_from_slice(&[1.0]);
+        for i in (0..self.layers.len()).rev() {
+            delta = self.layers[i].input_gradient(&outputs[i], &delta);
+        }
+        let full = self.backend.vec_to_vec(&delta); // length state_dim + action_dim
+        full[self.config.state_dim..].to_vec()
+    }
+
     /// Extracts a serializable snapshot of current weights.
     ///
     /// Converts generic layers to CPU layers via `layer_to_cpu` for
@@ -355,19 +381,32 @@ mod tests {
     #[test]
     fn test_action_gradient_matches_finite_difference() {
         let mut rng = StdRng::seed_from_u64(7);
-        let cfg = QCriticConfig { state_dim: 2, action_dim: 2,
-            hidden_layers: vec![LayerDef { size: 12, activation: Activation::Tanh }], lr: 0.0 };
+        let cfg = QCriticConfig {
+            state_dim: 2,
+            action_dim: 2,
+            hidden_layers: vec![LayerDef {
+                size: 12,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.0,
+        };
         let q: QCritic = QCritic::new(CpuLinAlg::new(), cfg, &mut rng).unwrap();
-        let s = [0.3, -0.4]; let a = [0.2, -0.1];
+        let s = [0.3, -0.4];
+        let a = [0.2, -0.1];
         let grad = q.action_gradient(&s, &a);
         assert_eq!(grad.len(), 2);
         let h = 1e-6;
         for j in 0..2 {
-            let mut ap = a; let mut am = a;
-            ap[j] += h; am[j] -= h;
+            let mut ap = a;
+            let mut am = a;
+            ap[j] += h;
+            am[j] -= h;
             let num = (q.forward(&s, &ap) - q.forward(&s, &am)) / (2.0 * h);
-            assert!((grad[j] - num).abs() < 1e-4,
-                "∇_a Q[{j}] = {} vs finite-diff {num}", grad[j]);
+            assert!(
+                (grad[j] - num).abs() < 1e-4,
+                "∇_a Q[{j}] = {} vs finite-diff {num}",
+                grad[j]
+            );
         }
     }
 
