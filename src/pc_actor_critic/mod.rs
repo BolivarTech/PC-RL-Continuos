@@ -14672,6 +14672,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_continuous_nonfinite_entropy_coeff_does_not_corrupt_weights() {
+        let mut agent = PcActorCritic::new(CpuLinAlg::new(), continuous_base_config(), 5).unwrap();
+        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 0.0, false).unwrap();
+        agent.config.policy_entropy_coeff = f64::NAN; // illegal post-construction mutation
+        // must not panic / NaN-corrupt
+        let _ = agent.step_continuous(&[0.1, 0.2, 0.3], 1.0, false);
+        let w = &agent.actor.layers[0].weights.data;
+        assert!(
+            w.iter().all(|x| x.is_finite()),
+            "weights must stay finite under non-finite policy_entropy_coeff"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Task 4 (v4.2.0): continuous entropy gradient wiring tests
     // -----------------------------------------------------------------------
