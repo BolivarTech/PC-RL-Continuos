@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::activation::Activation;
 use crate::error::PcError;
-use crate::layer::{Layer, LayerDef};
+use crate::layer::{layer_from_cpu, layer_to_cpu, Layer, LayerDef};
 use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
 
@@ -463,37 +463,15 @@ impl<L: LinAlg> MlpCritic<L> {
 
     /// Extracts a serializable snapshot of current weights.
     ///
-    /// Converts generic layers to CPU layers element-by-element for
+    /// Converts generic layers to CPU layers via [`layer_to_cpu`] for
     /// backend-agnostic serialization.
     pub fn to_weights(&self) -> MlpCriticWeights {
-        let cpu_layers: Vec<Layer> = self
+        let layers = self
             .layers
             .iter()
-            .map(|layer| {
-                let rows = self.backend.mat_rows(&layer.weights);
-                let cols = self.backend.mat_cols(&layer.weights);
-                let cpu = CpuLinAlg::new();
-                let mut cpu_weights = cpu.zeros_mat(rows, cols);
-                for r in 0..rows {
-                    for c in 0..cols {
-                        cpu.mat_set(
-                            &mut cpu_weights,
-                            r,
-                            c,
-                            self.backend.mat_get(&layer.weights, r, c),
-                        );
-                    }
-                }
-                let cpu_bias = self.backend.vec_to_vec(&layer.bias);
-                Layer {
-                    weights: cpu_weights,
-                    bias: cpu_bias,
-                    activation: layer.activation,
-                    backend: CpuLinAlg::new(),
-                }
-            })
+            .map(|l| layer_to_cpu(l, &self.backend))
             .collect();
-        MlpCriticWeights { layers: cpu_layers }
+        MlpCriticWeights { layers }
     }
 
     /// Restores a critic from saved weights without requiring an RNG.
@@ -562,35 +540,13 @@ impl<L: LinAlg> MlpCritic<L> {
             }
         }
 
-        let generic_layers: Vec<Layer<L>> = weights
+        let layers = weights
             .layers
-            .into_iter()
-            .map(|cpu_layer| {
-                let cpu = CpuLinAlg::new();
-                let rows = cpu.mat_rows(&cpu_layer.weights);
-                let cols = cpu.mat_cols(&cpu_layer.weights);
-                let mut generic_weights = backend.zeros_mat(rows, cols);
-                for r in 0..rows {
-                    for c in 0..cols {
-                        backend.mat_set(
-                            &mut generic_weights,
-                            r,
-                            c,
-                            cpu.mat_get(&cpu_layer.weights, r, c),
-                        );
-                    }
-                }
-                let generic_bias = backend.vec_from_slice(&cpu_layer.bias);
-                Layer {
-                    weights: generic_weights,
-                    bias: generic_bias,
-                    activation: cpu_layer.activation,
-                    backend: backend.clone(),
-                }
-            })
+            .iter()
+            .map(|cpu_layer| layer_from_cpu(cpu_layer, &backend))
             .collect();
         Ok(Self {
-            layers: generic_layers,
+            layers,
             config,
             backend,
         })

@@ -16,6 +16,69 @@ use crate::linalg::cpu::CpuLinAlg;
 use crate::linalg::LinAlg;
 use crate::matrix::{GRAD_CLIP, WEIGHT_CLIP};
 
+/// Converts a generic `Layer<L>` to a CPU-backed `Layer` snapshot for serialization.
+///
+/// Copies weights element-by-element from the generic backend into a freshly allocated
+/// CPU matrix. The bias is converted via `backend.vec_to_vec`. This is the canonical
+/// serialization helper; [`layer_from_cpu`] is its inverse.
+///
+/// # Arguments
+///
+/// * `layer` - Generic layer to snapshot.
+/// * `backend` - Backend used by `layer`; used to read weights and the bias vector.
+pub(crate) fn layer_to_cpu<L: LinAlg>(layer: &Layer<L>, backend: &L) -> Layer {
+    let rows = backend.mat_rows(&layer.weights);
+    let cols = backend.mat_cols(&layer.weights);
+    let cpu = CpuLinAlg::new();
+    let mut cpu_weights = cpu.zeros_mat(rows, cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            cpu.mat_set(&mut cpu_weights, r, c, backend.mat_get(&layer.weights, r, c));
+        }
+    }
+    let cpu_bias = backend.vec_to_vec(&layer.bias);
+    Layer {
+        weights: cpu_weights,
+        bias: cpu_bias,
+        activation: layer.activation,
+        backend: CpuLinAlg::new(),
+    }
+}
+
+/// Restores a generic `Layer<L>` from a CPU-backed snapshot.
+///
+/// Copies weights element-by-element from the CPU matrix into a backend-allocated
+/// generic matrix. The bias is copied via `backend.vec_from_slice`. This is the
+/// canonical deserialization helper; [`layer_to_cpu`] is its inverse.
+///
+/// # Arguments
+///
+/// * `cpu` - CPU-backed layer snapshot (source of weights/bias/activation).
+/// * `backend` - Backend to allocate the returned generic layer on.
+pub(crate) fn layer_from_cpu<L: LinAlg>(cpu: &Layer, backend: &L) -> Layer<L> {
+    let cpu_be = CpuLinAlg::new();
+    let rows = cpu_be.mat_rows(&cpu.weights);
+    let cols = cpu_be.mat_cols(&cpu.weights);
+    let mut generic_weights = backend.zeros_mat(rows, cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            backend.mat_set(
+                &mut generic_weights,
+                r,
+                c,
+                cpu_be.mat_get(&cpu.weights, r, c),
+            );
+        }
+    }
+    let generic_bias = backend.vec_from_slice(&cpu.bias);
+    Layer {
+        weights: generic_weights,
+        bias: generic_bias,
+        activation: cpu.activation,
+        backend: backend.clone(),
+    }
+}
+
 /// Definition of a layer's shape and activation, used for topology configuration.
 ///
 /// # Examples
