@@ -444,6 +444,42 @@ mod tests {
         }
     }
 
+    // ── input_gradient tests ───────────────────────────────────────
+
+    #[test]
+    fn test_input_gradient_linear_single_neuron_equals_weight_row() {
+        // For a 1-neuron Linear layer, ∂out/∂input_j = W[0,j]; with Linear deriv=1
+        // and delta=[1.0], input_gradient returns Wᵀ·(delta⊙deriv) = row 0 of W.
+        let mut rng = make_rng();
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(3, 1, Activation::Linear, &backend, &mut rng);
+        layer.weights.set(0, 0, 2.0);
+        layer.weights.set(0, 1, -1.5);
+        layer.weights.set(0, 2, 0.5);
+        let output = layer.forward(&vec![0.1, 0.2, 0.3]);
+        let g = layer.input_gradient(&output, &vec![1.0]);
+        assert_eq!(g.len(), 3);
+        assert!((g[0] - 2.0).abs() < 1e-12);
+        assert!((g[1] - (-1.5)).abs() < 1e-12);
+        assert!((g[2] - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_input_gradient_does_not_mutate_weights() {
+        let mut rng = make_rng();
+        let backend = make_backend();
+        let mut layer: Layer = Layer::new(4, 3, Activation::Tanh, &backend, &mut rng);
+        let before = layer.weights.clone();
+        let output = layer.forward(&vec![0.5, -0.5, 0.1, 0.0]);
+        let _ = layer.input_gradient(&output, &vec![0.1, -0.2, 0.3]);
+        for r in 0..3 {
+            for c in 0..4 {
+                assert!((layer.weights.get(r, c) - before.get(r, c)).abs() < 1e-15,
+                    "input_gradient must not mutate weights");
+            }
+        }
+    }
+
     // ── serde test ─────────────────────────────────────────────────
 
     #[test]
