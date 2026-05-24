@@ -378,37 +378,6 @@ fn compute_n_step_reward(gamma: f64, rewards: &[f64]) -> f64 {
     g
 }
 
-/// v5.0.0 — per-component DESCENT-delta contribution of the entropy regularizer
-/// for the tanh-squashed Gaussian policy.
-///
-/// The squashed-Gaussian differential entropy carries the Jacobian term
-/// `−Σ log(1 − tanh²(a_raw))`, whose `μ`-gradient is `E_ε[−2 tanh(a_raw)]`
-/// (single-sample estimate `−2 tanh(a_raw)`). Maximizing `+α·H` by gradient
-/// ascent corresponds, under the descent rule `θ ← θ − lr·delta`, to a delta
-/// contribution `+2α·tanh(a_raw_j)` per output component. This is a restoring
-/// force toward `μ_raw = 0` that does NOT vanish at the squash boundary, so it
-/// bounds the `μ_raw` runaway (H-A). `α = 0` ⇒ all-zero (v4.1.0 no-op).
-///
-/// Applied LOCAL per-step (not accumulated in the GAE trace; see B12). The
-/// per-step Vec alloc is `output_size` f64s — negligible and consistent with
-/// the existing per-step `grad_direction` alloc in the continuous arm.
-///
-/// # Arguments
-///
-/// * `alpha` — entropy regularization coefficient. `0.0` is a true no-op.
-/// * `a_raw` — pre-squash action sample `μ_raw + σ·ε` for each output component.
-///
-/// # Returns
-///
-/// A `Vec<f64>` of the same length as `a_raw` where each element is
-/// `2 * alpha * tanh(a_raw[j])`.
-fn squashed_entropy_delta(alpha: f64, a_raw: &[f64]) -> Vec<f64> {
-    if alpha == 0.0 {
-        return vec![0.0; a_raw.len()];
-    }
-    a_raw.iter().map(|&ar| 2.0 * alpha * ar.tanh()).collect()
-}
-
 /// Numerical-stability epsilon for the tanh-Jacobian log term near the squash boundary.
 ///
 /// Added to `(1 − tanh²(a_raw))` before taking the logarithm so the Jacobian
@@ -2539,159 +2508,16 @@ impl<L: LinAlg> PcActorCritic<L> {
                     step.mode,
                 ))
             }
-            StepAction::Continuous { action: a_taken } => {
-                // Gaussian-policy gradient (brainstorm Q3 / spec §5.3).
-                //
-                //   π(a|s) = N(μ(s), σ² I)             — isotropic Gaussian
-                //   log π(a|s) = −‖a − μ‖² / (2σ²) + const
-                //   ∇_θ log π = ((a − μ) / σ²) · ∇_θ μ
-                //
-                // The output-level DESCENT delta (post-activation), applied via the
-                // `θ ← θ − lr·delta` update rule, is therefore
-                //   delta_j = (μ_j − a_taken_j) / σ²
-                // multiplied by td_error (advantage). The existing
-                // `update_with_decay` machinery in `apply_actor_update_and_
-                // bookkeeping` propagates this through the network using the
-                // standard activation derivatives; the Gaussian-vs-softmax
-                // distinction is fully captured by the delta vector built
-                // here.
-                //
-                // GAE eligibility traces mirror the discrete arm (v4.1.0):
-                // `actor_trace` is sized `output_size` (= continuous action
-                // dims) when `gae_lambda.is_some()`, so it indexes safely
-                // for the Gaussian gradient direction below.
-                let mu = &y_conv_vec; // y_conv is the post-activation μ(s).
-                let sigma = self.config.policy_sigma;
-                let sigma_sq = sigma * sigma;
-
-                // Defense-in-depth: if policy_sigma was mutated to a non-finite
-                // or non-positive value after construction, division by σ² would
-                // produce NaN/Inf that bypasses GRAD_CLIP and corrupts weights.
-                // Skip the actor gradient update for this step only; critic and
-                // bookkeeping proceed normally so loss/td_error remain valid.
-                if !sigma_sq.is_finite() || sigma_sq <= 0.0 {
-                    return Ok(self.apply_actor_update_and_bookkeeping(
-                        &vec![0.0; mu.len()],
-                        step.infer,
-                        step.state,
-                        &y_conv_vec,
-                        &[],
-                        0,
-                        td_error,
-                        loss,
-                        step.mode,
-                    ));
-                }
-
-                debug_assert!(
-                    sigma_sq.is_finite() && sigma_sq > 0.0,
-                    "policy_sigma must produce finite positive sigma_sq, got {sigma_sq} \
-                     (sigma = {sigma})"
-                );
-                debug_assert_eq!(
-                    a_taken.len(),
-                    mu.len(),
-                    "continuous action length {} must match μ length {}",
-                    a_taken.len(),
-                    mu.len()
-                );
-
-                // Per-dim descent gradient direction WITHOUT td_error scaling:
-                //   grad_direction_j = (μ_j − a_taken_j) / σ²
-                //
-                // Sanity: with td_error > 0 and a_taken > μ, delta < 0,
-                // so the bias update b_j ← b_j − lr·δ pushes μ_j UP —
-                // pulling the mean toward the rewarded action, which
-                // matches the Phase 4.1 gradient-direction test contract
-                // ("if a > μ and advantage > 0, μ moves up").
-                let mut grad_direction = vec![0.0; mu.len()];
-                for j in 0..mu.len() {
-                    grad_direction[j] = (mu[j] - a_taken[j]) / sigma_sq;
-                }
-
-                // Effective delta. Mirrors the discrete GAE arm:
-                //   - GAE + Online: online-only decay the trace by γλ, add
-                //     the gradient direction, clamp to ±GRAD_CLIP, then scale
-                //     by td_error (standard GAE eligibility update).
-                //   - GAE + Replay: fall back to plain TD(0) so off-policy
-                //     updates do not pollute the on-policy trace.
-                //   - No GAE: plain TD(0).
-                let mut delta: Vec<f64> = if let Some(lambda) = self.config.gae_lambda {
-                    if is_online {
-                        let gamma_lambda = self.config.gamma * lambda;
-                        for v in &mut self.actor_trace {
-                            *v *= gamma_lambda;
-                        }
-                        for (j, &g) in grad_direction.iter().enumerate() {
-                            self.actor_trace[j] += g;
-                        }
-                        for v in &mut self.actor_trace {
-                            *v = v.clamp(-crate::matrix::GRAD_CLIP, crate::matrix::GRAD_CLIP);
-                        }
-                        self.actor_trace.iter().map(|&t| td_error * t).collect()
-                    } else {
-                        // Unreachable in continuous mode: replay is rejected at
-                        // construction, so this off-policy fallback never runs.
-                        // Kept to mirror the discrete GAE arm's structure.
-                        grad_direction.iter().map(|&g| td_error * g).collect()
-                    }
-                } else {
-                    // No GAE → plain TD(0) advantage-scaled gradient.
-                    grad_direction.iter().map(|&g| td_error * g).collect()
-                };
-
-                // Entropy regularization (v5.0.0): the tanh-squashed Gaussian
-                // entropy's μ-gradient is a restoring force that bounds μ_raw at
-                // the squash boundary (closes H-A). Added AFTER the GAE trace
-                // decay/accumulate/clamp (excluded from the trace, B12).
-                //
-                // GRAD_CLIP-survival (C4): the score-function advantage routinely
-                // exceeds ±GRAD_CLIP, and layer.backward clips grad=delta·deriv to
-                // ±GRAD_CLIP — which would erase the small entropy term. Reserve
-                // headroom: clip the advantage to ±(GRAD_CLIP − 2α) FIRST, then add
-                // the entropy (|entropy_j| ≤ 2α). For the operational α range
-                // (0.05–0.5, i.e. α ≤ GRAD_CLIP·0.45 ≈ 2.25), GRAD_CLIP − 2α > 0
-                // and |delta_j| ≤ GRAD_CLIP. For α > 2.25 (outside documented range)
-                // the .max(GRAD_CLIP·0.1) floor keeps the headroom non-zero but the
-                // combined delta may exceed GRAD_CLIP — an unrealistic regime.
-                // α = 0 ⇒ headroom = GRAD_CLIP, entropy = 0 → identical to v4.1.0.
-                // Defense-in-depth (mirrors the policy_sigma runtime guard): the
-                // field is runtime-mutable for caller-side annealing, so a
-                // non-finite or negative α mutated in mid-training would make the
-                // entropy term NaN / anti-restoring and corrupt weights. Treat
-                // such values as 0.0 (no entropy) — construction already rejects
-                // them; this guards the runtime-mutation path.
-                let alpha = self.config.policy_entropy_coeff;
-                let alpha = if alpha.is_finite() && alpha >= 0.0 {
-                    alpha
-                } else {
-                    0.0
-                };
-                let entropy = squashed_entropy_delta(alpha, a_taken);
-                let headroom =
-                    (crate::matrix::GRAD_CLIP - 2.0 * alpha).max(crate::matrix::GRAD_CLIP * 0.1);
-                for (d, e) in delta.iter_mut().zip(entropy.iter()) {
-                    *d = d.clamp(-headroom, headroom) + *e;
-                }
-
-                // Use shared bookkeeping. Pass an empty mask and action=0
-                // so KL distillation (gated on `valid_actions.len() > 1`)
-                // and EWC logits-reversal (gated on `!valid_actions.
-                // is_empty()`) are skipped. These regularizers are
-                // discrete-specific and conceptually undefined for
-                // Gaussian policies; the continuous path keeps the
-                // canonical scale/decay/Fisher-on-delta machinery only.
-                Ok(self.apply_actor_update_and_bookkeeping(
-                    &delta,
-                    step.infer,
-                    step.state,
-                    &y_conv_vec,
-                    &[],
-                    0,
-                    td_error,
-                    loss,
-                    step.mode,
-                ))
+            StepAction::Continuous { .. } => {
+                // The on-policy score-function continuous path (v5.0.0) has been
+                // removed in v6.0.0. Continuous mode now uses SAC (off-policy twin
+                // Q-critics via sac_learn_step), which bypasses learn_continuous_inner
+                // entirely. Reaching this arm indicates a logic error in the caller.
+                unreachable!(
+                    "learn_continuous_inner must not be called with StepAction::Continuous \
+                     in v6.0.0 SAC mode; the continuous learning path runs through \
+                     sac_learn_step in step_continuous instead."
+                )
             }
         }
     }
@@ -3066,82 +2892,60 @@ impl<L: LinAlg> PcActorCritic<L> {
             )));
         }
 
-        // 1. Actor inference at current state.
+        // 1. Actor inference at current state. Snapshot y_conv as a host Vec
+        //    so the borrow on `self.actor` ends before we need `&mut self.rng`.
         let current_infer = self.actor.infer(state);
 
-        // 2. Learn from the previous transition if buffered. Continuous
-        //    step_continuous uses TD(0), or GAE(λ) when `gae_lambda = Some`.
-        if let (Some(prev_state), Some(prev_action), Some(prev_infer)) = (
-            self.state_prev.take(),
-            self.action_prev_continuous.take(),
-            self.infer_prev.take(),
-        ) {
+        // 2. SAC off-policy update: push previous transition into the replay
+        //    buffer, then trigger sac_learn_step (no-op until warmup reached).
+        //    The on-policy V-critic (learn_continuous_inner) is NOT called here;
+        //    SAC uses the twin Q-critics exclusively for value estimation.
+        if let (Some(prev_state), Some(prev_action)) =
+            (self.state_prev.take(), self.action_prev_continuous.take())
+        {
+            // Drop prev_infer — SAC doesn't use it for on-policy updates.
+            let _ = self.infer_prev.take();
+
             let prev_state_vec = self.backend.vec_to_vec(&prev_state);
-            let surprise_score = prev_infer.surprise_score;
 
-            let step = LearnStep::online(
-                &prev_state_vec,
-                &prev_infer,
-                StepAction::Continuous {
-                    action: &prev_action,
-                },
+            // Push transition to replay buffer: action stored as pre-squash a_raw.
+            let transition = crate::pc_actor_critic::replay::ReplayTransition {
+                state: prev_state_vec,
+                action: crate::pc_actor_critic::replay::Action::Continuous(prev_action),
                 reward,
-                state,
-                &current_infer,
+                next_state: state.to_vec(),
                 done,
-                self.config.gamma,
-            );
-            // Propagate any error from learn_continuous_inner. The loss value
-            // is not returned by step_continuous (caller gets the action),
-            // but errors must not be silently swallowed.
-            let _ = self.learn_continuous_inner(&step)?;
-
-            if self.actor_hysteresis.is_some() || self.critic_hysteresis.is_some() {
-                self.process_hysteresis(surprise_score, self.last_td_error.abs());
-            }
-
-            // Auto-record into replay buffer when configured.
+                valid_actions: None,
+            };
             if let Some(ref mut buffer) = self.replay_buffer {
-                let transition = crate::pc_actor_critic::replay::ReplayTransition {
-                    state: prev_state_vec,
-                    action: crate::pc_actor_critic::replay::Action::Continuous(prev_action.clone()),
-                    reward,
-                    next_state: state.to_vec(),
-                    done,
-                    valid_actions: None,
-                };
                 let _ = buffer.push(transition);
             }
+
+            // Off-policy SAC update (no-op until buffer >= batch_size).
+            self.sac_learn_step();
         }
 
-        // 3. Sample action from N(μ, σ² I) via Box-Muller. Two uniform
-        //    draws per Gaussian sample. Going through `self.rng` keeps
-        //    the action sequence deterministic under a fixed seed.
-        use rand::Rng;
-        let mu = self.backend.vec_to_vec(&current_infer.y_conv);
-        let sigma = self.config.policy_sigma;
-        let two_pi = 2.0 * std::f64::consts::PI;
-        let mut action: Vec<f64> = Vec::with_capacity(mu.len());
-        for &m in &mu {
-            // u1 ∈ (0, 1] avoids ln(0); u2 ∈ [0, 1).
-            let u1: f64 = self.rng.gen_range(f64::EPSILON..=1.0);
-            let u2: f64 = self.rng.gen_range(0.0..1.0);
-            let eps = (-2.0 * u1.ln()).sqrt() * (two_pi * u2).cos();
-            action.push(m + sigma * eps);
-        }
+        // 3. Sample action using the SAC reparameterized dual-head.
+        //    Actor output = [μ_raw | log_σ_raw] (length 2 * action_dim).
+        //    a_raw = μ_raw + σ·ε  (pre-squash, stored for next-step replay).
+        //    returned action = tanh(a_raw) ∈ (−1, 1).
+        let y_conv = self.backend.vec_to_vec(&current_infer.y_conv);
+        let action_dim = self
+            .config
+            .q_critic
+            .as_ref()
+            .map(|q| q.action_dim)
+            .unwrap_or(y_conv.len());
+        let (mu, log_sigma) = split_mu_log_sigma(&y_conv, action_dim);
+        let (a_raw, squashed) = sample_squashed_action(&mu, &log_sigma, &mut self.rng);
 
-        // 4. Stash (state, action, infer) for the next call's bootstrap.
-        //    `action` is a_raw = μ_raw + σ·ε (Linear output, unbounded).
-        //    Store a_raw for the next-step gradient; return the tanh-squashed
-        //    action for execution so the environment sees values in (−1, 1).
-        let squashed: Vec<f64> = action.iter().map(|&ar| ar.tanh()).collect();
-
+        // 4. Stash (state, a_raw) for the next call's replay push.
+        //    `action` is a_raw = μ_raw + σ·ε (pre-squash); the squashed
+        //    version is returned to the caller / environment.
         self.state_prev = Some(self.backend.vec_from_slice(state));
-        self.action_prev_continuous = Some(action); // a_raw (pre-squash) — gradient uses this
+        self.action_prev_continuous = Some(a_raw);
         self.infer_prev = Some(current_infer);
-        // `valid_actions_prev` is discrete-only; clear so a future
-        // accidental `step_masked` call after a config swap does not
-        // pick up a stale mask.
+        // `valid_actions_prev` is discrete-only; clear to avoid stale state.
         self.valid_actions_prev = None;
         self.action_prev = None;
 
@@ -14874,8 +14678,7 @@ mod tests {
     fn test_continuous_transition_roundtrips_through_replay() {
         use crate::pc_actor_critic::replay::{Action, ReplayTransition};
         let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
 
         let a_raw = vec![0.4_f64];
         let transition = ReplayTransition {
@@ -14896,11 +14699,7 @@ mod tests {
 
         // Sample one transition back and verify a_raw is preserved.
         let mut rng = rand::SeedableRng::seed_from_u64(1);
-        let batch = agent
-            .replay_buffer
-            .as_ref()
-            .unwrap()
-            .sample(1, &mut rng);
+        let batch = agent.replay_buffer.as_ref().unwrap().sample(1, &mut rng);
         assert_eq!(batch.len(), 1, "batch should contain one transition");
         match &batch[0].action {
             Action::Continuous(stored) => {
@@ -14918,8 +14717,7 @@ mod tests {
     #[test]
     fn test_one_sac_step_mutates_actor_and_critics() {
         let mut agent =
-            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42)
-                .unwrap();
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
 
         let s = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
         let probe_action = vec![0.5_f64];

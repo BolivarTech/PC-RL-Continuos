@@ -508,4 +508,55 @@ impl<L: LinAlg> PcActorCritic<L> {
             backend.vec_set(&mut target.bias, i, one_minus_tau * t + tau * l);
         }
     }
+
+    /// One off-policy SAC learning step: sample a batch and run the
+    /// critic → actor → temperature → Polyak pipeline.
+    ///
+    /// No-op (early return) until the replay buffer holds at least
+    /// `replay_batch_size` transitions (warmup = batch-size floor).
+    ///
+    /// # Call order
+    ///
+    /// 1. Check warmup: return if `total_len < replay_batch_size`.
+    /// 2. Sample `replay_batch_size` transitions from the replay buffer.
+    /// 3. [`sac_critic_update`](Self::sac_critic_update) — soft-Bellman TD
+    ///    update of the twin Q-critics.
+    /// 4. [`sac_actor_update`](Self::sac_actor_update) — reparameterised
+    ///    actor update; returns `(mean |delta|, mean logπ)`.
+    /// 5. [`sac_temperature_update`](Self::sac_temperature_update) — dual
+    ///    temperature gradient step toward target entropy.
+    /// 6. [`polyak_update_targets`](Self::polyak_update_targets) — soft
+    ///    Polyak averaging of both target Q-critics.
+    pub(crate) fn sac_learn_step(&mut self) {
+        let batch_size = self.config.replay_batch_size;
+
+        // Warmup: do nothing until the buffer holds at least `batch_size`
+        // transitions.
+        let buf_len = self
+            .replay_buffer
+            .as_ref()
+            .map(|b| b.total_len())
+            .unwrap_or(0);
+        if buf_len < batch_size {
+            return;
+        }
+
+        // Sample a batch from the replay buffer.
+        // We need a mutable borrow of `self.rng` to sample.  Temporarily
+        // clone the batch (cheap for the small SAC batch sizes typical in
+        // tests; matches the two-pass pattern used in sac_critic_update).
+        let batch = match self.replay_buffer.as_ref() {
+            Some(buf) => buf.sample(batch_size, &mut self.rng),
+            None => return,
+        };
+
+        if batch.is_empty() {
+            return;
+        }
+
+        let _loss = self.sac_critic_update(&batch);
+        let (_mean_delta, logp_mean) = self.sac_actor_update(&batch);
+        self.sac_temperature_update(logp_mean);
+        self.polyak_update_targets();
+    }
 }
