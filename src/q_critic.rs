@@ -239,13 +239,44 @@ impl<L: LinAlg> QCritic<L> {
     /// * `action` - Action vector.
     /// * `target` - Target Q-value (e.g., soft Bellman target).
     pub fn update(&mut self, state: &[f64], action: &[f64], target: f64) -> f64 {
+        self.update_scaled(state, action, target, 1.0)
+    }
+
+    /// Like [`update`](Self::update) but scales the effective learning rate by
+    /// `lr_scale` before backprop.
+    ///
+    /// Used by SAC batch training to apply mean-gradient semantics: calling
+    /// `update_scaled(…, 1.0 / batch_len)` for each transition in a batch
+    /// makes the aggregate weight change equal the **mean** gradient over the
+    /// batch (effective lr = `config.lr / batch_len` per transition), rather
+    /// than the **sum** (effective lr = `config.lr * batch_len`).
+    ///
+    /// [`Layer::backward`] accepts a `surprise_scale` multiplier on `lr`;
+    /// `lr_scale` is passed as that argument so no additional allocation is
+    /// needed — the per-layer clipping contract is fully preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `state`    - State observation vector.
+    /// * `action`   - Action vector.
+    /// * `target`   - Target Q-value (e.g., soft Bellman target).
+    /// * `lr_scale` - Multiplier applied to `config.lr` during this update
+    ///   (`1.0` is identical to [`update`](Self::update)).
+    pub fn update_scaled(
+        &mut self,
+        state: &[f64],
+        action: &[f64],
+        target: f64,
+        lr_scale: f64,
+    ) -> f64 {
         let (predicted, inputs, outputs) = self.forward_with_io(state, action);
         let error = target - predicted;
         let loss = error * error;
 
         let mut delta = self.backend.vec_from_slice(&[-2.0 * error]);
         for i in (0..self.layers.len()).rev() {
-            delta = self.layers[i].backward(&inputs[i], &outputs[i], &delta, self.config.lr, 1.0);
+            delta =
+                self.layers[i].backward(&inputs[i], &outputs[i], &delta, self.config.lr, lr_scale);
         }
         loss
     }
