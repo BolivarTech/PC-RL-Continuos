@@ -4469,6 +4469,40 @@ mod tests {
         agent
     }
 
+    /// Build a minimal valid SAC continuous config (v6.0.0).
+    ///
+    /// SAC requires: `q_critic = Some(..)`, `actor.output_size == 2 * action_dim`
+    /// (actor emits μ AND log_σ), `output_activation == Linear`, and
+    /// `replay_training_capacity > 0`.
+    ///
+    /// Uses `actor.input_size = 9` (matches `default_config`) and
+    /// `action_dim = 1` → `actor.output_size = 2`.
+    fn continuous_sac_config() -> PcActorCriticConfig {
+        let mut cfg = default_config();
+        cfg.action_space = ActionSpace::Continuous;
+        cfg.actor.output_size = 2; // 2 * action_dim(=1)
+        cfg.actor.output_activation = crate::activation::Activation::Linear;
+        cfg.policy_sigma = 0.3; // ignored by SAC but must be finite
+        cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+            state_dim: cfg.actor.input_size, // 9
+            action_dim: 1,
+            hidden_layers: vec![LayerDef {
+                size: 16,
+                activation: Activation::Tanh,
+            }],
+            lr: 0.001,
+        });
+        cfg.replay_training_capacity = 1000;
+        cfg.replay_batch_size = 8;
+        cfg.polyak_tau = 0.005;
+        cfg.gae_lambda = None;
+        cfg.td_steps = 0;
+        // Distillation unsupported in continuous mode — keep at 0.
+        cfg.distillation_lambda_polyak = 0.0;
+        cfg.distillation_lambda_frozen = 0.0;
+        cfg
+    }
+
     /// Build an agent configured for cross-wake regression tests.
     ///
     /// Both hysteresis state machines are enabled. The four coupling flags
@@ -13231,6 +13265,64 @@ mod tests {
         let state = vec![0.0; 9];
         let result = agent.act_continuous(&state, crate::pc_actor::SelectionMode::Play);
         assert!(result.is_err(), "act_continuous on Discrete must reject");
+    }
+
+    // ── v6.0.0 SAC continuous-mode validation rules ───────────────────
+    // T5 RED: validate SAC requires q_critic, 2×action_dim output_size, replay.
+
+    #[test]
+    fn test_sac_requires_output_size_twice_action_dim() {
+        let mut cfg = continuous_sac_config();
+        cfg.actor.output_size = 1; // wrong: must be 2 * action_dim = 2
+        let r = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(r, Err(PcError::ConfigValidation(ref m)) if m.contains("output_size")),
+            "output_size=1 (not 2×action_dim) must be rejected with message containing \
+             'output_size', got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_sac_requires_q_critic() {
+        let mut cfg = continuous_sac_config();
+        cfg.q_critic = None;
+        let r = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(r, Err(PcError::ConfigValidation(ref m)) if m.contains("q_critic")),
+            "q_critic=None must be rejected with message containing 'q_critic', got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_sac_requires_replay() {
+        let mut cfg = continuous_sac_config();
+        cfg.replay_training_capacity = 0;
+        let r = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(r, Err(PcError::ConfigValidation(ref m)) if m.contains("replay")),
+            "replay_training_capacity=0 must be rejected with message containing 'replay', \
+             got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_sac_rejects_non_finite_target_entropy() {
+        let mut cfg = continuous_sac_config();
+        cfg.target_entropy = Some(f64::NAN);
+        let r = PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42);
+        assert!(
+            matches!(r, Err(PcError::ConfigValidation(ref m)) if m.contains("target_entropy")),
+            "target_entropy=NaN must be rejected with message containing 'target_entropy', \
+             got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_sac_valid_config_constructs() {
+        assert!(
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).is_ok(),
+            "a fully-valid SAC continuous config must construct without error"
+        );
     }
 
     // ── Test 4 ──────────────────────────────────────────────────────────
