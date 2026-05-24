@@ -1,5 +1,34 @@
 # Changelog
 
+## [4.2.0] - 2026-05-23
+
+### Added (continuous action mode)
+- Entropy regularization of the tanh-squashed Gaussian policy
+  (`policy_entropy_coeff`, the temperature `α`). The squashed-Gaussian entropy's
+  `μ`-gradient is a restoring force (`+2α·tanh(a_raw)` per component) that bounds the
+  pre-squash mean `μ_raw` at the squash boundary, giving the DETERMINISTIC continuous
+  policy a real optimum + commitment (closes the H-A raw-`μ` degeneracy where `μ_raw`
+  random-walked / ran away in saturation).
+- The entropy term is added AFTER the GAE eligibility trace (excluded from the trace) and
+  reserves `GRAD_CLIP` headroom (the advantage is clipped to `±(GRAD_CLIP − 2α)` before the
+  entropy is added) so the restoring force survives `layer.backward`'s gradient clip in the
+  saturated regime — where it matters most.
+
+### Changed (continuous mode only; discrete unchanged)
+- **BEHAVIOR CHANGE:** continuous learning is entropy-regularized BY DEFAULT
+  (`policy_entropy_coeff` serde-default `0.1`). Set `policy_entropy_coeff = 0.0` to reproduce
+  v4.1.0 continuous behavior exactly (the entropy term is then a true no-op). Discrete mode
+  is unaffected — it uses the separate `entropy_coeff` (different, softmax-based estimator).
+  Configs deserialized without the field get the fix via the serde default.
+
+### Notes
+- `policy_entropy_coeff` is read on every learning step and is runtime-mutable like
+  `policy_sigma`; temperature annealing is a caller-side pattern (no library schedule).
+- This is NOT a pathwise/reparameterization gradient (no Q(s,a) critic); it is
+  entropy-regularized REINFORCE on the latent Gaussian, on-policy with the V-critic + GAE.
+- Deterministic-policy convergence on Pendulum-v1 is validated by the downstream PC-Pendulum
+  harness (B10, authoritative); the in-library guard asserts the mechanism (`μ_raw` bounded).
+
 ## [4.1.0] - 2026-05-23
 
 ### Added / Changed (continuous action mode)

@@ -220,6 +220,10 @@ hidden_layers = [{ size = 64, activation = "tanh" }]
 action_space = "Continuous"
 policy_sigma = 0.3
 gae_lambda = 0.95          # GAE eligibility trace for multi-step credit assignment
+policy_entropy_coeff = 0.1 # v4.2.0 entropy temperature α (default-on); bounds μ_raw at the
+                           # squash boundary so the DETERMINISTIC policy converges. 0.0 = v4.1.0
+                           # behavior. Read per-step + runtime-mutable like policy_sigma — anneal
+                           # it caller-side over training (lower α as the policy commits).
 
 # --- override any other default as needed ---
 gamma = 0.99
@@ -261,13 +265,14 @@ When `action_space == ActionSpace::Continuous`, `new()` returns
 | Field | Rule in continuous mode | Reason |
 |---|---|---|
 | `policy_sigma` | **must be `> 0.0` and finite** | it's the Gaussian σ; `/σ²` in the gradient |
+| `policy_entropy_coeff` | **must be `>= 0.0` and finite** | v4.2.0 entropy temperature α; bounds `μ_raw` (default-on `0.1`; `0.0` = v4.1.0). Distinct from discrete `entropy_coeff` |
 | `distillation_lambda_polyak` | **must be `0.0`** | KL distillation undefined for raw continuous output |
 | `distillation_lambda_frozen` | **must be `0.0`** | same reason |
 | `gae_lambda` | `None` (TD(0)) **or** `Some(λ)` where `0 < λ < 1` | GAE eligibility trace supported in v4.1.0; `Some(0.95)` recommended |
 | `td_steps` | **must be `0`** | continuous TD(n) not implemented |
 | `replay_training_capacity` | **must be `0`** | `replay_learn` rejects continuous transitions → buffer would be write-only |
 | `replay_recent_capacity` | **must be `0`** | same reason |
-| `entropy_coeff` | any value **allowed but inert** | fixed-σ Gaussian ⇒ entropy gradient is constant; no effect, not rejected |
+| `entropy_coeff` | any value **allowed but inert** | this is the DISCRETE (softmax) entropy coeff — inert in continuous. For continuous entropy use `policy_entropy_coeff` (v4.2.0) |
 
 Continuous mode uses a **constant learning rate** — the surprise→LR modulation
 (M1) is bypassed for continuous policy learning. No replay, no distillation, no
