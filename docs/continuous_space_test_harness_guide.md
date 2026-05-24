@@ -265,7 +265,7 @@ When `action_space == ActionSpace::Continuous`, `new()` returns
 | Field | Rule in continuous mode | Reason |
 |---|---|---|
 | `policy_sigma` | **must be `> 0.0` and finite** | it's the Gaussian σ; `/σ²` in the gradient |
-| `policy_entropy_coeff` | **must be `>= 0.0` and finite** | v4.2.0 entropy temperature α; bounds `μ_raw` (default-on `0.1`; `0.0` = v4.1.0). Distinct from discrete `entropy_coeff` |
+| `policy_entropy_coeff` | **must be `>= 0.0` and finite** | v4.2.0 entropy temperature α; bounds `μ_raw` (default-on `0.1`; `0.0` = v4.1.0). Distinct from discrete `entropy_coeff`. A constant α is an always-on restoring force that continuously biases `μ_raw` toward zero — callers SHOULD anneal α downward over training (start higher, decay toward a small floor as the policy commits) to let the mean escape to its optimal value. The field is read per-step and runtime-mutable like `policy_sigma`, enabling caller-side annealing. |
 | `distillation_lambda_polyak` | **must be `0.0`** | KL distillation undefined for raw continuous output |
 | `distillation_lambda_frozen` | **must be `0.0`** | same reason |
 | `gae_lambda` | `None` (TD(0)) **or** `Some(λ)` where `0 < λ < 1` | GAE eligibility trace supported in v4.1.0; `Some(0.95)` recommended |
