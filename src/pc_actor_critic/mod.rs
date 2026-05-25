@@ -15785,4 +15785,324 @@ mod tests {
             terminal_t.next_state
         );
     }
+
+    // ── Step-0: SAC contextual-bandit learning-dynamics diagnostic ────────────
+    //
+    // White-box measurement only — DO NOT modify production code based on this test.
+    // Probes whether (a) the twin Q-critic learns an accurate Q(s,a) and
+    // (b) the actor's deterministic μ(s) reaches argmax_a Q(s,a) and the
+    // true interior optimum a*(s).
+    //
+    // Run with:
+    //   cargo nextest run --release --run-ignored all diagnose_sac_contextual_bandit --no-capture
+    //   cargo test --release -- --ignored --nocapture diagnose_sac_contextual_bandit
+    #[test]
+    #[ignore = "Step-0 SAC learning-dynamics diagnostic"]
+    #[allow(clippy::type_complexity)]
+    fn diagnose_sac_contextual_bandit() {
+        use rand::SeedableRng;
+        use crate::pc_actor_critic::replay::{Action as ReplayAction, ReplayTransition};
+
+        // ── Task definition ─────────────────────────────────────────────────
+        // K=4 distinct 3-D probe states.  True optimal actions a*_k are INTERIOR
+        // (not at the squash boundary) so both Q-critic and actor have a
+        // well-defined, reachable target.
+        let probe_states: Vec<Vec<f64>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let true_opt: [f64; 4] = [-0.6, -0.2, 0.2, 0.6];
+
+        // Reward function: -(a - a*)^2 for a ∈ (-1, 1), a* ∈ true_opt.
+        let reward_fn = |a: f64, a_star: f64| -> f64 { -(a - a_star).powi(2) };
+
+        // ── Helper: build an SAC agent for a given lr ───────────────────────
+        let build_agent = |actor_lr: f64, q_lr: f64| -> PcActorCritic {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.actor.input_size = 3;
+            cfg.actor.hidden_layers = vec![
+                LayerDef { size: 64, activation: Activation::Tanh },
+                LayerDef { size: 64, activation: Activation::Tanh },
+            ];
+            cfg.actor.output_size = 2; // 2 * action_dim(=1): μ head + log_σ head
+            cfg.actor.output_activation = Activation::Linear;
+            cfg.actor.max_steps = 5;
+            cfg.actor.lr_weights = actor_lr;
+            cfg.critic.input_size = 3 + 64 + 64; // state + latent concat
+            cfg.policy_sigma = 0.3;
+            cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+                state_dim: 3,
+                action_dim: 1,
+                hidden_layers: vec![
+                    LayerDef { size: 64, activation: Activation::Tanh },
+                    LayerDef { size: 64, activation: Activation::Tanh },
+                ],
+                lr: q_lr,
+            });
+            // Training compartment sealed at construction → all pushes go to recent (FIFO).
+            cfg.replay_training_capacity = 256; // ≥ learning_starts, satisfies SAC validation
+            cfg.replay_recent_capacity = 20_000;
+            cfg.replay_batch_size = 128;
+            cfg.learning_starts = 256;
+            cfg.polyak_tau = 0.005;
+            cfg.target_entropy = Some(-1.0); // -action_dim
+            cfg.gae_lambda = None;
+            cfg.td_steps = 0;
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42)
+                .expect("agent construction must succeed")
+        };
+
+        // ── Helper: run one variant and return final per-state metrics ───────
+        // Returns: per-state (mu_det, argmax_q, sigma, q_at_opt, q_at_neg_opt)
+        //   + mean|mu-a*|, mean|argmaxQ-a*|, mean|mu-argmaxQ|, final alpha.
+        let run_variant = |mut agent: PcActorCritic,
+                           n_steps: usize,
+                           probe_interval: usize,
+                           label: &str|
+         -> (Vec<(f64, f64, f64, f64, f64)>, f64, f64, f64, f64) {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            // Buffer holding ReplayTransitions for direct SAC update calls.
+            let mut buf: Vec<ReplayTransition> = Vec::with_capacity(20_000);
+
+            println!(
+                "\n══════════════════════════════════════════════════════════\
+                 \n  Variant: {label}   ({n_steps} steps)\
+                 \n══════════════════════════════════════════════════════════"
+            );
+
+            for step in 0..n_steps {
+                let k = step % 4;
+                let s = probe_states[k].clone();
+                let a_star = true_opt[k];
+
+                // Get μ and log_σ from the actor probe.
+                let mu = agent.actor_mu_raw_for_test(&s);
+                let log_sigma = agent.actor_log_sigma_for_test(&s);
+
+                // Sample a stochastic action.
+                let (a_raw, a_squashed) = sample_squashed_action(&mu, &log_sigma, &mut rng);
+
+                // Compute reward from SQUASHED action.
+                let reward = reward_fn(a_squashed[0], a_star);
+
+                // Build transition (done=true → Bellman target = r, no bootstrap).
+                let t = ReplayTransition {
+                    state: s.clone(),
+                    action: ReplayAction::Continuous(a_raw),
+                    reward,
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                };
+
+                // Push into FIFO buffer (cap to capacity).
+                if buf.len() >= 20_000 {
+                    buf.remove(0);
+                }
+                buf.push(t);
+
+                // Once we have enough samples, run a SAC update.
+                if buf.len() >= 256 {
+                    // Sample a random batch of 128 transitions.
+                    use rand::seq::SliceRandom;
+                    let mut indices: Vec<usize> = (0..buf.len()).collect();
+                    indices.shuffle(&mut rng);
+                    let batch: Vec<ReplayTransition> = indices
+                        .iter()
+                        .take(128)
+                        .map(|&i| buf[i].clone())
+                        .collect();
+
+                    agent.sac_critic_update(&batch);
+                    let (_mean_delta, logp_opt) = agent.sac_actor_update(&batch);
+                    if let Some(logp) = logp_opt {
+                        agent.sac_temperature_update(logp);
+                    }
+                    agent.polyak_update_targets();
+                }
+
+                // Print instrumentation every probe_interval steps and at end.
+                if (step + 1) % probe_interval == 0 || step + 1 == n_steps {
+                    println!(
+                        "\n  --- Step {} ---  alpha={:.4}",
+                        step + 1,
+                        agent.alpha_for_test()
+                    );
+                    let mut mean_mu_err = 0.0_f64;
+                    let mut mean_q_err = 0.0_f64;
+                    let mut mean_mu_vs_q = 0.0_f64;
+                    for (k2, s2) in probe_states.iter().enumerate() {
+                        let a_star_k = true_opt[k2];
+                        let mu_raw = agent.actor_mu_raw_for_test(s2);
+                        let log_s = agent.actor_log_sigma_for_test(s2);
+                        let mu_det = mu_raw[0].tanh();
+                        let sigma_k = log_s[0].exp();
+
+                        // argmax Q1 over a grid of 41 points in [-0.98, 0.98].
+                        let grid_n = 41_usize;
+                        let a_min = -0.98_f64;
+                        let a_max = 0.98_f64;
+                        let mut best_q = f64::NEG_INFINITY;
+                        let mut argmax_q = 0.0_f64;
+                        for gi in 0..grid_n {
+                            let a_g = a_min + (a_max - a_min) * gi as f64 / (grid_n - 1) as f64;
+                            let q_g = agent.q1_for_test(s2, &[a_g]);
+                            if q_g > best_q {
+                                best_q = q_g;
+                                argmax_q = a_g;
+                            }
+                        }
+
+                        let q_at_opt = agent.q1_for_test(s2, &[a_star_k]);
+                        let q_at_neg = agent.q1_for_test(s2, &[-a_star_k]);
+
+                        let e_mu = (mu_det - a_star_k).abs();
+                        let e_q = (argmax_q - a_star_k).abs();
+                        let e_mq = (mu_det - argmax_q).abs();
+                        mean_mu_err += e_mu;
+                        mean_q_err += e_q;
+                        mean_mu_vs_q += e_mq;
+
+                        println!(
+                            "    s{k2}  a*={a_star_k:+.2}  mu_det={mu_det:+.4}  |mu-a*|={e_mu:.4}  \
+                             argmaxQ={argmax_q:+.4}  |argmaxQ-a*|={e_q:.4}  |mu-argmaxQ|={e_mq:.4}  \
+                             sigma={sigma_k:.4}  Q(a*)={q_at_opt:.4}  Q(-a*)={q_at_neg:.4}"
+                        );
+                    }
+                    let n = probe_states.len() as f64;
+                    println!(
+                        "  >>> mean|mu-a*|={:.4}  mean|argmaxQ-a*|={:.4}  mean|mu-argmaxQ|={:.4}  skipped_critic={}  skipped_actor={}",
+                        mean_mu_err / n,
+                        mean_q_err / n,
+                        mean_mu_vs_q / n,
+                        agent.sac_skipped_critic_updates(),
+                        agent.sac_skipped_actor_updates(),
+                    );
+                }
+            }
+
+            // Collect final per-state metrics.
+            let mut results: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+            let mut sum_mu = 0.0_f64;
+            let mut sum_q = 0.0_f64;
+            let mut sum_mq = 0.0_f64;
+            for (k2, s2) in probe_states.iter().enumerate() {
+                let a_star_k = true_opt[k2];
+                let mu_raw = agent.actor_mu_raw_for_test(s2);
+                let log_s = agent.actor_log_sigma_for_test(s2);
+                let mu_det = mu_raw[0].tanh();
+                let sigma_k = log_s[0].exp();
+
+                let grid_n = 41_usize;
+                let a_min = -0.98_f64;
+                let a_max = 0.98_f64;
+                let mut best_q = f64::NEG_INFINITY;
+                let mut argmax_q = 0.0_f64;
+                for gi in 0..grid_n {
+                    let a_g = a_min + (a_max - a_min) * gi as f64 / (grid_n - 1) as f64;
+                    let q_g = agent.q1_for_test(s2, &[a_g]);
+                    if q_g > best_q {
+                        best_q = q_g;
+                        argmax_q = a_g;
+                    }
+                }
+
+                let q_at_opt = agent.q1_for_test(s2, &[a_star_k]);
+                let q_at_neg = agent.q1_for_test(s2, &[-a_star_k]);
+
+                sum_mu += (mu_det - a_star_k).abs();
+                sum_q += (argmax_q - a_star_k).abs();
+                sum_mq += (mu_det - argmax_q).abs();
+                results.push((mu_det, argmax_q, sigma_k, q_at_opt, q_at_neg));
+            }
+            let n = probe_states.len() as f64;
+            (results, sum_mu / n, sum_q / n, sum_mq / n, agent.alpha_for_test())
+        };
+
+        // ── Three variants ───────────────────────────────────────────────────
+        let n_steps_v1v2 = 15_000_usize;
+        let n_steps_v3 = 60_000_usize;
+        let probe_interval = 1_500_usize;
+
+        println!("\n\n=== VARIANT V1: actor_lr=3e-4, q_lr=3e-4, steps=15000 ===");
+        let agent_v1 = build_agent(3e-4, 3e-4);
+        let (res_v1, mu_err_v1, q_err_v1, mq_err_v1, alpha_v1) =
+            run_variant(agent_v1, n_steps_v1v2, probe_interval, "V1 (lr=3e-4, 15k steps)");
+
+        println!("\n\n=== VARIANT V2: actor_lr=3e-3, q_lr=3e-3, steps=15000 ===");
+        let agent_v2 = build_agent(3e-3, 3e-3);
+        let (res_v2, mu_err_v2, q_err_v2, mq_err_v2, alpha_v2) =
+            run_variant(agent_v2, n_steps_v1v2, probe_interval, "V2 (lr=3e-3, 15k steps)");
+
+        println!("\n\n=== VARIANT V3: actor_lr=3e-3, q_lr=3e-3, steps=60000 ===");
+        let agent_v3 = build_agent(3e-3, 3e-3);
+        let (res_v3, mu_err_v3, q_err_v3, mq_err_v3, alpha_v3) =
+            run_variant(agent_v3, n_steps_v3, probe_interval, "V3 (lr=3e-3, 60k steps)");
+
+        // ── Final comparison table ───────────────────────────────────────────
+        println!("\n\n╔══════════════════════════════════════════════════════════════════════════════════════╗");
+        println!("║  FINAL COMPARISON TABLE — SAC Contextual Bandit Step-0 Diagnostic                  ║");
+        println!("╠══════════════════════════════════════════════════════════════════════════════════════╣");
+        for (label, results, mu_err, q_err, mq_err, alpha) in [
+            ("V1 (lr=3e-4, 15k)", &res_v1, mu_err_v1, q_err_v1, mq_err_v1, alpha_v1),
+            ("V2 (lr=3e-3, 15k)", &res_v2, mu_err_v2, q_err_v2, mq_err_v2, alpha_v2),
+            ("V3 (lr=3e-3, 60k)", &res_v3, mu_err_v3, q_err_v3, mq_err_v3, alpha_v3),
+        ] {
+            println!("║  {label}");
+            println!("║    {:>4}  {:>8}  {:>8}  {:>7}  {:>7}  {:>8}", "a*", "argmaxQ", "mu_det", "sigma", "Q(a*)", "Q(-a*)");
+            for (k2, (mu_det, argmax_q, sigma_k, q_opt, q_neg)) in results.iter().enumerate() {
+                println!(
+                    "║    s{k2}  a*={:+.2}  argmaxQ={:+.4}  mu_det={:+.4}  sigma={:.4}  Q(a*)={:.4}  Q(-a*)={:.4}",
+                    true_opt[k2], argmax_q, mu_det, sigma_k, q_opt, q_neg
+                );
+            }
+            println!(
+                "║    mean|mu-a*|={mu_err:.4}  mean|argmaxQ-a*|={q_err:.4}  mean|mu-argmaxQ|={mq_err:.4}  final_alpha={alpha:.4}"
+            );
+            println!("║  ──────────────────────────────────────────────────────────────────────────────────");
+        }
+        println!("╚══════════════════════════════════════════════════════════════════════════════════════╝");
+
+        // Loose completeness assertions (measurement only — no convergence guarantee).
+        for (label, results, mu_err, q_err, mq_err, alpha) in [
+            ("V1", &res_v1, mu_err_v1, q_err_v1, mq_err_v1, alpha_v1),
+            ("V2", &res_v2, mu_err_v2, q_err_v2, mq_err_v2, alpha_v2),
+            ("V3", &res_v3, mu_err_v3, q_err_v3, mq_err_v3, alpha_v3),
+        ] {
+            for (k2, (mu_det, argmax_q, sigma_k, q_opt, q_neg)) in results.iter().enumerate() {
+                assert!(
+                    mu_det.is_finite(),
+                    "{label} s{k2}: mu_det must be finite, got {mu_det}"
+                );
+                assert!(
+                    argmax_q.is_finite(),
+                    "{label} s{k2}: argmax_q must be finite, got {argmax_q}"
+                );
+                assert!(
+                    sigma_k.is_finite() && *sigma_k > 0.0,
+                    "{label} s{k2}: sigma must be finite and positive, got {sigma_k}"
+                );
+                assert!(
+                    q_opt.is_finite(),
+                    "{label} s{k2}: Q(a*) must be finite, got {q_opt}"
+                );
+                assert!(
+                    q_neg.is_finite(),
+                    "{label} s{k2}: Q(-a*) must be finite, got {q_neg}"
+                );
+            }
+            assert!(mu_err.is_finite(), "{label}: mean|mu-a*| must be finite");
+            assert!(q_err.is_finite(), "{label}: mean|argmaxQ-a*| must be finite");
+            assert!(mq_err.is_finite(), "{label}: mean|mu-argmaxQ| must be finite");
+            assert!(
+                alpha.is_finite() && alpha > 0.0,
+                "{label}: alpha must be finite and positive, got {alpha}"
+            );
+        }
+    }
 }
