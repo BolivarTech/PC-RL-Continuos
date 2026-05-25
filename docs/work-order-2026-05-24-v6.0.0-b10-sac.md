@@ -24,6 +24,26 @@ Date: 2026-05-24
 - The harness already depends on the library via `pc-rl-core = { path = "../PC-RL-Core" }`, so with
   PC-RL-Core checked out on this branch the harness builds against v6.0.0 directly.
 
+## 0b. ⚠ CRITICAL CORRECTION (2026-05-25, from Step-0 in-library diagnostic — read before tuning)
+
+The first B10 attempt MISSED. An upstream white-box diagnostic
+(`diagnose_sac_contextual_bandit`, an in-library contextual bandit with state-dependent interior
+optima) **root-caused it: the recommended `lr = 3e-4` in §3 was ~10× TOO LOW for this library's
+plain-SGD framework** (pc-rl-core uses fixed-lr SGD, NOT Adam; 3e-4 is the *Adam*-standard, whose
+effective step is far larger than a raw SGD step). At `lr = 3e-4` the Q-critic never learns a
+discriminative surface (argmax_a Q stuck at the action-grid edge, Q(a*)≈Q(−a*)) → the actor gets no
+signal → μ stays random/saturated and σ never collapses — EXACTLY the symptoms the first B10 run
+reported. At **`lr = 3e-3` (×10)** the diagnostic SAC converges cleanly: Q learns the correct interior
+optima, μ tracks argmax_a Q, σ collapses to ~0.15–0.27, α settles. The mechanism is correct; the lr was
+the bottleneck. The first run swept `target_entropy`/`alpha_lr`/capacity/activation but NOT the main
+actor/Q-critic lr (because §3 pinned 3e-4) — so it never hit the working regime.
+
+**ACTION: re-run B10 with `actor.lr_weights = q_critic.lr ≈ 3e-3` (sweep 1e-3…1e-2).** §3 below is
+corrected accordingly. Caveat (honest): the diagnostic is single-step (no temporal horizon), so the
+higher lr is NECESSARY and high-confidence, but Pendulum's 200-step horizon is untested in-library — if
+B10 still misses *after* the lr fix, the next diagnostic is the horizon/credit-assignment path (n-step
+Q targets), not the core mechanism.
+
 ## 1. B10 pass criterion (unchanged)
 
 `multi_seed` 10×500: **deterministic** eval (Play mode, `tanh(μ_raw)`, no exploration noise) mean
@@ -66,11 +86,11 @@ actor.output_activation  = Linear
 actor.max_steps          = 5–10            # PC inference depth. LOWER than 20 to cut B10 wall-clock
                                            #   (T0 spike: 15.7 ms/update @ max_steps=20 → ~4.4 h for 10×500;
                                            #    max_steps=5 roughly quarters the actor-inference cost)
-actor.lr_weights         = 3e-4            # SAC standard
+actor.lr_weights         = 3e-3            # CORRECTED (was 3e-4): SGD framework needs ~10× the Adam-standard lr (see §0b); sweep 1e-3…1e-2
 q_critic.state_dim       = 3
 q_critic.action_dim      = 1
 q_critic.hidden_layers   = [64, 64] (Tanh) # or [256,256] if compute allows
-q_critic.lr              = 3e-4
+q_critic.lr              = 3e-3            # CORRECTED (was 3e-4): same SGD-vs-Adam reason (§0b) — this is the lr that starved the critic in run 1; sweep 1e-3…1e-2
 replay_training_capacity = 100_000         # 1e5 (1e6 also fine if memory allows)
 replay_recent_capacity   = 0
 replay_batch_size        = 256             # SAC standard; must be ≤ capacity
@@ -78,7 +98,7 @@ learning_starts          = 1_000           # collect ~1k transitions before lear
 polyak_tau               = 0.005
 target_entropy           = None            # ⇒ −action_dim = −1.0 (Pendulum standard); tune if needed
 log_alpha_init           = 0.0             # α₀ = 1.0
-alpha_lr                 = 3e-4            # SAC standard (NOT the library default 0.001 — tune)
+alpha_lr                 = 3e-3            # raised with the rest (SGD framework, §0b); the temperature was NOT the bottleneck — the actor/Q lr was
 # leave these at SAC-safe values:
 gae_lambda = None ; td_steps = 0 ; actor_hysteresis = false ; critic_hysteresis = false
 ```
@@ -109,9 +129,11 @@ Record per-seed deterministic eval means in a results doc (mirror `docs/results_
 The in-library SAC mechanism is correct (FD-verified) regardless of B10, so a miss is a TUNING/harness
 matter, not a library bug. Try in order:
 
-1. **Hyperparameter tuning** — `alpha_lr` (entropy temperature speed), `target_entropy` (e.g. −1 → more
-   negative forces faster exploitation), actor/critic `lr`, `learning_starts`, `replay_batch_size`,
-   `polyak_tau`, `actor.max_steps` (PC depth), hidden sizes. SAC is sensitive to lr/τ/target_entropy.
+1. **Actor + Q-critic learning rate FIRST (the confirmed run-1 root cause, §0b)** — `actor.lr_weights`
+   and `q_critic.lr` at **~3e-3, sweep 1e-3…1e-2**. This is the lever the first run missed; the Step-0
+   diagnostic proves SAC fails at 3e-4 and converges at 3e-3 in-library. Only after the lr is in the
+   working regime do the other knobs matter: `target_entropy`, `alpha_lr`, `learning_starts`,
+   `replay_batch_size`, `polyak_tau`, `actor.max_steps` (PC depth), hidden sizes.
 2. **Reward/obs normalization** — confirm it is ON and correct (running stats); try reward scaling.
 3. **σ / log_σ diagnostics (MAGI Caspar)** — log `mean σ` and `mean|μ_raw|` over training so a σ
    instability (σ collapsing too fast → premature exploitation, or never collapsing → never commits)
