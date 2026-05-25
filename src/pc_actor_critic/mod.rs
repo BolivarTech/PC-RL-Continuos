@@ -16105,4 +16105,511 @@ mod tests {
             );
         }
     }
+
+    // ── Step-0 SAC horizon / n-step learning-dynamics diagnostic ────────────
+    //
+    // White-box characterization only — DO NOT modify production code.
+    //
+    // Tests whether single-step SAC credit assignment (MODE A, production)
+    // degrades with episode horizon H compared to an n-step Q-target (MODE B,
+    // prototype). Both modes share identical actor/temperature/polyak updates;
+    // ONLY the critic Q-target differs.
+    //
+    // Run with:
+    //   cargo nextest run --release --run-ignored all diagnose_sac_horizon_nstep --no-capture
+    //   cargo test --release -- --ignored --nocapture diagnose_sac_horizon_nstep
+    #[test]
+    #[ignore = "Step-0 SAC horizon/n-step diagnostic"]
+    #[allow(clippy::type_complexity)]
+    fn diagnose_sac_horizon_nstep() {
+        use rand::SeedableRng;
+        use crate::pc_actor_critic::replay::{Action as ReplayAction, ReplayTransition};
+
+        // ── Task constants ───────────────────────────────────────────────────
+        // 1-D point-mass with delayed terminal reward.
+        // State: [x, 0.0, 0.0] (length 3, consistent with actor.input_size=3).
+        // Action: a_t = tanh(a_raw_t) ∈ (-1,1).
+        // Dynamics: x_{t+1} = clamp(x_t + MOVE * a_t, -1, 1).
+        // Reward: 0 for t < H-1; -(x_H)^2 at the terminal step (done=true).
+        // Optimal: a*(x) = clamp(-x / MOVE, -1, 1) → drives x toward 0.
+        const MOVE: f64 = 0.2;
+        const GAMMA: f64 = 0.99;
+        const STATE_DIM: usize = 3;
+        const ACTION_DIM: usize = 1;
+
+        // Probe start positions for evaluation.
+        let probe_x: [f64; 4] = [-0.8, -0.4, 0.4, 0.8];
+
+        // Optimal action for a given x.
+        let opt_action = |x: f64| -> f64 { (-x / MOVE).clamp(-1.0, 1.0) };
+
+        // Step dynamics.
+        let step_x = |x: f64, a_squashed: f64| -> f64 {
+            (x + MOVE * a_squashed).clamp(-1.0, 1.0)
+        };
+
+        // ── Build an SAC agent for this task ─────────────────────────────────
+        let build_agent = || -> PcActorCritic {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            // Actor: input_size=3, hidden [32,32] Tanh, output_size=2 (μ+log_σ).
+            cfg.actor.input_size = STATE_DIM;
+            cfg.actor.hidden_layers = vec![
+                LayerDef { size: 32, activation: Activation::Tanh },
+                LayerDef { size: 32, activation: Activation::Tanh },
+            ];
+            cfg.actor.output_size = 2 * ACTION_DIM;
+            cfg.actor.output_activation = crate::activation::Activation::Linear;
+            cfg.actor.max_steps = 5;
+            cfg.actor.lr_weights = 3e-3;
+            // MLP critic: not used in SAC mode for actor updates but must be
+            // constructed; set input_size = state + latent_concat = 3+32+32 = 67.
+            cfg.critic.input_size = STATE_DIM + 32 + 32;
+            cfg.critic.hidden_layers = vec![LayerDef { size: 32, activation: Activation::Tanh }];
+            cfg.policy_sigma = 0.3;
+            // Q-critics (SAC).
+            cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+                state_dim: STATE_DIM,
+                action_dim: ACTION_DIM,
+                hidden_layers: vec![
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                ],
+                lr: 3e-3,
+            });
+            cfg.alpha_lr = 3e-3;
+            cfg.replay_training_capacity = 50_000;
+            cfg.replay_recent_capacity = 0;
+            cfg.replay_positive_only = false;
+            cfg.replay_batch_size = 128;
+            cfg.learning_starts = 512;
+            cfg.target_entropy = Some(-(ACTION_DIM as f64));
+            cfg.polyak_tau = 0.005;
+            cfg.gamma = GAMMA;
+            cfg.gae_lambda = None;
+            cfg.td_steps = 0;
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42)
+                .expect("diagnose_sac_horizon_nstep: agent construction must succeed")
+        };
+
+        // ── Deterministic rollout: evaluate the deterministic policy from x0 ─
+        let det_rollout = |agent: &PcActorCritic, x0: f64, h: usize| -> f64 {
+            let mut x = x0;
+            for t in 0..h {
+                let s = vec![x, 0.0, 0.0];
+                let mu_raw = agent.actor_mu_raw_for_test(&s);
+                let a_det = mu_raw[0].tanh(); // tanh(μ_raw) = deterministic action
+                let x_next = step_x(x, a_det);
+                if t == h - 1 {
+                    // Terminal: reward = -(x_H)^2
+                    return -(x_next * x_next);
+                }
+                x = x_next;
+            }
+            unreachable!()
+        };
+
+        // ── Per-state evaluation metrics ─────────────────────────────────────
+        // Returns (mean terminal reward, mean |μ_det − a*|) across probe starts.
+        let eval_metrics = |agent: &PcActorCritic, h: usize| -> (f64, f64) {
+            let mut sum_reward = 0.0_f64;
+            let mut sum_mu_err = 0.0_f64;
+            for &x0 in &probe_x {
+                let s = vec![x0, 0.0, 0.0];
+                let mu_raw = agent.actor_mu_raw_for_test(&s);
+                let mu_det = mu_raw[0].tanh();
+                let a_star = opt_action(x0);
+                sum_mu_err += (mu_det - a_star).abs();
+                sum_reward += det_rollout(agent, x0, h);
+            }
+            let n = probe_x.len() as f64;
+            (sum_reward / n, sum_mu_err / n)
+        };
+
+        // ── MODE B: n-step critic update (local helper, no production change) ─
+        //
+        // For a start index `t0` into a SINGLE episode, accumulates the
+        // discounted return over n=min(H,16) steps, then bootstraps from
+        // the target Q-critics at s_{t0+n}.
+        //
+        // y = Σ_{i=0}^{n-1} γ^i * r_{t0+i}
+        //     + γ^n * (1-done_{t0+n-1}) * (min(q1t,q2t)(s_{t0+n}, a')
+        //                                   − α * logπ(a'|s_{t0+n}))
+        //
+        // Then updates q1 and q2 with update_scaled at (s_{t0}, a_{t0}, y).
+        // Returns the mean MSE loss over the mini-batch, or 0.0 on full skip.
+        let nstep_critic_update = |agent: &mut PcActorCritic,
+                                   episodes: &[Vec<ReplayTransition>],
+                                   batch_indices: &[(usize, usize)],
+                                   n: usize,
+                                   h: usize| {
+            // batch_indices: (episode_idx, step_idx_t0)
+            let batch_n = batch_indices.len() as f64;
+            let lr_scale = 1.0 / batch_n;
+            let gamma = agent.config.gamma;
+            let alpha = agent.alpha();
+            let mut total_loss = 0.0_f64;
+            let mut applied = 0_usize;
+
+            // Collect (state_t0, a_squashed_t0, y) triples, then do a
+            // two-pass update to avoid borrow conflicts.
+            let mut targets: Vec<(Vec<f64>, Vec<f64>, f64)> = Vec::new();
+
+            for &(ep_idx, t0) in batch_indices {
+                let ep = &episodes[ep_idx];
+                if t0 >= ep.len() {
+                    continue;
+                }
+                let a_raw_t0 = match &ep[t0].action {
+                    ReplayAction::Continuous(v) => v.clone(),
+                    ReplayAction::Discrete(_) => continue,
+                };
+                let a_squashed_t0: Vec<f64> = a_raw_t0.iter().map(|x| x.tanh()).collect();
+
+                // Accumulate discounted returns.
+                let actual_n = n.min(ep.len() - t0);
+                let mut ret = 0.0_f64;
+                let mut discount = 1.0_f64;
+                let mut bootstrap_done = false;
+                for i in 0..actual_n {
+                    let ti = t0 + i;
+                    ret += discount * ep[ti].reward;
+                    discount *= gamma;
+                    if ep[ti].done {
+                        bootstrap_done = true;
+                        break;
+                    }
+                }
+
+                // Bootstrap: use next_state at the last step.
+                let last_step_idx = t0 + actual_n - 1;
+                let bootstrap_y = if bootstrap_done {
+                    0.0
+                } else if last_step_idx < ep.len() {
+                    let s_next = ep[last_step_idx].next_state.clone();
+                    // Fresh actor sample at s_next.
+                    let y_next = {
+                        let infer = agent.actor.infer(&s_next);
+                        agent.backend.vec_to_vec(&infer.y_conv)
+                    };
+                    let (mu_n, ls_n) = split_mu_log_sigma(&y_next, ACTION_DIM);
+                    let (a_next_raw, a_next) =
+                        sample_squashed_action(&mu_n, &ls_n, &mut agent.rng);
+                    let logp_next = squashed_log_prob(&mu_n, &ls_n, &a_next_raw);
+
+                    let q1t = agent.q1_target.as_ref().map(|q| q.forward(&s_next, &a_next));
+                    let q2t = agent.q2_target.as_ref().map(|q| q.forward(&s_next, &a_next));
+
+                    match (q1t, q2t) {
+                        (Some(v1), Some(v2)) if v1.is_finite() && v2.is_finite() && logp_next.is_finite() => {
+                            v1.min(v2) - alpha * logp_next
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    continue
+                };
+
+                let y = ret + discount * bootstrap_y;
+                if !y.is_finite() {
+                    continue;
+                }
+
+                targets.push((ep[t0].state.clone(), a_squashed_t0, y));
+            }
+
+            // Two-pass update: targets collected above, now update q1/q2.
+            for (state, a_sq, y) in &targets {
+                let l1 = agent.q1.as_mut().unwrap().update_scaled(state, a_sq, *y, lr_scale);
+                let l2 = agent.q2.as_mut().unwrap().update_scaled(state, a_sq, *y, lr_scale);
+                if l1.is_finite() && l2.is_finite() {
+                    total_loss += 0.5 * (l1 + l2);
+                    applied += 1;
+                }
+            }
+
+            if h == 0 || applied == 0 {
+                0.0
+            } else {
+                total_loss / applied as f64
+            }
+        };
+
+        // ── Run one mode (A or B) for a given horizon H ──────────────────────
+        // Returns (final mean terminal reward, final mean |μ_det − a*|).
+        let run_mode = |label: &str,
+                        h: usize,
+                        n_env_steps: usize,
+                        is_nstep: bool|
+         -> (f64, f64) {
+            use rand::Rng as _;
+            let mut agent = build_agent();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+            let probe_interval = n_env_steps / 5;
+
+            // n-step lookahead cap (capped to episode length).
+            let n: usize = 16_usize.min(h);
+            let n_nstep = n;
+
+            // Episode storage for n-step indexing.
+            // Each element is a completed episode (Vec of ReplayTransition).
+            let mut episodes: Vec<Vec<ReplayTransition>> = Vec::new();
+            let mut flat_buf: Vec<(usize, usize)> = Vec::new(); // (ep_idx, step_idx)
+            let max_buf_entries = 50_000_usize;
+
+            // Flat transition list for MODE A (single-step production path).
+            let mut flat_transitions: Vec<ReplayTransition> = Vec::new();
+            let batch_size = 128_usize;
+            let warmup = 512_usize;
+            let mut env_step = 0_usize;
+
+            println!(
+                "\n\n══ {label}  H={h}  n={n_nstep}  ({n_env_steps} env steps) ══"
+            );
+
+            // Outer loop: collect episodes and interleave learning.
+            'outer: loop {
+                // Roll out one episode of length H.
+                let x0 = (rng.gen_range(0_u32..8) as f64 - 3.5) * 0.2; // uniform in [-0.7..0.7]
+                let x0 = x0.clamp(-0.8, 0.8);
+                let mut x = x0;
+                let mut ep: Vec<ReplayTransition> = Vec::with_capacity(h);
+
+                for t in 0..h {
+                    let s = vec![x, 0.0, 0.0];
+                    let mu_raw = agent.actor_mu_raw_for_test(&s);
+                    let log_sigma = agent.actor_log_sigma_for_test(&s);
+                    let (a_raw, a_sq) = sample_squashed_action(&mu_raw, &log_sigma, &mut agent.rng);
+
+                    let x_next = step_x(x, a_sq[0]);
+                    let is_last = t == h - 1;
+                    let reward = if is_last { -(x_next * x_next) } else { 0.0 };
+
+                    let trans = ReplayTransition {
+                        state: s.clone(),
+                        action: ReplayAction::Continuous(a_raw),
+                        reward,
+                        next_state: vec![x_next, 0.0, 0.0],
+                        done: is_last,
+                        valid_actions: None,
+                    };
+                    flat_transitions.push(trans.clone());
+                    ep.push(trans);
+                    x = x_next;
+
+                    env_step += 1;
+                    if env_step >= n_env_steps {
+                        episodes.push(ep);
+                        break 'outer;
+                    }
+                }
+
+                // Store episode for n-step indexing.
+                let ep_idx = episodes.len();
+                for step_idx in 0..ep.len() {
+                    flat_buf.push((ep_idx, step_idx));
+                    // Trim oldest entries to stay within capacity.
+                    if flat_buf.len() > max_buf_entries {
+                        flat_buf.remove(0);
+                    }
+                }
+                episodes.push(ep);
+
+                // Trim old episodes once we have too many in flat_buf.
+                // Keep episodes only as long as they are referenced.
+
+                // Once warm, do one learning step per env step in this episode.
+                let buf_len = if is_nstep { flat_buf.len() } else { flat_transitions.len() };
+                if buf_len < warmup {
+                    continue;
+                }
+
+                // Sample a random batch.
+                use rand::seq::SliceRandom;
+                if is_nstep {
+                    // MODE B: sample episode/step indices, compute n-step target.
+                    let mut indices: Vec<usize> = (0..flat_buf.len()).collect();
+                    indices.shuffle(&mut rng);
+                    let batch_idx: Vec<(usize, usize)> = indices
+                        .iter()
+                        .take(batch_size)
+                        .map(|&i| flat_buf[i])
+                        .collect();
+
+                    nstep_critic_update(
+                        &mut agent,
+                        &episodes,
+                        &batch_idx,
+                        n_nstep,
+                        h,
+                    );
+                } else {
+                    // MODE A: sample flat transitions and call production sac_critic_update.
+                    let mut idx: Vec<usize> = (0..flat_transitions.len()).collect();
+                    idx.shuffle(&mut rng);
+                    let batch: Vec<ReplayTransition> = idx
+                        .iter()
+                        .take(batch_size)
+                        .map(|&i| flat_transitions[i].clone())
+                        .collect();
+                    agent.sac_critic_update(&batch);
+                }
+
+                // Actor + temperature + polyak — SAME for both modes.
+                {
+                    let batch_len = flat_transitions.len().min(flat_buf.len());
+                    let sample_len = batch_size.min(batch_len);
+                    if sample_len > 0 {
+                        // Use flat_transitions for actor update in both modes
+                        // (actor always trains on plain transitions, same as production).
+                        use rand::seq::SliceRandom;
+                        let mut idx: Vec<usize> = (0..flat_transitions.len()).collect();
+                        idx.shuffle(&mut rng);
+                        let actor_batch: Vec<ReplayTransition> = idx
+                            .iter()
+                            .take(sample_len)
+                            .map(|&i| flat_transitions[i].clone())
+                            .collect();
+                        let (_mean_delta, logp_opt) = agent.sac_actor_update(&actor_batch);
+                        if let Some(logp) = logp_opt {
+                            agent.sac_temperature_update(logp);
+                        }
+                        agent.polyak_update_targets();
+                    }
+                }
+
+                // Periodic reporting.
+                if env_step.is_multiple_of(probe_interval) {
+                    let (mean_r, mean_mu_err) = eval_metrics(&agent, h);
+                    println!(
+                        "  step={env_step:>7}  mean_term_r={mean_r:+.4}  mean|mu-a*|={mean_mu_err:.4}  \
+                         alpha={:.4}  skipped_c={}  skipped_a={}",
+                        agent.alpha_for_test(),
+                        agent.sac_skipped_critic_updates(),
+                        agent.sac_skipped_actor_updates(),
+                    );
+                }
+            }
+
+            let (mean_r, mean_mu_err) = eval_metrics(&agent, h);
+            let sigma_vals: f64 = probe_x
+                .iter()
+                .map(|&x0| {
+                    let s = vec![x0, 0.0, 0.0];
+                    let ls = agent.actor_log_sigma_for_test(&s);
+                    ls[0].exp()
+                })
+                .sum::<f64>()
+                / probe_x.len() as f64;
+
+            println!(
+                "\n  FINAL {label} H={h}: mean_term_r={mean_r:+.4}  mean|mu-a*|={mean_mu_err:.4}  \
+                 mean_sigma={sigma_vals:.4}  alpha={:.4}  skipped_c={}  skipped_a={}",
+                agent.alpha_for_test(),
+                agent.sac_skipped_critic_updates(),
+                agent.sac_skipped_actor_updates(),
+            );
+
+            // Per-probe state details.
+            for &x0 in &probe_x {
+                let s = vec![x0, 0.0, 0.0];
+                let mu_raw = agent.actor_mu_raw_for_test(&s);
+                let mu_det = mu_raw[0].tanh();
+                let a_star = opt_action(x0);
+                let ls = agent.actor_log_sigma_for_test(&s);
+                let sigma_k = ls[0].exp();
+                let term_r = det_rollout(&agent, x0, h);
+                println!(
+                    "    x0={x0:+.2}  mu_det={mu_det:+.4}  a*={a_star:+.4}  \
+                     |mu-a*|={:.4}  term_r={term_r:+.4}  sigma={sigma_k:.4}",
+                    (mu_det - a_star).abs(),
+                );
+            }
+
+            assert!(mean_r.is_finite(), "{label} H={h}: mean terminal reward must be finite");
+            assert!(mean_mu_err.is_finite(), "{label} H={h}: mean|mu-a*| must be finite");
+
+            (mean_r, mean_mu_err)
+        };
+
+        // ── Horizon sweep: H ∈ {4, 16, 40} ─────────────────────────────────
+        // We run enough env steps so both modes have plateaued.
+        let configs: &[(usize, usize)] = &[
+            (4,  20_000),
+            (16, 20_000),
+            (40, 25_000),
+        ];
+
+        #[derive(Clone)]
+        struct HResult {
+            h: usize,
+            mode_a_r: f64,
+            mode_a_mu: f64,
+            mode_b_r: f64,
+            mode_b_mu: f64,
+        }
+        let mut results: Vec<HResult> = Vec::new();
+
+        for &(h, n_env_steps) in configs {
+            println!("\n\n╔══════════════════════════════════════════════════╗");
+            println!("║  HORIZON H={h:>2}  ({n_env_steps} env steps)");
+            println!("╚══════════════════════════════════════════════════╝");
+
+            let (r_a, mu_a) = run_mode("MODE-A(single-step)", h, n_env_steps, false);
+            let (r_b, mu_b) = run_mode("MODE-B(n-step)", h, n_env_steps, true);
+
+            results.push(HResult {
+                h,
+                mode_a_r: r_a,
+                mode_a_mu: mu_a,
+                mode_b_r: r_b,
+                mode_b_mu: mu_b,
+            });
+        }
+
+        // ── Final summary table ──────────────────────────────────────────────
+        println!("\n\n╔══════════════════════════════════════════════════════════════════════════╗");
+        println!("║  FINAL A-vs-B-by-H TABLE                                                ║");
+        println!("╠══════════════╦═══════════════════════════╦═══════════════════════════════╣");
+        println!("║     H        ║  MODE A (single-step)     ║  MODE B (n-step)              ║");
+        println!("║              ║  mean_term_r  mean|μ−a*|  ║  mean_term_r  mean|μ−a*|     ║");
+        println!("╠══════════════╬═══════════════════════════╬═══════════════════════════════╣");
+        for r in &results {
+            println!(
+                "║  H={:<9}║  {:>+9.4}    {:>8.4}  ║  {:>+9.4}    {:>8.4}          ║",
+                r.h, r.mode_a_r, r.mode_a_mu, r.mode_b_r, r.mode_b_mu
+            );
+        }
+        println!("╚══════════════╩═══════════════════════════╩═══════════════════════════════╝");
+        println!("\n  Interpretation guide:");
+        println!("  mean_term_r: mean -(x_H)^2 under deterministic policy; optimal ≈ 0, random ≈ -0.32");
+        println!("  mean|μ−a*|: mean |tanh(μ_raw) − a*(x0)| across probe starts; optimal = 0");
+        println!("  If MODE A degrades with H and MODE B holds → n-step fixes credit assignment.");
+
+        // Loose sanity assertions: all results must be finite.
+        for r in &results {
+            assert!(
+                r.mode_a_r.is_finite(),
+                "MODE A H={}: mean_term_r non-finite",
+                r.h
+            );
+            assert!(
+                r.mode_a_mu.is_finite(),
+                "MODE A H={}: mean|mu-a*| non-finite",
+                r.h
+            );
+            assert!(
+                r.mode_b_r.is_finite(),
+                "MODE B H={}: mean_term_r non-finite",
+                r.h
+            );
+            assert!(
+                r.mode_b_mu.is_finite(),
+                "MODE B H={}: mean|mu-a*| non-finite",
+                r.h
+            );
+        }
+    }
 }
