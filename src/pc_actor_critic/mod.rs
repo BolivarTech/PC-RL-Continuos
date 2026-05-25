@@ -17336,4 +17336,148 @@ mod tests {
             "BOUNDARY-SINGLESTEP: alpha non-finite or zero"
         );
     }
+
+    // ── Uniform-random warmup tests ───────────────────────────────────────────
+
+    /// During the `learning_starts` warmup window, `step_continuous` must return
+    /// actions that are UNIFORM in (−1, 1) rather than clustered around zero
+    /// (as a Gaussian-squashed policy would be).
+    ///
+    /// Contract assertions (500 warmup steps, fixed state):
+    /// - `|mean| < 0.12`  — not biased toward a pole
+    /// - all four quartile bins of (−1, 1) each hold ≥ 12 % of samples
+    /// - `min < −0.7` and `max > 0.7`  — both extremes covered
+    #[test]
+    fn test_random_warmup_actions_are_uniform_during_warmup() {
+        let mut cfg = continuous_sac_config();
+        // learning_starts >> steps we take so we stay inside the warmup window.
+        cfg.learning_starts = 600;
+        cfg.replay_batch_size = 8;
+        cfg.replay_training_capacity = 2000;
+        cfg.replay_positive_only = false;
+
+        let mut agent =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42).unwrap();
+
+        let state = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+        let n_steps = 500_usize;
+        let mut actions: Vec<f64> = Vec::with_capacity(n_steps);
+
+        for _ in 0..n_steps {
+            let a = agent
+                .step_continuous(&state, 0.0, false)
+                .expect("step_continuous must not error during warmup");
+            // action_dim == 1 for the test SAC config
+            actions.push(a[0]);
+        }
+
+        // All actions must lie strictly inside the squashed range.
+        for &v in &actions {
+            assert!(
+                v > -1.0 && v < 1.0,
+                "warmup action {v} out of (−1, 1) squash range"
+            );
+        }
+
+        let mean = actions.iter().copied().sum::<f64>() / n_steps as f64;
+        assert!(
+            mean.abs() < 0.12,
+            "warmup action mean {mean:.4} should be near 0 (uniform), not biased"
+        );
+
+        let min = actions.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = actions.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            min < -0.7,
+            "warmup min {min:.4} should reach below −0.7 (uniform coverage)"
+        );
+        assert!(
+            max > 0.7,
+            "warmup max {max:.4} should reach above 0.7 (uniform coverage)"
+        );
+
+        // Quartile bin check: (−1,−0.5), (−0.5, 0), (0, 0.5), (0.5, 1) each ≥ 12 %.
+        let thresholds = [-1.0_f64, -0.5, 0.0, 0.5, 1.0];
+        for w in thresholds.windows(2) {
+            let lo = w[0];
+            let hi = w[1];
+            let count = actions.iter().filter(|&&v| v >= lo && v < hi).count();
+            let frac = count as f64 / n_steps as f64;
+            assert!(
+                frac >= 0.12,
+                "quartile bin ({lo}, {hi}) holds only {:.1}% of warmup actions (need ≥ 12 %)",
+                frac * 100.0
+            );
+        }
+    }
+
+    /// When `learning_starts == 0` (the default), no warmup applies: actions
+    /// come from the policy, not from uniform random sampling.
+    ///
+    /// Strategy: build TWO identically-seeded agents (seed 42), one with
+    /// `learning_starts = 0` and one with `learning_starts = 600`.  After a
+    /// single step at the SAME state, their actions must differ (the warmup
+    /// agent draws a fresh uniform sample while the no-warmup agent samples
+    /// from the seeded policy network — these will be different).  Additionally,
+    /// the no-warmup agent's 200 actions must NOT be uniformly distributed:
+    /// the standard deviation of a Gaussian-squashed output is much less than
+    /// the std-dev of a uniform on (−1,1) ≈ 0.577.
+    #[test]
+    fn test_no_warmup_when_learning_starts_zero() {
+        let make_agent = |learning_starts: usize| {
+            let mut cfg = continuous_sac_config();
+            cfg.learning_starts = learning_starts;
+            cfg.replay_batch_size = 8;
+            cfg.replay_training_capacity = 2000;
+            cfg.replay_positive_only = false;
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), cfg, 42).unwrap()
+        };
+
+        let mut agent_no_warmup = make_agent(0);
+        let mut agent_warmup = make_agent(600);
+
+        let state = vec![0.1_f64, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
+        // First action from each agent at the same state.
+        let a_no_warmup = agent_no_warmup
+            .step_continuous(&state, 0.0, false)
+            .unwrap()[0];
+        let a_warmup = agent_warmup
+            .step_continuous(&state, 0.0, false)
+            .unwrap()[0];
+
+        // With learning_starts=0 the policy is used, NOT uniform random.
+        // The warmup agent samples Uniform(-0.999, 0.999) while the no-warmup
+        // agent samples from the (near-zero-initialized) policy; they should differ.
+        assert!(
+            (a_no_warmup - a_warmup).abs() > 1e-6,
+            "no-warmup action ({a_no_warmup:.6}) and warmup action ({a_warmup:.6}) \
+             should differ: warmup draws uniform while no-warmup uses the policy"
+        );
+
+        // Collect 200 actions from the no-warmup agent and confirm they are NOT uniform.
+        // A near-zero-initialized policy produces actions clustered near 0;
+        // std_dev of Uniform(-1,1) ≈ 0.577 — we assert the policy std_dev << 0.4.
+        let n = 200_usize;
+        let mut no_warmup_actions: Vec<f64> = Vec::with_capacity(n);
+        no_warmup_actions.push(a_no_warmup);
+        for _ in 1..n {
+            let a = agent_no_warmup
+                .step_continuous(&state, 0.0, false)
+                .unwrap()[0];
+            no_warmup_actions.push(a);
+        }
+        let mean = no_warmup_actions.iter().copied().sum::<f64>() / n as f64;
+        let std_dev = (no_warmup_actions
+            .iter()
+            .map(|&v| (v - mean).powi(2))
+            .sum::<f64>()
+            / n as f64)
+            .sqrt();
+        assert!(
+            std_dev < 0.4,
+            "no-warmup actions have std_dev {std_dev:.4} — expected < 0.4 \
+             (policy output, not uniform random)"
+        );
+    }
 }
