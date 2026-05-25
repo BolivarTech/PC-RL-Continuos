@@ -16612,4 +16612,728 @@ mod tests {
             );
         }
     }
+
+    // ── Step-0 SAC horizon-vs-boundary disambiguation diagnostic ────────────
+    //
+    // White-box characterization only — DO NOT modify production code based on
+    // this test.  Changes ONE variable at a time from the WORKING interior
+    // single-step baseline (diagnose_sac_contextual_bandit) to isolate whether
+    // the SAC μ-convergence failure is caused by HORIZON (credit-assignment
+    // over time) or BOUNDARY commitment (μ_raw saturating without a fixed point).
+    //
+    // Three cells, all at lr=3e-3:
+    //
+    //   INTERIOR-MULTISTEP       — multi-step, interior optima (action cost + terminal)
+    //   INTERIOR-MULTISTEP-NSTEP — same task, n-step Q-target (prototype in-test)
+    //   BOUNDARY-SINGLESTEP      — single-step bandit, boundary optima a*=±0.9
+    //
+    // Run with:
+    //   cargo nextest run --release --run-ignored all diagnose_sac_horizon_vs_boundary --no-capture
+    //   cargo test --release -- --ignored --nocapture diagnose_sac_horizon_vs_boundary
+    #[test]
+    #[ignore = "Step-0 SAC horizon-vs-boundary disambiguation"]
+    #[allow(clippy::type_complexity)]
+    fn diagnose_sac_horizon_vs_boundary() {
+        use rand::SeedableRng;
+        use crate::pc_actor_critic::replay::{Action as ReplayAction, ReplayTransition};
+
+        // ── Shared task / agent constants ────────────────────────────────────
+        const STATE_DIM: usize = 3;
+        const ACTION_DIM: usize = 1;
+        const GAMMA: f64 = 0.99;
+        // MOVE=0.1 → optimal policy uses moderate interior actions (not bang-bang ±1).
+        const MOVE: f64 = 0.1;
+        // Action cost coefficient: penalises saturated actions → optima stay interior.
+        const ACTION_COST: f64 = 0.3;
+        // Horizon for multi-step cells.
+        const H: usize = 12;
+
+        // Interior-multistep start positions (non-zero, not at boundary).
+        let probe_x: [f64; 4] = [-0.6, -0.3, 0.3, 0.6];
+
+        // Dynamics: x_{t+1} = clamp(x_t + MOVE * tanh(a_raw), -1, 1).
+        let step_x = |x: f64, a_sq: f64| -> f64 { (x + MOVE * a_sq).clamp(-1.0, 1.0) };
+
+        // Multi-step reward: running action cost + terminal position penalty.
+        // r_t = -ACTION_COST * a_squashed^2  for t < H-1
+        // r_{H-1} = -ACTION_COST * a_sq^2 - x_H^2
+        let reward_multistep = |a_sq: f64, x_next: f64, is_last: bool| -> f64 {
+            let cost = -ACTION_COST * a_sq * a_sq;
+            if is_last { cost - x_next * x_next } else { cost }
+        };
+
+        // Reference returns for the interior-multistep cells (computed analytically
+        // in-test so we can gauge learning without knowing the closed-form optimum).
+        //
+        // R_random: a_t = 0 every step → action cost = 0, terminal = -x0^2.
+        let r_random = |x0: f64| -> f64 { -x0 * x0 };
+        // R_greedy: always max toward 0 (a = clamp(-x/MOVE, ±1)), incurs action cost.
+        let r_greedy = |x0: f64| -> f64 {
+            let mut x = x0;
+            let mut ret = 0.0_f64;
+            let mut disc = 1.0_f64;
+            for t in 0..H {
+                let a_sq = (-x / MOVE).clamp(-1.0, 1.0);
+                let x_next = step_x(x, a_sq);
+                let is_last = t == H - 1;
+                ret += disc * reward_multistep(a_sq, x_next, is_last);
+                disc *= GAMMA;
+                x = x_next;
+            }
+            ret
+        };
+
+        // ── Build an SAC agent (interior-multistep topology) ─────────────────
+        // Actor: [32,32] Tanh, output 2 (μ+log_σ); Q-critics: [32,32] Tanh.
+        let build_agent_interior = || -> PcActorCritic {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.actor.input_size = STATE_DIM;
+            cfg.actor.hidden_layers = vec![
+                LayerDef { size: 32, activation: Activation::Tanh },
+                LayerDef { size: 32, activation: Activation::Tanh },
+            ];
+            cfg.actor.output_size = 2 * ACTION_DIM;
+            cfg.actor.output_activation = crate::activation::Activation::Linear;
+            cfg.actor.max_steps = 5;
+            cfg.actor.lr_weights = 3e-3;
+            cfg.critic.input_size = STATE_DIM + 32 + 32;
+            cfg.critic.hidden_layers = vec![LayerDef { size: 32, activation: Activation::Tanh }];
+            cfg.policy_sigma = 0.3;
+            cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+                state_dim: STATE_DIM,
+                action_dim: ACTION_DIM,
+                hidden_layers: vec![
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                ],
+                lr: 3e-3,
+            });
+            cfg.alpha_lr = 3e-3;
+            cfg.replay_training_capacity = 50_000;
+            cfg.replay_recent_capacity = 0;
+            cfg.replay_positive_only = false;
+            cfg.replay_batch_size = 128;
+            cfg.learning_starts = 512;
+            cfg.target_entropy = Some(-(ACTION_DIM as f64));
+            cfg.polyak_tau = 0.005;
+            cfg.gamma = GAMMA;
+            cfg.gae_lambda = None;
+            cfg.td_steps = 0;
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42)
+                .expect("diagnose_sac_horizon_vs_boundary: interior agent construction must succeed")
+        };
+
+        // ── Deterministic rollout for the multi-step task ─────────────────────
+        // Returns (total discounted return, final |x|).
+        let det_rollout_interior =
+            |agent: &PcActorCritic, x0: f64| -> (f64, f64) {
+                let mut x = x0;
+                let mut ret = 0.0_f64;
+                let mut disc = 1.0_f64;
+                for t in 0..H {
+                    let s = vec![x, 0.0, 0.0];
+                    let mu_raw = agent.actor_mu_raw_for_test(&s);
+                    let a_sq = mu_raw[0].tanh();
+                    let x_next = step_x(x, a_sq);
+                    let is_last = t == H - 1;
+                    ret += disc * reward_multistep(a_sq, x_next, is_last);
+                    disc *= GAMMA;
+                    x = x_next;
+                }
+                (ret, x.abs())
+            };
+
+        // ── n-step critic update (in-test prototype, no production change) ────
+        //
+        // y_{t0} = Σ_{i<n} γ^i r_{t0+i}
+        //        + γ^n (1−done) (min(q1_t,q2_t)(s_{t0+n}, a') − α·logπ(a'))
+        //
+        // Updates q1 and q2 via update_scaled at (s_{t0}, a_{squashed,t0}, y).
+        let nstep_critic_update_interior =
+            |agent: &mut PcActorCritic,
+             episodes: &[Vec<ReplayTransition>],
+             batch_indices: &[(usize, usize)],
+             n: usize| {
+                let batch_n = batch_indices.len() as f64;
+                let lr_scale = 1.0 / batch_n;
+                let gamma = agent.config.gamma;
+                let alpha = agent.alpha();
+                let mut targets: Vec<(Vec<f64>, Vec<f64>, f64)> = Vec::new();
+
+                for &(ep_idx, t0) in batch_indices {
+                    let ep = &episodes[ep_idx];
+                    if t0 >= ep.len() {
+                        continue;
+                    }
+                    let a_raw_t0 = match &ep[t0].action {
+                        ReplayAction::Continuous(v) => v.clone(),
+                        ReplayAction::Discrete(_) => continue,
+                    };
+                    let a_sq_t0: Vec<f64> = a_raw_t0.iter().map(|v| v.tanh()).collect();
+
+                    let actual_n = n.min(ep.len() - t0);
+                    let mut ret = 0.0_f64;
+                    let mut discount = 1.0_f64;
+                    let mut terminal = false;
+                    for i in 0..actual_n {
+                        let ti = t0 + i;
+                        ret += discount * ep[ti].reward;
+                        discount *= gamma;
+                        if ep[ti].done {
+                            terminal = true;
+                            break;
+                        }
+                    }
+
+                    let last_idx = t0 + actual_n - 1;
+                    let bootstrap = if terminal {
+                        0.0
+                    } else if last_idx < ep.len() {
+                        let s_next = ep[last_idx].next_state.clone();
+                        let y_next = {
+                            let infer = agent.actor.infer(&s_next);
+                            agent.backend.vec_to_vec(&infer.y_conv)
+                        };
+                        let (mu_n, ls_n) = split_mu_log_sigma(&y_next, ACTION_DIM);
+                        let (a_next_raw, a_next) =
+                            sample_squashed_action(&mu_n, &ls_n, &mut agent.rng);
+                        let logp_next = squashed_log_prob(&mu_n, &ls_n, &a_next_raw);
+                        let q1t = agent.q1_target.as_ref().map(|q| q.forward(&s_next, &a_next));
+                        let q2t = agent.q2_target.as_ref().map(|q| q.forward(&s_next, &a_next));
+                        match (q1t, q2t) {
+                            (Some(v1), Some(v2))
+                                if v1.is_finite() && v2.is_finite() && logp_next.is_finite() =>
+                            {
+                                v1.min(v2) - alpha * logp_next
+                            }
+                            _ => continue,
+                        }
+                    } else {
+                        continue;
+                    };
+
+                    let y = ret + discount * bootstrap;
+                    if !y.is_finite() {
+                        continue;
+                    }
+                    targets.push((ep[t0].state.clone(), a_sq_t0, y));
+                }
+
+                for (state, a_sq, y) in &targets {
+                    let _l1 = agent
+                        .q1
+                        .as_mut()
+                        .unwrap()
+                        .update_scaled(state, a_sq, *y, lr_scale);
+                    let _l2 = agent
+                        .q2
+                        .as_mut()
+                        .unwrap()
+                        .update_scaled(state, a_sq, *y, lr_scale);
+                }
+            };
+
+        // ── Cell runner for INTERIOR-MULTISTEP and INTERIOR-MULTISTEP-NSTEP ──
+        //
+        // Returns (per-probe (discounted_return, final_abs_x, mu_det), mean_return,
+        //          mean_final_abs_x, final_alpha).
+        let run_interior_cell =
+            |label: &str, is_nstep: bool, n_env_steps: usize|
+             -> (Vec<(f64, f64, f64)>, f64, f64, f64) {
+                use rand::Rng as _;
+                let mut agent = build_agent_interior();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+                let probe_interval = n_env_steps / 6;
+                let nstep_n = H; // n = min(H, 12) = 12 = H
+                let batch_size = 128_usize;
+                let warmup = 512_usize;
+
+                // Episode storage.
+                let mut episodes: Vec<Vec<ReplayTransition>> = Vec::new();
+                let mut flat_buf: Vec<(usize, usize)> = Vec::new(); // (ep_idx, step_idx)
+                let mut flat_transitions: Vec<ReplayTransition> = Vec::new();
+                let max_flat = 50_000_usize;
+                let mut env_step = 0_usize;
+
+                println!(
+                    "\n\n══ Cell {label}  H={H}  n={nstep_n}  ({n_env_steps} env steps) ══"
+                );
+
+                'outer: loop {
+                    // Sample start from probe_x or random.
+                    let x0 = {
+                        let i = rng.gen_range(0_usize..probe_x.len());
+                        probe_x[i]
+                    };
+                    let mut x = x0;
+                    let mut ep: Vec<ReplayTransition> = Vec::with_capacity(H);
+
+                    for t in 0..H {
+                        let s = vec![x, 0.0, 0.0];
+                        let mu_raw = agent.actor_mu_raw_for_test(&s);
+                        let log_sigma = agent.actor_log_sigma_for_test(&s);
+                        let (a_raw, a_sq_vec) =
+                            sample_squashed_action(&mu_raw, &log_sigma, &mut agent.rng);
+                        let a_sq = a_sq_vec[0];
+                        let x_next = step_x(x, a_sq);
+                        let is_last = t == H - 1;
+                        let r = reward_multistep(a_sq, x_next, is_last);
+
+                        let trans = ReplayTransition {
+                            state: s,
+                            action: ReplayAction::Continuous(a_raw),
+                            reward: r,
+                            next_state: vec![x_next, 0.0, 0.0],
+                            done: is_last,
+                            valid_actions: None,
+                        };
+                        if flat_transitions.len() >= max_flat {
+                            flat_transitions.remove(0);
+                        }
+                        flat_transitions.push(trans.clone());
+                        ep.push(trans);
+                        x = x_next;
+                        env_step += 1;
+                        if env_step >= n_env_steps {
+                            episodes.push(ep);
+                            break 'outer;
+                        }
+                    }
+
+                    let ep_idx = episodes.len();
+                    for step_idx in 0..ep.len() {
+                        flat_buf.push((ep_idx, step_idx));
+                        if flat_buf.len() > max_flat {
+                            flat_buf.remove(0);
+                        }
+                    }
+                    episodes.push(ep);
+
+                    let buf_len = if is_nstep {
+                        flat_buf.len()
+                    } else {
+                        flat_transitions.len()
+                    };
+                    if buf_len < warmup {
+                        continue;
+                    }
+
+                    use rand::seq::SliceRandom;
+                    if is_nstep {
+                        let mut indices: Vec<usize> = (0..flat_buf.len()).collect();
+                        indices.shuffle(&mut rng);
+                        let batch_idx: Vec<(usize, usize)> = indices
+                            .iter()
+                            .take(batch_size)
+                            .map(|&i| flat_buf[i])
+                            .collect();
+                        nstep_critic_update_interior(&mut agent, &episodes, &batch_idx, nstep_n);
+                    } else {
+                        let mut idx: Vec<usize> = (0..flat_transitions.len()).collect();
+                        idx.shuffle(&mut rng);
+                        let batch: Vec<ReplayTransition> = idx
+                            .iter()
+                            .take(batch_size)
+                            .map(|&i| flat_transitions[i].clone())
+                            .collect();
+                        agent.sac_critic_update(&batch);
+                    }
+
+                    // Actor + temperature + polyak — identical for both modes.
+                    {
+                        use rand::seq::SliceRandom;
+                        let mut idx: Vec<usize> = (0..flat_transitions.len()).collect();
+                        idx.shuffle(&mut rng);
+                        let actor_batch: Vec<ReplayTransition> = idx
+                            .iter()
+                            .take(batch_size.min(flat_transitions.len()))
+                            .map(|&i| flat_transitions[i].clone())
+                            .collect();
+                        if !actor_batch.is_empty() {
+                            let (_d, logp_opt) = agent.sac_actor_update(&actor_batch);
+                            if let Some(logp) = logp_opt {
+                                agent.sac_temperature_update(logp);
+                            }
+                            agent.polyak_update_targets();
+                        }
+                    }
+
+                    // Periodic probe reporting.
+                    if env_step > 0 && env_step % probe_interval < H {
+                        let mut sum_ret = 0.0_f64;
+                        let mut sum_abs_x = 0.0_f64;
+                        for &x0p in &probe_x {
+                            let (ret, abs_x) = det_rollout_interior(&agent, x0p);
+                            sum_ret += ret;
+                            sum_abs_x += abs_x;
+                        }
+                        let n = probe_x.len() as f64;
+                        println!(
+                            "  step={env_step:>7}  mean_det_return={:+.4}  mean_final|x|={:.4}  \
+                             alpha={:.4}  skipped_c={}  skipped_a={}",
+                            sum_ret / n,
+                            sum_abs_x / n,
+                            agent.alpha_for_test(),
+                            agent.sac_skipped_critic_updates(),
+                            agent.sac_skipped_actor_updates(),
+                        );
+                    }
+                }
+
+                // Final metrics.
+                let mut per_probe: Vec<(f64, f64, f64)> = Vec::new();
+                let mut sum_ret = 0.0_f64;
+                let mut sum_abs_x = 0.0_f64;
+                for &x0p in &probe_x {
+                    let s = vec![x0p, 0.0, 0.0];
+                    let mu_raw = agent.actor_mu_raw_for_test(&s);
+                    let mu_det = mu_raw[0].tanh();
+                    let (ret, abs_x) = det_rollout_interior(&agent, x0p);
+                    per_probe.push((ret, abs_x, mu_det));
+                    sum_ret += ret;
+                    sum_abs_x += abs_x;
+                }
+                let n = probe_x.len() as f64;
+                let mean_ret = sum_ret / n;
+                let mean_abs_x = sum_abs_x / n;
+                let final_alpha = agent.alpha_for_test();
+
+                println!(
+                    "\n  FINAL {label}: mean_det_return={:+.4}  mean_final|x|={:.4}  \
+                     alpha={:.4}  skipped_c={}  skipped_a={}",
+                    mean_ret,
+                    mean_abs_x,
+                    final_alpha,
+                    agent.sac_skipped_critic_updates(),
+                    agent.sac_skipped_actor_updates(),
+                );
+                // Reference values printed per start.
+                println!("  Per-start detail (det_return  final|x|  mu_det  R_random  R_greedy):");
+                for (i, (&x0p, (ret, abs_x, mu_det))) in
+                    probe_x.iter().zip(per_probe.iter()).enumerate()
+                {
+                    let rr = r_random(x0p);
+                    let rg = r_greedy(x0p);
+                    println!(
+                        "    x0[{i}]={x0p:+.2}  det_return={ret:+.6}  final|x|={abs_x:.4}  \
+                         mu_det={mu_det:+.4}  R_random={rr:+.4}  R_greedy={rg:+.4}  \
+                         beats_random={}",
+                        *ret > rr
+                    );
+                }
+
+                (per_probe, mean_ret, mean_abs_x, final_alpha)
+            };
+
+        // ════════════════════════════════════════════════════════════════════
+        // Cell 1: INTERIOR-MULTISTEP (single-step SAC critic, interior optima)
+        // ════════════════════════════════════════════════════════════════════
+        let (pp_im, mean_ret_im, mean_abs_x_im, alpha_im) =
+            run_interior_cell("INTERIOR-MULTISTEP(single-step-SAC)", false, 16_000);
+
+        // ════════════════════════════════════════════════════════════════════
+        // Cell 2: INTERIOR-MULTISTEP-NSTEP (n-step Q-target, interior optima)
+        // ════════════════════════════════════════════════════════════════════
+        let (pp_nstep, mean_ret_nstep, mean_abs_x_nstep, alpha_nstep) =
+            run_interior_cell("INTERIOR-MULTISTEP-NSTEP(n-step-critic)", true, 16_000);
+
+        // ════════════════════════════════════════════════════════════════════
+        // Cell 3: BOUNDARY-SINGLESTEP (single-step bandit, a*=±0.9)
+        // ════════════════════════════════════════════════════════════════════
+        //
+        // Same setup as diagnose_sac_contextual_bandit (K=4 states, interior
+        // a*) but ONLY the targets change to boundary ±0.9.
+        //
+        // Metric: per-state mean|mu_det − a*|; does μ reach a*≈±0.9?
+
+        // 4 states → 2 negative targets, 2 positive.
+        let probe_states_bnd: Vec<Vec<f64>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let bnd_targets: [f64; 4] = [-0.9, -0.9, 0.9, 0.9];
+
+        let reward_bnd = |a: f64, a_star: f64| -> f64 { -(a - a_star).powi(2) };
+
+        // Build agent (same topology as contextual-bandit: actor [32,32], Q [32,32]).
+        let mut agent_bnd = {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.actor.input_size = STATE_DIM;
+            cfg.actor.hidden_layers = vec![
+                LayerDef { size: 32, activation: Activation::Tanh },
+                LayerDef { size: 32, activation: Activation::Tanh },
+            ];
+            cfg.actor.output_size = 2 * ACTION_DIM;
+            cfg.actor.output_activation = crate::activation::Activation::Linear;
+            cfg.actor.max_steps = 5;
+            cfg.actor.lr_weights = 3e-3;
+            cfg.critic.input_size = STATE_DIM + 32 + 32;
+            cfg.critic.hidden_layers =
+                vec![LayerDef { size: 32, activation: Activation::Tanh }];
+            cfg.policy_sigma = 0.3;
+            cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+                state_dim: STATE_DIM,
+                action_dim: ACTION_DIM,
+                hidden_layers: vec![
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                    LayerDef { size: 32, activation: Activation::Tanh },
+                ],
+                lr: 3e-3,
+            });
+            cfg.alpha_lr = 3e-3;
+            cfg.replay_training_capacity = 50_000;
+            cfg.replay_recent_capacity = 0;
+            cfg.replay_positive_only = false;
+            cfg.replay_batch_size = 128;
+            cfg.learning_starts = 512;
+            cfg.target_entropy = Some(-(ACTION_DIM as f64));
+            cfg.polyak_tau = 0.005;
+            cfg.gamma = GAMMA;
+            cfg.gae_lambda = None;
+            cfg.td_steps = 0;
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42)
+                .expect("diagnose_sac_horizon_vs_boundary: boundary agent construction must succeed")
+        };
+
+        let n_steps_bnd = 20_000_usize;
+        let probe_interval_bnd = 2_000_usize;
+
+        println!(
+            "\n\n══ Cell BOUNDARY-SINGLESTEP  (a*=±0.9, {n_steps_bnd} steps) ══"
+        );
+
+        {
+            use rand::seq::SliceRandom;
+            let mut rng_bnd = rand::rngs::StdRng::seed_from_u64(42);
+            let mut buf_bnd: Vec<ReplayTransition> = Vec::with_capacity(50_000);
+
+            for step in 0..n_steps_bnd {
+                let k = step % probe_states_bnd.len();
+                let s = probe_states_bnd[k].clone();
+                let a_star = bnd_targets[k];
+
+                let mu_bnd = agent_bnd.actor_mu_raw_for_test(&s);
+                let ls_bnd = agent_bnd.actor_log_sigma_for_test(&s);
+                let (a_raw_bnd, a_sq_bnd) =
+                    sample_squashed_action(&mu_bnd, &ls_bnd, &mut agent_bnd.rng);
+                let r = reward_bnd(a_sq_bnd[0], a_star);
+
+                let t = ReplayTransition {
+                    state: s.clone(),
+                    action: ReplayAction::Continuous(a_raw_bnd),
+                    reward: r,
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                };
+                if buf_bnd.len() >= 50_000 {
+                    buf_bnd.remove(0);
+                }
+                buf_bnd.push(t);
+
+                if buf_bnd.len() >= 512 {
+                    let mut indices: Vec<usize> = (0..buf_bnd.len()).collect();
+                    indices.shuffle(&mut rng_bnd);
+                    let batch: Vec<ReplayTransition> = indices
+                        .iter()
+                        .take(128)
+                        .map(|&i| buf_bnd[i].clone())
+                        .collect();
+                    agent_bnd.sac_critic_update(&batch);
+                    let (_d, logp_opt) = agent_bnd.sac_actor_update(&batch);
+                    if let Some(logp) = logp_opt {
+                        agent_bnd.sac_temperature_update(logp);
+                    }
+                    agent_bnd.polyak_update_targets();
+                }
+
+                if (step + 1) % probe_interval_bnd == 0 || step + 1 == n_steps_bnd {
+                    let mut sum_err = 0.0_f64;
+                    println!("\n  --- Step {} ---  alpha={:.4}", step + 1, agent_bnd.alpha_for_test());
+                    for (k2, s2) in probe_states_bnd.iter().enumerate() {
+                        let a_star_k = bnd_targets[k2];
+                        let mu_r = agent_bnd.actor_mu_raw_for_test(s2);
+                        let ls_k = agent_bnd.actor_log_sigma_for_test(s2);
+                        let mu_det = mu_r[0].tanh();
+                        let sigma_k = ls_k[0].exp();
+                        let err = (mu_det - a_star_k).abs();
+                        sum_err += err;
+                        println!(
+                            "    s{k2}  a*={a_star_k:+.2}  mu_det={mu_det:+.4}  \
+                             |mu_det-a*|={err:.4}  sigma={sigma_k:.4}  \
+                             mu_raw={:.4}",
+                            mu_r[0]
+                        );
+                    }
+                    println!(
+                        "  >>> mean|mu_det-a*|={:.4}  skipped_c={}  skipped_a={}",
+                        sum_err / probe_states_bnd.len() as f64,
+                        agent_bnd.sac_skipped_critic_updates(),
+                        agent_bnd.sac_skipped_actor_updates(),
+                    );
+                }
+            }
+        }
+
+        // Collect final boundary metrics.
+        let mut bnd_results: Vec<(f64, f64, f64)> = Vec::new(); // (mu_det, mu_raw, sigma)
+        let mut sum_bnd_err = 0.0_f64;
+        for (k2, s2) in probe_states_bnd.iter().enumerate() {
+            let a_star_k = bnd_targets[k2];
+            let mu_r = agent_bnd.actor_mu_raw_for_test(s2);
+            let ls_k = agent_bnd.actor_log_sigma_for_test(s2);
+            let mu_det = mu_r[0].tanh();
+            let sigma_k = ls_k[0].exp();
+            let err = (mu_det - a_star_k).abs();
+            sum_bnd_err += err;
+            bnd_results.push((mu_det, mu_r[0], sigma_k));
+            let _ = k2;
+        }
+        let mean_bnd_err = sum_bnd_err / probe_states_bnd.len() as f64;
+        let alpha_bnd = agent_bnd.alpha_for_test();
+
+        // ════════════════════════════════════════════════════════════════════
+        // Final summary table
+        // ════════════════════════════════════════════════════════════════════
+        println!(
+            "\n\n╔══════════════════════════════════════════════════════════════════════════════╗"
+        );
+        println!(
+            "║  FINAL SUMMARY — SAC Horizon-vs-Boundary Disambiguation (Step-0)           ║"
+        );
+        println!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+
+        // Cell 1: INTERIOR-MULTISTEP
+        println!("║  Cell 1: INTERIOR-MULTISTEP (single-step SAC, H=12, interior optima)");
+        println!("║    {:>6}  {:>12}  {:>10}  {:>8}  {:>8}  {:>8}",
+                 "x0", "det_return", "final|x|", "mu_det", "R_random", "R_greedy");
+        for (i, (&x0p, (ret, abs_x, mu_det))) in
+            probe_x.iter().zip(pp_im.iter()).enumerate()
+        {
+            let rr = r_random(x0p);
+            let rg = r_greedy(x0p);
+            println!(
+                "║    [{i}] x0={x0p:+.2}  det_return={ret:+.6}  final|x|={abs_x:.4}  \
+                 mu_det={mu_det:+.4}  R_random={rr:+.4}  R_greedy={rg:+.4}  beats_random={}",
+                *ret > rr
+            );
+        }
+        println!(
+            "║    MEAN: det_return={:+.4}  mean_final|x|={:.4}  alpha={:.4}",
+            mean_ret_im, mean_abs_x_im, alpha_im
+        );
+        println!("║  ──────────────────────────────────────────────────────────────────────────");
+
+        // Cell 2: INTERIOR-MULTISTEP-NSTEP
+        println!("║  Cell 2: INTERIOR-MULTISTEP-NSTEP (n-step SAC, H=12, n=12, interior optima)");
+        println!("║    {:>6}  {:>12}  {:>10}  {:>8}  {:>8}  {:>8}",
+                 "x0", "det_return", "final|x|", "mu_det", "R_random", "R_greedy");
+        for (i, (&x0p, (ret, abs_x, mu_det))) in
+            probe_x.iter().zip(pp_nstep.iter()).enumerate()
+        {
+            let rr = r_random(x0p);
+            let rg = r_greedy(x0p);
+            println!(
+                "║    [{i}] x0={x0p:+.2}  det_return={ret:+.6}  final|x|={abs_x:.4}  \
+                 mu_det={mu_det:+.4}  R_random={rr:+.4}  R_greedy={rg:+.4}  beats_random={}",
+                *ret > rr
+            );
+        }
+        println!(
+            "║    MEAN: det_return={:+.4}  mean_final|x|={:.4}  alpha={:.4}",
+            mean_ret_nstep, mean_abs_x_nstep, alpha_nstep
+        );
+        println!("║  ──────────────────────────────────────────────────────────────────────────");
+
+        // Cell 3: BOUNDARY-SINGLESTEP
+        println!("║  Cell 3: BOUNDARY-SINGLESTEP (single-step SAC, a*=±0.9)");
+        println!("║    {:>4}  {:>6}  {:>8}  {:>8}  {:>8}",
+                 "a*", "mu_raw", "mu_det", "sigma", "|mu-a*|");
+        for (k2, (a_star_k, (mu_det, mu_raw, sigma_k))) in
+            bnd_targets.iter().zip(bnd_results.iter()).enumerate()
+        {
+            let err = (mu_det - a_star_k).abs();
+            println!(
+                "║    s{k2}  a*={a_star_k:+.2}  mu_raw={mu_raw:+.4}  mu_det={mu_det:+.4}  \
+                 sigma={sigma_k:.4}  |mu_det-a*|={err:.4}  \
+                 reached_target={}",
+                err < 0.15
+            );
+        }
+        println!(
+            "║    MEAN: mean|mu_det-a*|={:.4}  alpha={:.4}",
+            mean_bnd_err, alpha_bnd
+        );
+        println!("║  ──────────────────────────────────────────────────────────────────────────");
+
+        println!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+        println!("║  INTERPRETATION GUIDE:");
+        println!("║  Cell 1+2 det_return: sum of (action_cost + terminal) under det policy.");
+        println!("║    R_random = a=0 always → return = -x0^2 (action cost 0, position penalty).");
+        println!("║    R_greedy = bang-bang toward 0 → incurs action cost, reaches 0 fast.");
+        println!("║    A converged interior policy should beat R_random; approach interior opt.");
+        println!("║  Cell 3: mean|mu_det-a*| < 0.15 → μ reached boundary ≈ ±0.9.");
+        println!("║    If Cell 1/2 converge but Cell 3 does NOT → failure is BOUNDARY-commitment.");
+        println!("║    If Cell 1 fails but Cell 2 converges → failure is HORIZON/credit.");
+        println!(
+            "╚══════════════════════════════════════════════════════════════════════════════╝"
+        );
+
+        // Loose completeness assertions — measurement only, no convergence guarantee.
+        for (i, (ret, abs_x, mu_det)) in pp_im.iter().enumerate() {
+            assert!(ret.is_finite(), "INTERIOR-MULTISTEP x0[{i}]: det_return non-finite");
+            assert!(abs_x.is_finite(), "INTERIOR-MULTISTEP x0[{i}]: final|x| non-finite");
+            assert!(mu_det.is_finite(), "INTERIOR-MULTISTEP x0[{i}]: mu_det non-finite");
+        }
+        assert!(mean_ret_im.is_finite(), "INTERIOR-MULTISTEP: mean_det_return non-finite");
+        assert!(mean_abs_x_im.is_finite(), "INTERIOR-MULTISTEP: mean_final|x| non-finite");
+        assert!(alpha_im.is_finite() && alpha_im > 0.0, "INTERIOR-MULTISTEP: alpha non-finite or zero");
+
+        for (i, (ret, abs_x, mu_det)) in pp_nstep.iter().enumerate() {
+            assert!(ret.is_finite(), "INTERIOR-MULTISTEP-NSTEP x0[{i}]: det_return non-finite");
+            assert!(abs_x.is_finite(), "INTERIOR-MULTISTEP-NSTEP x0[{i}]: final|x| non-finite");
+            assert!(mu_det.is_finite(), "INTERIOR-MULTISTEP-NSTEP x0[{i}]: mu_det non-finite");
+        }
+        assert!(mean_ret_nstep.is_finite(), "INTERIOR-MULTISTEP-NSTEP: mean_det_return non-finite");
+        assert!(
+            mean_abs_x_nstep.is_finite(),
+            "INTERIOR-MULTISTEP-NSTEP: mean_final|x| non-finite"
+        );
+        assert!(
+            alpha_nstep.is_finite() && alpha_nstep > 0.0,
+            "INTERIOR-MULTISTEP-NSTEP: alpha non-finite or zero"
+        );
+
+        for (k2, (mu_det, mu_raw, sigma_k)) in bnd_results.iter().enumerate() {
+            assert!(
+                mu_det.is_finite(),
+                "BOUNDARY-SINGLESTEP s{k2}: mu_det non-finite"
+            );
+            assert!(
+                mu_raw.is_finite(),
+                "BOUNDARY-SINGLESTEP s{k2}: mu_raw non-finite"
+            );
+            assert!(
+                sigma_k.is_finite() && *sigma_k > 0.0,
+                "BOUNDARY-SINGLESTEP s{k2}: sigma non-finite or zero"
+            );
+        }
+        assert!(mean_bnd_err.is_finite(), "BOUNDARY-SINGLESTEP: mean|mu_det-a*| non-finite");
+        assert!(
+            alpha_bnd.is_finite() && alpha_bnd > 0.0,
+            "BOUNDARY-SINGLESTEP: alpha non-finite or zero"
+        );
+    }
 }
