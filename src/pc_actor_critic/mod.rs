@@ -557,6 +557,33 @@ fn sample_squashed_action(
     (a_raw, a)
 }
 
+/// Draws a uniform-random action in the squashed space for SAC warmup.
+///
+/// Each action component `a_j` is sampled from `Uniform(−0.999, 0.999)`,
+/// keeping coverage uniform in action space. The pre-squash value is computed
+/// as `a_raw_j = atanh(a_j)`. Sampling in the squashed space (then `atanh`)
+/// rather than sampling `a_raw` uniformly avoids the clustering of
+/// `tanh(a_raw)` at ±1 that arises from uniform sampling in raw space.
+///
+/// # Parameters
+///
+/// * `action_dim` — number of action components.
+/// * `rng` — any `rand::Rng` implementor (agent's seeded `StdRng`).
+///
+/// # Returns
+///
+/// `(a_raw, a)` where `a_raw` holds `atanh(a_j)` and `a ∈ (−0.999, 0.999)`.
+fn sample_uniform_squashed_action(
+    action_dim: usize,
+    rng: &mut impl rand::Rng,
+) -> (Vec<f64>, Vec<f64>) {
+    let squashed: Vec<f64> = (0..action_dim)
+        .map(|_| rng.gen_range(-0.999_f64..=0.999_f64))
+        .collect();
+    let a_raw: Vec<f64> = squashed.iter().map(|&a| a.atanh()).collect();
+    (a_raw, squashed)
+}
+
 impl<L: LinAlg> PcActorCritic<L> {
     /// Builds the four SAC Q-critic slots (`q1`, `q2`, `q1_target`, `q2_target`).
     ///
@@ -3086,12 +3113,7 @@ impl<L: LinAlg> PcActorCritic<L> {
         let (a_raw, squashed) =
             if self.config.learning_starts > 0 && buf_len < self.config.learning_starts {
                 // Warmup path: uniform random in the squashed space.
-                use rand::Rng as _;
-                let squashed: Vec<f64> = (0..action_dim)
-                    .map(|_| self.rng.gen_range(-0.999_f64..=0.999_f64))
-                    .collect();
-                let a_raw: Vec<f64> = squashed.iter().map(|&a| a.atanh()).collect();
-                (a_raw, squashed)
+                sample_uniform_squashed_action(action_dim, &mut self.rng)
             } else {
                 // Normal path: sample from the policy network.
                 let (mu, log_sigma) = split_mu_log_sigma(&y_conv, action_dim);
