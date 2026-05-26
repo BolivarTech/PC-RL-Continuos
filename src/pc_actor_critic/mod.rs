@@ -15612,6 +15612,74 @@ mod tests {
         );
     }
 
+    /// Public SAC accessors (`sac_alpha`, `sac_q_min`, `sac_action_gradient_min`)
+    /// return `Some` in SAC mode and `None` in discrete mode, and the gradient
+    /// returned by `sac_action_gradient_min` matches the `action_gradient` of
+    /// whichever live Q-critic currently realises the minimum at `(s, a)`.
+    #[test]
+    fn test_sac_public_accessors_discriminate_mode_and_match_min_critic() {
+        // SAC mode: all three accessors return Some.
+        // `continuous_sac_config()` defaults to actor.input_size = 9 ⇒ state_dim = 9.
+        let agent_sac =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), continuous_sac_config(), 42).unwrap();
+        let state = vec![0.1_f64, -0.2, 0.3, 0.0, 0.5, -0.1, 0.4, -0.3, 0.2];
+        let action = vec![0.4_f64];
+
+        let alpha = agent_sac
+            .sac_alpha()
+            .expect("sac_alpha must be Some in SAC mode");
+        assert!(
+            alpha.is_finite() && alpha > 0.0,
+            "α must be finite and positive"
+        );
+        // log_alpha_init defaults to 0.0 ⇒ α₀ = exp(0) = 1.0.
+        assert!(
+            (alpha - 1.0).abs() < 1e-9,
+            "α₀ must be 1.0 (log_alpha_init=0)"
+        );
+
+        let q_min = agent_sac
+            .sac_q_min(&state, &action)
+            .expect("sac_q_min must be Some in SAC mode");
+        assert!(q_min.is_finite(), "Q_min must be finite");
+
+        let grad = agent_sac
+            .sac_action_gradient_min(&state, &action)
+            .expect("sac_action_gradient_min must be Some in SAC mode");
+        assert_eq!(grad.len(), 1, "gradient length must equal action_dim (=1)");
+        assert!(grad[0].is_finite(), "gradient component must be finite");
+
+        // Identify which critic realises the min and check the gradient agrees.
+        let q1 = agent_sac.q1.as_ref().expect("q1 must be Some in SAC mode");
+        let q2 = agent_sac.q2.as_ref().expect("q2 must be Some in SAC mode");
+        let v1 = q1.forward(&state, &action);
+        let v2 = q2.forward(&state, &action);
+        let expected = if v1 <= v2 {
+            q1.action_gradient(&state, &action)
+        } else {
+            q2.action_gradient(&state, &action)
+        };
+        assert_eq!(grad, expected, "gradient must come from min(Q1,Q2) critic");
+
+        // Discrete mode: all three accessors return None (no twin Q-critics).
+        let agent_disc =
+            PcActorCritic::<CpuLinAlg>::new(CpuLinAlg::new(), default_config(), 42).unwrap();
+        assert!(
+            agent_disc.sac_alpha().is_none(),
+            "sac_alpha must be None in discrete mode"
+        );
+        assert!(
+            agent_disc.sac_q_min(&state, &action).is_none(),
+            "sac_q_min must be None in discrete mode"
+        );
+        assert!(
+            agent_disc
+                .sac_action_gradient_min(&state, &action)
+                .is_none(),
+            "sac_action_gradient_min must be None in discrete mode"
+        );
+    }
+
     // ── Fix 2: apply_config rejects q_critic topology change ─────────────
 
     /// `apply_config` must return `Err(ConfigValidation)` when the new config
@@ -17696,6 +17764,295 @@ mod tests {
             warmup_min < -0.5 && warmup_max > 0.5,
             "warmup agent (learning_starts=600) must spread below −0.5 and above 0.5 in 100 steps; \
              got min={warmup_min:.4}, max={warmup_max:.4}"
+        );
+    }
+
+    // ── Step-0 diagnostic: deterministic-actor saturation lock ───────────────
+    //
+    // Characterises the v6.0.0 SAC failure mode the downstream PC-Pendulum
+    // harness surfaced at B10 (results_v6_sac_b10_v2.md): the STOCHASTIC policy
+    // SOLVES (s44 best_train −4) but the DETERMINISTIC actor converges to a
+    // CONSTANT saturated action — |μ_raw|→~2, state-independent — while σ
+    // shrinks fine. Two competing mechanisms could produce that:
+    //
+    //   (H-Jac)  Pathwise gradient attenuation at saturation: ∂a/∂a_raw =
+    //            1 − tanh²(a_raw) collapses (~0.07 at |a_raw|=2), and once α
+    //            is annealed low for commitment the entropy restoring term
+    //            (≈ 2α) also vanishes — so neither force can move μ off the
+    //            boundary toward the per-state argmax_a Q.
+    //   (H-Rep)  Actor representation collapses to state-INDEPENDENT μ(s):
+    //            the network simply stops conditioning on the state at
+    //            saturation regardless of the Jacobian.
+    //
+    // Probe task: state-dependent BOUNDARY-OPTIMUM contextual bandit, 4 probe
+    // states, a*(s) ∈ {+1, −1, +1, −1} (the optima ARE at the squash boundary,
+    // so the deterministic policy MUST commit to saturated *state-dependent*
+    // actions to be correct — exactly the Pendulum regime). r = 1 − (a − a*)²
+    // (max = 1 at the optimum). Done=true → single-step Bellman targets.
+    //
+    // Compare two regimes that differ ONLY in target_entropy (the commitment
+    // lever the harness sweeps):
+    //   • EXPLORE_HIGH  target_entropy=−0.5 → α stays high → entropy ≈2α
+    //                   dominates → policy should stay state-aware but not
+    //                   commit (μ moderate, state-variance HIGH).
+    //   • COMMIT_LOW    target_entropy=−4.0 → α anneals low → entropy weak →
+    //                   if H-Jac holds, μ drifts to saturation and locks
+    //                   state-INDEPENDENT (state-variance COLLAPSES); if
+    //                   H-Rep, state-variance collapses regardless of α.
+    //
+    // Per-probe telemetry (every PROBE_INTERVAL steps): for each probe state
+    // s_k we log μ_raw(s_k), μ_det = tanh(μ_raw), |∇_a Q_min(s, μ_det)|,
+    // 2α (entropy gradient magnitude), and the per-step variance of μ_raw
+    // across the four states (state-dependence proxy).
+    //
+    // Distinguishing signature:
+    //   • H-Jac wins  → var(μ_raw across states) HIGH in EXPLORE_HIGH but
+    //                   COLLAPSES in COMMIT_LOW; |∇_a Q| at the deterministic
+    //                   action shrinks vs |∇_a Q| at interior actions
+    //                   (Jacobian attenuation visible).
+    //   • H-Rep wins  → var(μ_raw across states) is LOW in BOTH regimes
+    //                   regardless of |∇_a Q| / α — the network has lost
+    //                   state-conditioning irrespective of saturation.
+    //
+    // The test is informational (prints CSV-like rows), not a pass/fail
+    // assertion — it gathers the evidence the harness can't gather (Q-critics
+    // were `pub(crate)`, now exposed via `sac_action_gradient_min` / `sac_q_min`
+    // / `sac_alpha` for the same instrumentation downstream).
+    //
+    // Run with:
+    //   cargo nextest run --release --run-ignored all diagnose_sac_saturation_lock --no-capture
+    //   cargo test --release -- --ignored --nocapture diagnose_sac_saturation_lock
+    #[test]
+    #[ignore = "Step-0 SAC saturation-lock characterisation"]
+    #[allow(clippy::type_complexity)]
+    fn diagnose_sac_saturation_lock() {
+        use crate::pc_actor_critic::replay::{Action as ReplayAction, ReplayTransition};
+        use rand::SeedableRng;
+
+        // ── Task ─────────────────────────────────────────────────────────────
+        // 4 probe states; BOUNDARY-saturated state-dependent optima.
+        let probe_states: Vec<Vec<f64>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 0.0],
+        ];
+        let true_opt: [f64; 4] = [1.0, -1.0, 1.0, -1.0];
+        // Reward in [0, 1]; max 1 at a = a*; r ≈ 0 at a = −a*.  Smooth, single-step.
+        let reward_fn = |a: f64, a_star: f64| -> f64 {
+            let d = a - a_star;
+            (1.0 - d * d).max(-3.0)
+        };
+
+        // Interior probe action (away from saturation) — for the |∇_a Q| ratio.
+        const A_INTERIOR: f64 = 0.0;
+
+        // ── Build helper: SAC agent with given target_entropy ────────────────
+        let build_agent = |target_entropy: f64| -> PcActorCritic {
+            let mut cfg = default_config();
+            cfg.action_space = ActionSpace::Continuous;
+            cfg.actor.input_size = 3;
+            cfg.actor.hidden_layers = vec![
+                LayerDef {
+                    size: 64,
+                    activation: Activation::Tanh,
+                },
+                LayerDef {
+                    size: 64,
+                    activation: Activation::Tanh,
+                },
+            ];
+            cfg.actor.output_size = 2; // μ + log_σ heads, action_dim = 1
+            cfg.actor.output_activation = Activation::Linear;
+            cfg.actor.max_steps = 5;
+            cfg.actor.lr_weights = 3e-3; // SGD-tuned lr (matches work order v2)
+            cfg.critic.input_size = 3 + 64 + 64;
+            cfg.policy_sigma = 0.3;
+            cfg.q_critic = Some(crate::q_critic::QCriticConfig {
+                state_dim: 3,
+                action_dim: 1,
+                hidden_layers: vec![
+                    LayerDef {
+                        size: 64,
+                        activation: Activation::Tanh,
+                    },
+                    LayerDef {
+                        size: 64,
+                        activation: Activation::Tanh,
+                    },
+                ],
+                lr: 3e-3,
+            });
+            cfg.replay_training_capacity = 256;
+            cfg.replay_recent_capacity = 20_000;
+            cfg.replay_batch_size = 128;
+            cfg.learning_starts = 256;
+            cfg.polyak_tau = 0.005;
+            cfg.alpha_lr = 3e-3;
+            cfg.target_entropy = Some(target_entropy);
+            cfg.gae_lambda = None;
+            cfg.td_steps = 0;
+            cfg.distillation_lambda_polyak = 0.0;
+            cfg.distillation_lambda_frozen = 0.0;
+            PcActorCritic::new(CpuLinAlg::new(), cfg, 42).expect("agent construction must succeed")
+        };
+
+        const N_STEPS: usize = 6000;
+        const PROBE_INTERVAL: usize = 1000;
+
+        // ── Per-regime run ───────────────────────────────────────────────────
+        // Returns final (mean|μ−a*|, var(μ_raw across states), mean|∇_a Q at μ_det|, α).
+        let run_regime = |mut agent: PcActorCritic, label: &str| -> (f64, f64, f64, f64) {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            let mut buf: Vec<ReplayTransition> = Vec::with_capacity(20_000);
+
+            println!(
+                "\n══════════════════════════════════════════════════════════\
+                 \n  Regime: {label}   ({N_STEPS} SAC update steps)\
+                 \n══════════════════════════════════════════════════════════\
+                 \n  Columns: step | alpha | 2α | mean|μ−a*| | var(μ_raw across states) | \
+                 mean|μ_raw| | mean|∇_aQ@μ_det| | mean|∇_aQ@0| | atten(=g@μ/g@0)"
+            );
+
+            for step in 0..N_STEPS {
+                let k = step % 4;
+                let s = probe_states[k].clone();
+                let a_star = true_opt[k];
+
+                let mu = agent.actor_mu_raw_for_test(&s);
+                let log_sigma = agent.actor_log_sigma_for_test(&s);
+                let (a_raw, a_squashed) = sample_squashed_action(&mu, &log_sigma, &mut rng);
+                let reward = reward_fn(a_squashed[0], a_star);
+
+                let t = ReplayTransition {
+                    state: s.clone(),
+                    action: ReplayAction::Continuous(a_raw),
+                    reward,
+                    next_state: s.clone(),
+                    done: true,
+                    valid_actions: None,
+                };
+                if buf.len() >= 20_000 {
+                    buf.remove(0);
+                }
+                buf.push(t);
+
+                if buf.len() >= 256 {
+                    use rand::seq::SliceRandom;
+                    let mut indices: Vec<usize> = (0..buf.len()).collect();
+                    indices.shuffle(&mut rng);
+                    let batch: Vec<ReplayTransition> =
+                        indices.iter().take(128).map(|&i| buf[i].clone()).collect();
+                    agent.sac_critic_update(&batch);
+                    let (_mean_delta, logp_opt) = agent.sac_actor_update(&batch);
+                    if let Some(logp) = logp_opt {
+                        agent.sac_temperature_update(logp);
+                    }
+                    agent.polyak_update_targets();
+                }
+
+                if (step + 1) % PROBE_INTERVAL == 0 || step + 1 == N_STEPS {
+                    let alpha = agent.alpha_for_test();
+                    let mut mu_raws = Vec::with_capacity(4);
+                    let mut sum_err = 0.0_f64;
+                    let mut sum_abs_mu = 0.0_f64;
+                    let mut sum_g_sat = 0.0_f64;
+                    let mut sum_g_int = 0.0_f64;
+                    for (k2, s2) in probe_states.iter().enumerate() {
+                        let mu_raw = agent.actor_mu_raw_for_test(s2);
+                        let mu_det = mu_raw[0].tanh();
+                        mu_raws.push(mu_raw[0]);
+                        sum_err += (mu_det - true_opt[k2]).abs();
+                        sum_abs_mu += mu_raw[0].abs();
+                        // |∇_a Q_min| at deterministic action and at interior probe.
+                        let g_sat = agent
+                            .sac_action_gradient_min(s2, &[mu_det])
+                            .expect("SAC mode → gradient present")[0]
+                            .abs();
+                        let g_int = agent
+                            .sac_action_gradient_min(s2, &[A_INTERIOR])
+                            .expect("SAC mode → gradient present")[0]
+                            .abs();
+                        sum_g_sat += g_sat;
+                        sum_g_int += g_int;
+                    }
+                    let n = probe_states.len() as f64;
+                    let mean_mu = mu_raws.iter().sum::<f64>() / n;
+                    let var_mu_raw = mu_raws.iter().map(|m| (m - mean_mu).powi(2)).sum::<f64>() / n;
+                    let mean_err = sum_err / n;
+                    let mean_abs_mu = sum_abs_mu / n;
+                    let mean_g_sat = sum_g_sat / n;
+                    let mean_g_int = sum_g_int / n;
+                    let atten = if mean_g_int > 1e-12 {
+                        mean_g_sat / mean_g_int
+                    } else {
+                        f64::NAN
+                    };
+                    println!(
+                        "  {:>5} | α={:.5} | 2α={:.5} | err={:.4} | var(μ_raw)={:.4} | \
+                         |μ_raw|={:.4} | |∇Q@μ|={:.5} | |∇Q@0|={:.5} | atten={:.3}",
+                        step + 1,
+                        alpha,
+                        2.0 * alpha,
+                        mean_err,
+                        var_mu_raw,
+                        mean_abs_mu,
+                        mean_g_sat,
+                        mean_g_int,
+                        atten,
+                    );
+                }
+            }
+
+            // Final aggregate metrics.
+            let alpha = agent.alpha_for_test();
+            let mut mu_raws = Vec::with_capacity(4);
+            let mut sum_err = 0.0_f64;
+            let mut sum_g_sat = 0.0_f64;
+            for (k2, s2) in probe_states.iter().enumerate() {
+                let mu_raw = agent.actor_mu_raw_for_test(s2);
+                let mu_det = mu_raw[0].tanh();
+                mu_raws.push(mu_raw[0]);
+                sum_err += (mu_det - true_opt[k2]).abs();
+                sum_g_sat += agent
+                    .sac_action_gradient_min(s2, &[mu_det])
+                    .expect("SAC mode → gradient present")[0]
+                    .abs();
+            }
+            let n = probe_states.len() as f64;
+            let mean_mu = mu_raws.iter().sum::<f64>() / n;
+            let var_mu_raw = mu_raws.iter().map(|m| (m - mean_mu).powi(2)).sum::<f64>() / n;
+            (sum_err / n, var_mu_raw, sum_g_sat / n, alpha)
+        };
+
+        // ── Run both regimes ─────────────────────────────────────────────────
+        let agent_high = build_agent(-0.5);
+        let (err_high, var_high, g_high, alpha_high) =
+            run_regime(agent_high, "EXPLORE_HIGH te=-0.5");
+
+        let agent_low = build_agent(-4.0);
+        let (err_low, var_low, g_low, alpha_low) = run_regime(agent_low, "COMMIT_LOW te=-4.0");
+
+        // ── Verdict (informational, not asserted) ────────────────────────────
+        println!(
+            "\n══════════════════════════════════════════════════════════\
+             \n  DIAGNOSIS\
+             \n══════════════════════════════════════════════════════════\
+             \n  EXPLORE_HIGH:  err={err_high:.4}  var(μ_raw)={var_high:.4}  \
+             |∇Q@μ|={g_high:.5}  α={alpha_high:.5}\
+             \n  COMMIT_LOW:    err={err_low:.4}   var(μ_raw)={var_low:.4}   \
+             |∇Q@μ|={g_low:.5}   α={alpha_low:.5}\
+             \n  ─────────────────────────────────────────────────────────\
+             \n  var ratio (high/low) = {:.3}\
+             \n    >> H-Jac (Jacobian attenuation × low α) → expect var COLLAPSES under COMMIT_LOW\
+             \n       (ratio ≫ 1: high keeps state-variance, low loses it).\
+             \n    >> H-Rep (representation collapse) → expect var LOW in BOTH regimes\
+             \n       (ratio ≈ 1, both small).",
+            if var_low > 1e-12 {
+                var_high / var_low
+            } else {
+                f64::INFINITY
+            },
         );
     }
 }

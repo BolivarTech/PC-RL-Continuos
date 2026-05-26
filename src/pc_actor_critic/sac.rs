@@ -120,6 +120,72 @@ impl<L: LinAlg> PcActorCritic<L> {
         self.alpha()
     }
 
+    /// SAC entropy temperature `α = exp(log_alpha)`, or `None` outside SAC mode.
+    ///
+    /// SAC mode is detected by the presence of the twin Q-critics
+    /// (`q1.is_some()` internally); discrete agents return `None`.
+    /// Useful as a downstream diagnostic — pair it with
+    /// [`sac_action_gradient_min`](Self::sac_action_gradient_min) to compare the
+    /// magnitude of the entropy term (`≈ 2α`) against `|∇_a Q|` at probe states.
+    pub fn sac_alpha(&self) -> Option<f64> {
+        if self.has_sac_critics() {
+            Some(self.alpha())
+        } else {
+            None
+        }
+    }
+
+    /// `min(Q1(s,a), Q2(s,a))` from the live twin Q-critics, or `None` outside
+    /// SAC mode.
+    ///
+    /// `min(Q1, Q2)` is the action-value signal the SAC actor pathwise
+    /// objective consumes, so this is the right scalar to read when probing
+    /// "what does the critic think of this action."
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — state vector of length `q_critic.state_dim`.
+    /// * `action` — squashed action vector of length `q_critic.action_dim`
+    ///   (the action the environment would execute).
+    ///
+    /// Returns `None` when twin Q-critics are absent (discrete mode).
+    pub fn sac_q_min(&self, state: &[f64], action: &[f64]) -> Option<f64> {
+        let q1 = self.q1.as_ref()?;
+        let q2 = self.q2.as_ref()?;
+        let v1 = q1.forward(state, action);
+        let v2 = q2.forward(state, action);
+        Some(v1.min(v2))
+    }
+
+    /// `∇_a min(Q1(s,a), Q2(s,a))` — gradient of the SAC actor's action-value
+    /// signal with respect to the squashed action.  Returns `None` outside SAC
+    /// mode.
+    ///
+    /// At each query the live `Q1` and `Q2` are evaluated; the critic that
+    /// currently realizes the minimum at `(state, action)` provides the
+    /// gradient (clipped-double-Q semantics).  This matches the signal the
+    /// actor's pathwise update consumes, so the returned vector is what a
+    /// caller should compare against the entropy gradient magnitude `2α` when
+    /// diagnosing commitment behavior (entropy dominating vs. Q dominating).
+    ///
+    /// # Arguments
+    ///
+    /// * `state` — state vector of length `q_critic.state_dim`.
+    /// * `action` — squashed action vector of length `q_critic.action_dim`.
+    ///
+    /// Returned vector has length `q_critic.action_dim`.
+    pub fn sac_action_gradient_min(&self, state: &[f64], action: &[f64]) -> Option<Vec<f64>> {
+        let q1 = self.q1.as_ref()?;
+        let q2 = self.q2.as_ref()?;
+        let v1 = q1.forward(state, action);
+        let v2 = q2.forward(state, action);
+        if v1 <= v2 {
+            Some(q1.action_gradient(state, action))
+        } else {
+            Some(q2.action_gradient(state, action))
+        }
+    }
+
     /// Returns `true` when SAC twin Q-critics are present (continuous SAC mode).
     ///
     /// Equivalent to `self.q1.is_some()`.  Used by tests and future task
