@@ -351,6 +351,20 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         if targets.is_empty() {
+            // In-band signal: an entire sampled batch was dropped (non-finite
+            // intermediate values, or — defensively — cross-mode actions). No
+            // critic learning happened this step. Surfacing it on stderr gives
+            // downstream debuggers (e.g. B10) a warning without polling
+            // `sac_skipped_critic_updates()`.
+            if !batch.is_empty() {
+                eprintln!(
+                    "[pc-rl-continuos] WARN: SAC critic update skipped the entire \
+                     batch of {} transition(s); no critic learning this step \
+                     (total skipped: {}).",
+                    batch.len(),
+                    self.sac_skipped_critic_updates
+                );
+            }
             return 0.0;
         }
 
@@ -585,6 +599,18 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
 
         if collected.is_empty() {
+            // In-band signal: an entire sampled batch was dropped for the actor
+            // update (non-finite delta/log-prob). No actor or temperature
+            // learning happened this step.
+            if !batch.is_empty() {
+                eprintln!(
+                    "[pc-rl-continuos] WARN: SAC actor update skipped the entire \
+                     batch of {} transition(s); no actor/temperature learning this \
+                     step (total skipped: {}).",
+                    batch.len(),
+                    self.sac_skipped_actor_updates
+                );
+            }
             // Return None logπ: signals the caller to skip temperature update
             // rather than drift `log_alpha` on garbage (Fix 5).
             return (0.0, None);

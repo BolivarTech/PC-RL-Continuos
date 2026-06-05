@@ -25,18 +25,16 @@ fn default_critic_lr() -> f64 {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use pc_rl_continuos::activation::Activation;
-/// use pc_rl_continuos::layer::LayerDef;
-/// use pc_rl_continuos::mlp_critic::MlpCriticConfig;
-///
-/// let config = MlpCriticConfig {
+/// ```text
+/// // Internal (pub(crate)) discrete V-critic — illustrative only; dead under
+/// // SAC and slated for removal in a follow-up (see CHANGELOG 1.0.0).
+/// MlpCriticConfig {
 ///     input_size: 27,
 ///     hidden_layers: vec![LayerDef { size: 36, activation: Activation::Tanh }],
 ///     output_activation: Activation::Linear,
 ///     lr: 0.005,
-/// };
-/// ```ignore
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlpCriticConfig {
     /// Dimensionality of the input vector (board state + latent concat).
@@ -54,7 +52,7 @@ pub struct MlpCriticConfig {
 ///
 /// Used by the serializer module to persist and restore the critic
 /// without requiring an RNG.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MlpCriticWeights {
     /// Layer weight snapshots in order (hidden layers + output layer).
     pub layers: Vec<Layer>,
@@ -70,25 +68,18 @@ pub struct MlpCriticWeights {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use pc_rl_continuos::activation::Activation;
-/// use pc_rl_continuos::layer::LayerDef;
-/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
-/// use pc_rl_continuos::mlp_critic::{MlpCritic, MlpCriticConfig};
-/// use rand::SeedableRng;
-/// use rand::rngs::StdRng;
-///
+/// ```text
+/// // Internal (pub(crate)) discrete V-critic — illustrative only; dead under
+/// // SAC and slated for removal in a follow-up (see CHANGELOG 1.0.0).
 /// let config = MlpCriticConfig {
 ///     input_size: 27,
 ///     hidden_layers: vec![LayerDef { size: 36, activation: Activation::Tanh }],
 ///     output_activation: Activation::Linear,
 ///     lr: 0.005,
 /// };
-/// let mut rng = StdRng::seed_from_u64(42);
-/// let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
-/// let value = critic.forward(&vec![0.0; 27]);
-/// assert!(value.is_finite());
-/// ```ignore
+/// let critic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
+/// let value = critic.forward(&vec![0.0; 27]); // V(s)
+/// ```
 #[derive(Debug)]
 pub struct MlpCritic<L: LinAlg = CpuLinAlg> {
     /// Dense layers: hidden layers followed by the output layer (1 neuron).

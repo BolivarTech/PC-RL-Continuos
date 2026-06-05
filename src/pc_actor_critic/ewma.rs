@@ -27,8 +27,8 @@ pub enum PlasticityState {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use pc_rl_continuos::EwmaTracker;
+/// ```
+/// use pc_rl_continuos::pc_actor_critic::EwmaTracker;
 ///
 /// let mut tracker = EwmaTracker::new(5);
 /// // Warmup phase: exact arithmetic mean

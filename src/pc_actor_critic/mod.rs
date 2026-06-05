@@ -3014,17 +3014,6 @@ impl<L: LinAlg> PcActorCritic<L> {
         Ok(())
     }
 
-    /// Monotonic count of `replay_learn` iterations in which the
-    /// internal TD-error clamp (`±MAX_REPLAY_TD_ERROR`) was binding.
-    ///
-    /// Exposed as observable telemetry for the self-recovery pipeline
-    /// (MAGI R5 W5). The counter only advances when the clamp actually
-    /// truncates the raw TD error; it does not count iterations that
-    /// pass through the clamp unchanged.
-    pub fn replay_clamp_count(&self) -> u64 {
-        self.replay_clamp_count
-    }
-
     /// Forward the LIVE Q-critic `q1` at `(state, action)` (test helper only).
     #[cfg(test)]
     pub(crate) fn q1_for_test(&self, state: &[f64], action: &[f64]) -> f64 {

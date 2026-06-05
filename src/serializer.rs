@@ -174,6 +174,12 @@ pub struct SaveFile {
     /// Actor network weights.
     pub actor_weights: PcActorWeights,
     /// Critic network weights.
+    ///
+    /// `#[serde(default)]` for forward-compatibility: the discrete V-critic
+    /// (`MlpCritic`) is dead under SAC and slated for removal in a follow-up;
+    /// tolerating an absent `critic_weights` field keeps future SAC-only save
+    /// files loadable here without a schema break.
+    #[serde(default)]
     pub critic_weights: crate::mlp_critic::MlpCriticWeights,
     /// Continuous learning state (None for legacy/v2.0.0 files).
     #[serde(default)]

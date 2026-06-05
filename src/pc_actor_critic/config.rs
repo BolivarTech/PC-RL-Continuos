@@ -305,7 +305,11 @@ fn default_critic_floor_replay() -> f64 {
 ///
 /// # Examples
 ///
-/// ```ignore
+/// Illustrative field layout (for a runnable continuous-SAC example see the
+/// crate README Quick Start). The `critic` / `MlpCriticConfig` slot is the
+/// dead discrete V-critic, kept for now and slated for removal in a follow-up.
+///
+/// ```text
 /// use pc_rl_continuos::activation::Activation;
 /// use pc_rl_continuos::layer::LayerDef;
 /// use pc_rl_continuos::mlp_critic::MlpCriticConfig;

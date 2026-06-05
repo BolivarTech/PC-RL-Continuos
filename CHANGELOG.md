@@ -1,5 +1,54 @@
 # Changelog
 
+## [1.0.0] - 2026-06-05
+
+Establishes **PC-RL-Continuos** as its own standalone continuous-control
+project, split off from the discrete `pc-rl-core` lineage.
+
+### Identity
+
+- **Crate renamed** `pc-rl-core` → `pc-rl-continuos` (module path
+  `pc_rl_continuos`). Downstream consumers must update both the dependency name
+  and `use pc_rl_core::…` → `use pc_rl_continuos::…`.
+- **Version reset** `6.0.0` → `1.0.0`: this is the first release of the
+  continuous-only project, not a continuation of the `pc-rl-core` version line.
+  The `[6.0.0]` and earlier entries below are retained as lineage history.
+- The spelling **"continuos"** (not "continuous") is intentional — it matches
+  the repository name `BolivarTech/PC-RL-Continuos`.
+
+### Scope
+
+- **SAC-only**: the discrete REINFORCE path (public `MlpCritic` V-critic,
+  GA-crossover/CCA, discrete actor API, ~13k lines of discrete tests) was
+  removed. `ActionSpace::Continuous` is canonical SAC. See `CLEANUP_REPORT.md`.
+
+### Hardening (MAGI review follow-ups)
+
+- `SaveFile::critic_weights` gains `#[serde(default)]` (and `MlpCriticWeights`
+  derives `Default`) for forward-compatibility with the planned `MlpCritic`
+  removal — absent `critic_weights` no longer breaks deserialization.
+- Cross-mode replay contamination is rejected at `ReplayBuffer::push` (a
+  `Discrete` action in a `Continuous` buffer returns `Err`); the SAC update
+  loops keep a defensive skip as defence-in-depth.
+- SAC critic/actor updates now emit a stderr warning when an **entire** sampled
+  batch is skipped (no learning this step) — an in-band signal complementing the
+  `sac_skipped_critic_updates()` / `sac_skipped_actor_updates()` counters.
+- Removed the dead `replay_clamp_count()` accessor (the discrete `replay_learn`
+  clamp it counted no longer exists; the serialized field is retained for
+  save-file compatibility).
+- The four previously `ignore`d doctests are resolved: `EwmaTracker` is now a
+  real compiling doctest; the `PcActorCriticConfig` and internal `MlpCritic*`
+  examples are explicitly illustrative (`text`).
+
+### Deferred follow-up (tracked for a future minor release)
+
+A focused purge of the intentional dead-code residue is planned: delete
+`MlpCritic` and the discrete-only `PcActorCriticConfig` fields (with a save-file
+migration for `critic_weights`), remove or split the `ActionSpace::Discrete` /
+`Action::Discrete` replay variants, and drop the validator-rejected
+continuous-learning state fields. These are non-blocking for 1.0.0: the SAC
+mechanism is correct and the dead paths are validator-gated.
+
 ## [6.0.0] - 2026-05-24
 
 ### Breaking
