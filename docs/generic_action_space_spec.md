@@ -3,7 +3,7 @@
 **Version:** 2.0 (rewrite against v3.0.0 baseline)
 **Date:** 2026-04-25
 **Author:** Julian Bolivar
-**Crate:** `pc-rl-core`
+**Crate:** `pc-rl-continuos`
 **Status:** Spec-ready for SBTDD `/deep-plan`. Target release: **v4.0.0 (BREAKING)**.
 **Predecessor spec:** v1.0 (2026-XX), preserved at git tag `pre-v4-spec` for context.
 **Coordination:** v4.0.0 is **CPU-first** — must function correctly on
@@ -16,7 +16,7 @@ surface.
 
 ## 1. Overview
 
-PC-RL-Core's defining ambition is to be a **general-purpose reinforcement
+PC-RL-Continuos's defining ambition is to be a **general-purpose reinforcement
 learning framework** built around deliberative predictive coding. The
 discrete-action specialization that has carried the project through v3.x
 must be widened so the same actor-critic loop can drive continuous control,
@@ -976,9 +976,9 @@ v4.0.0 is a major bump per SemVer 2.0.0 because:
    migrating their step calls.
 
 The same Cargo-resolves-major-boundary safety-net rule that bounded
-v3.0.0's blast radius applies here: downstream `pc-rl-core = "3"` users
+v3.0.0's blast radius applies here: downstream `pc-rl-continuos = "3"` users
 do **not** auto-receive v4. They must update their `Cargo.toml` to
-`pc-rl-core = "4"` to opt into the breaking change.
+`pc-rl-continuos = "4"` to opt into the breaking change.
 
 ---
 

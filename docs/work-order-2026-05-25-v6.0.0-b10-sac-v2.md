@@ -4,7 +4,7 @@ Version: 2.0.0
 Date: 2026-05-25
 -->
 
-# Work order v2 — B10 of pc-rl-core v6.0.0 (canonical SAC): random warmup + commitment-annealing
+# Work order v2 — B10 of pc-rl-continuos v6.0.0 (canonical SAC): random warmup + commitment-annealing
 
 > **For the PC-Inv_Pendulum harness owner/agent.** SUPERSEDES `work-order-2026-05-24-v6.0.0-b10-sac.md`
 > (+§0b lr fix). After 7 in-library diagnostics, the root cause of the B10 miss is understood and a small
@@ -31,7 +31,7 @@ exactly the symptom in your first two B10 runs). **The earlier "sustained explor
 
 ## 1. Library change that LANDED upstream (use it)
 
-pc-rl-core now does **uniform-random ACTION warmup** during `learning_starts`: while the replay buffer has
+pc-rl-continuos now does **uniform-random ACTION warmup** during `learning_starts`: while the replay buffer has
 < `learning_starts` transitions, the continuous-SAC agent executes/records actions drawn `Uniform(−1,1)` in
 the squashed action space (proper coverage), then switches to the policy. **Set `learning_starts > 0` to
 enable it** (default 0 = off). This is the coverage half of the fix; it's automatic once you set it.
@@ -73,7 +73,7 @@ Per eval, log (you already have σ/μ_raw/skip from v1):
 ## 4. Run B10
 
 ```
-cd ../PC-Inv_Pendulum   # PC-RL-Core checked out on feature/v6.0.0-sac-continuous (path-dep)
+cd ../PC-Inv_Pendulum   # PC-RL-Continuos checked out on feature/v6.0.0-sac-continuous (path-dep)
 # set config per §2 (learning_starts=5000; sweep target_entropy −1/−2/−4); ensure obs/reward norm ON
 cargo run --release --bin multi_seed
 ```

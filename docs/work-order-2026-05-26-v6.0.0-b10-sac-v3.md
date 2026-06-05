@@ -4,7 +4,7 @@ Version: 3.0.0
 Date: 2026-05-26
 -->
 
-# Work order v3 — B10 of pc-rl-core v6.0.0 (canonical SAC): saturation-lock REFUTED upstream → instrument and confirm
+# Work order v3 — B10 of pc-rl-continuos v6.0.0 (canonical SAC): saturation-lock REFUTED upstream → instrument and confirm
 
 > **For the PC-Inv_Pendulum harness owner/agent.** SUPERSEDES `work-order-2026-05-25-v6.0.0-b10-sac-v2.md`.
 > v2 landed the random-action warmup, lr=3e-3 SGD fix, and the commitment-annealing `target_entropy`
@@ -99,7 +99,7 @@ probe state per eval (CSV in `results/`).
 If the Pendulum `|∇_a Q|` vs `2α` and `var(μ_raw)` numbers match the bandit's working regime,
 **no further harness tuning is on the table**. The remaining structural lever — multi-step Q
 targets in the soft-Bellman backup — is internal to `sac_learn_step` and `sac_bellman_target` in
-the library (R1 forbids editing pc-rl-core). Upstream will start a SBTDD cycle for n-step (or λ-)
+the library (R1 forbids editing pc-rl-continuos). Upstream will start a SBTDD cycle for n-step (or λ-)
 returns in the SAC critic; v3 is the trigger.
 
 ### 2c. If 2a uncovers something else (unlikely but possible)

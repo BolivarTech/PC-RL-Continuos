@@ -1,8 +1,8 @@
 # PC-CartPole-Continuous — Experiment Specification
 
-**Project:** Standalone Rust binary that consumes `pc-rl-core v4.0.0` to train and evaluate a Predictive Coding agent on a continuous-control variant of the cart-pole balance task.
+**Project:** Standalone Rust binary that consumes `pc-rl-continuos v4.0.0` to train and evaluate a Predictive Coding agent on a continuous-control variant of the cart-pole balance task.
 
-**Status:** Spec — implementation pending. Standalone repository (separate from `pc-rl-core`), following the PC-TicTacToe pattern.
+**Status:** Spec — implementation pending. Standalone repository (separate from `pc-rl-continuos`), following the PC-TicTacToe pattern.
 
 **Target repository name:** `PC-CartPole-Continuous` (suggested) on `github.com/BolivarTech/`.
 
@@ -115,13 +115,13 @@ Penalizes pole tilt, cart drift, and large forces. Provides per-step gradient si
 | Random policy | ~50 | ~20 | N/A |
 | REINFORCE vanilla | ~250 | ~150 | 200-500 |
 | DDPG / SAC (replay) | ~480 (near max 500) | ~480 | 50-100 |
-| **PC-RL-Core v4.0.0 target (variant B)** | **~350-450** | **~200-350** | **200-400** |
+| **PC-RL-Continuos v4.0.0 target (variant B)** | **~350-450** | **~200-350** | **200-400** |
 
 ---
 
 ## 3. Architecture
 
-### 3.1 pc-rl-core configuration
+### 3.1 pc-rl-continuos configuration
 
 ```rust
 fn build_config() -> PcActorCriticConfig {
@@ -281,7 +281,7 @@ PC-CartPole-Continuous/
 ├── src/
 │   ├── env.rs              # CartPole physics
 │   ├── reward.rs           # Both reward variants
-│   ├── agent.rs            # pc-rl-core wrapper
+│   ├── agent.rs            # pc-rl-continuos wrapper
 │   ├── training.rs         # Training loop with done-flag handling
 │   ├── evaluation.rs       # Play-mode eval
 │   ├── metrics.rs          # CSV logging (includes episode_length)
@@ -312,7 +312,7 @@ edition = "2021"
 authors = ["Julian Bolivar"]
 
 [dependencies]
-pc-rl-core = "4"
+pc-rl-continuos = "4"
 rand = "0.8"
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }

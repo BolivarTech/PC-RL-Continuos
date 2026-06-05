@@ -3,7 +3,7 @@
 **Version:** 1.0
 **Date:** 2026-04-12
 **Author:** Julian Bolivar
-**Crate:** `pc-rl-core`
+**Crate:** `pc-rl-continuos`
 **Status:** Implemented on branch `continuos_learning`, merged to `main`
 
 ---

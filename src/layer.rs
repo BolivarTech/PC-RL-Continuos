@@ -90,8 +90,8 @@ pub(crate) fn layer_from_cpu<L: LinAlg>(cpu: &Layer, backend: &L) -> Layer<L> {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
 ///
 /// let def = LayerDef { size: 64, activation: Activation::Tanh };
 /// assert_eq!(def.size, 64);
@@ -124,9 +124,9 @@ pub struct LayerDef {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::Layer;
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::Layer;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///

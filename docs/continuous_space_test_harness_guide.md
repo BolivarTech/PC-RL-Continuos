@@ -1,7 +1,7 @@
 # Continuous Action Space — Test Harness Handoff Guide (v4.1.0)
 
 **Audience:** The agent/developer who will build the **downstream consumer
-binary** (e.g. `PC-Pendulum`) that validates `pc-rl-core` v4.1.0's continuous
+binary** (e.g. `PC-Pendulum`) that validates `pc-rl-continuos` v4.1.0's continuous
 action mode against real dynamics.
 
 **Purpose:** Give that agent the *exact, code-verified* public API contract of
@@ -51,7 +51,7 @@ design; read *this* guide for the API.
 ```toml
 # Consumer Cargo.toml
 [dependencies]
-pc-rl-core = "4"          # v4.0.0+
+pc-rl-continuos = "4"          # v4.0.0+
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -59,17 +59,17 @@ toml = "0.8"              # optional: if you load config from TOML
 chrono = "0.4"           # optional: metrics timestamps
 ```
 
-`pc-rl-core` has no ML-framework dependencies and is CPU-only in v4.0.0
+`pc-rl-continuos` has no ML-framework dependencies and is CPU-only in v4.0.0
 (`CpuLinAlg`). A GPU backend is planned but not shipped — do not depend on it.
 
 ---
 
 ## 3. Public API surface you will use
 
-Everything is re-exported from the crate root (`pc_rl_core::…`).
+Everything is re-exported from the crate root (`pc_rl_continuos::…`).
 
 ```rust
-use pc_rl_core::{
+use pc_rl_continuos::{
     PcActorCritic, PcActorCriticConfig, ActionSpace, CpuLinAlg,
     SelectionMode,                       // re-exported from pc_actor
     PcActorConfig, MlpCriticConfig, LayerDef, Activation,
@@ -328,7 +328,7 @@ mistakes immediately:
 ```rust
 #[test]
 fn continuous_smoke() {
-    use pc_rl_core::*;
+    use pc_rl_continuos::*;
 
     // Build a tiny continuous config (Path B literal, or load a TOML).
     let cfg: PcActorCriticConfig =
@@ -375,7 +375,7 @@ If this passes, the API wiring is correct and you can build the real
   fixed seed; surprise score decreases over training.
 - **Reveals a v4.1.0 bug (report back to this repo):** all seeds stuck at
   ~−1500 (gradient-sign/numerical issue); most seeds NaN; reward improves then
-  catastrophically collapses. Include seed, `pc-rl-core` commit SHA, and the
+  catastrophically collapses. Include seed, `pc-rl-continuos` commit SHA, and the
   metrics CSV in the bug report.
 
 ---
@@ -412,14 +412,14 @@ order of impact):
 
 **Merge gate:** the in-library unit and integration tests (716 tests, including
 the continuous smoke and gradient-sign tests) are the merge gate for
-`pc-rl-core`. The Pendulum harness result is the **external validation** check
+`pc-rl-continuos`. The Pendulum harness result is the **external validation** check
 and lives in a separate `PC-Pendulum` repository. Failing the Pendulum PASS bar
 does not block a library release but should be investigated before the result is
 cited as empirical evidence that the continuous mode works on real dynamics.
 
 ---
 
-**TL;DR for the implementing agent:** add `pc-rl-core = "4"`; build a
+**TL;DR for the implementing agent:** add `pc-rl-continuos = "4"`; build a
 `PcActorCriticConfig` with `action_space = "Continuous"`, `policy_sigma > 0`,
 `output_activation = "linear"`, and `gae_lambda = 0.95` (TOML+serde is
 easiest); `PcActorCritic::new(CpuLinAlg::new(), cfg, seed)?`; loop

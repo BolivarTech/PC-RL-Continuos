@@ -9,10 +9,10 @@
 //! # Examples
 //!
 //! ```
-//! use pc_rl_core::activation::Activation;
-//! use pc_rl_core::layer::LayerDef;
-//! use pc_rl_core::linalg::cpu::CpuLinAlg;
-//! use pc_rl_core::q_critic::{QCritic, QCriticConfig};
+//! use pc_rl_continuos::activation::Activation;
+//! use pc_rl_continuos::layer::LayerDef;
+//! use pc_rl_continuos::linalg::cpu::CpuLinAlg;
+//! use pc_rl_continuos::q_critic::{QCritic, QCriticConfig};
 //! use rand::{rngs::StdRng, SeedableRng};
 //!
 //! let mut rng = StdRng::seed_from_u64(42);
@@ -50,9 +50,9 @@ fn default_q_lr() -> f64 {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::q_critic::QCriticConfig;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::q_critic::QCriticConfig;
 ///
 /// let cfg = QCriticConfig {
 ///     state_dim: 3,
@@ -94,10 +94,10 @@ pub struct QCriticWeights {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
-/// use pc_rl_core::q_critic::{QCritic, QCriticConfig};
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::q_critic::{QCritic, QCriticConfig};
 /// use rand::{rngs::StdRng, SeedableRng};
 ///
 /// let mut rng = StdRng::seed_from_u64(42);

@@ -3,7 +3,7 @@
 // Date: 2026-04-17
 
 //! Dual-compartment replay buffer for off-policy learning from stored
-//! positive-reward trajectories. See docs/pc_rl_core_self_recovery_spec.md
+//! positive-reward trajectories. See docs/pc_rl_continuos_self_recovery_spec.md
 //! Phase 2 for the design rationale.
 //!
 //! The buffer maintains two FIFO compartments:

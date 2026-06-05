@@ -22,9 +22,9 @@ use crate::linalg::LinAlg;
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::pc_actor::PcActorConfig;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::pc_actor::PcActorConfig;
 ///
 /// let config = PcActorConfig {
 ///     input_size: 9,
@@ -207,10 +207,10 @@ pub enum SelectionMode {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
-/// use pc_rl_core::pc_actor::{PcActor, PcActorConfig, SelectionMode};
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::pc_actor::{PcActor, PcActorConfig, SelectionMode};
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///

@@ -4,10 +4,10 @@ Version: 1.0.0
 Date: 2026-05-24
 -->
 
-# Work order — B10 validation of pc-rl-core v6.0.0 (canonical SAC) on the PC-Inv_Pendulum harness
+# Work order — B10 validation of pc-rl-continuos v6.0.0 (canonical SAC) on the PC-Inv_Pendulum harness
 
 > **For the PC-Inv_Pendulum harness owner/agent.** Cross-repo handoff (mandate R1: the library is
-> fixed; the harness adapts its agent construction + tunes hyperparameters against B10). pc-rl-core
+> fixed; the harness adapts its agent construction + tunes hyperparameters against B10). pc-rl-continuos
 > v6.0.0 replaces the continuous on-policy score-function path with **canonical off-policy SAC**.
 > This work order says how to bump the harness to the SAC API, a concrete starting config, how to
 > run **B10**, the pass criterion, and the escalation levers if B10 misses.
@@ -21,15 +21,15 @@ Date: 2026-05-24
   directional guards (μ_raw bounded, pathwise drives μ, σ-narrowing, Q learns, auto-temp) pass.
 - **B10 is the authoritative deterministic-convergence check** (R10/R12): the minimal in-library
   Pendulum cannot reproduce the stochastic-solves gap, so convergence is proven only here.
-- The harness already depends on the library via `pc-rl-core = { path = "../PC-RL-Core" }`, so with
-  PC-RL-Core checked out on this branch the harness builds against v6.0.0 directly.
+- The harness already depends on the library via `pc-rl-continuos = { path = "../PC-RL-Continuos" }`, so with
+  PC-RL-Continuos checked out on this branch the harness builds against v6.0.0 directly.
 
 ## 0b. ⚠ CRITICAL CORRECTION (2026-05-25, from Step-0 in-library diagnostic — read before tuning)
 
 The first B10 attempt MISSED. An upstream white-box diagnostic
 (`diagnose_sac_contextual_bandit`, an in-library contextual bandit with state-dependent interior
 optima) **root-caused it: the recommended `lr = 3e-4` in §3 was ~10× TOO LOW for this library's
-plain-SGD framework** (pc-rl-core uses fixed-lr SGD, NOT Adam; 3e-4 is the *Adam*-standard, whose
+plain-SGD framework** (pc-rl-continuos uses fixed-lr SGD, NOT Adam; 3e-4 is the *Adam*-standard, whose
 effective step is far larger than a raw SGD step). At `lr = 3e-4` the Q-critic never learns a
 discriminative surface (argmax_a Q stuck at the action-grid edge, Q(a*)≈Q(−a*)) → the actor gets no
 signal → μ stays random/saturated and σ never collapses — EXACTLY the symptoms the first B10 run
@@ -114,7 +114,7 @@ gae_lambda = None ; td_steps = 0 ; actor_hysteresis = false ; critic_hysteresis 
 ## 4. How to run B10
 
 ```
-# PC-RL-Core checked out on feature/v6.0.0-sac-continuous (the path dep picks it up):
+# PC-RL-Continuos checked out on feature/v6.0.0-sac-continuous (the path dep picks it up):
 cd ../PC-Inv_Pendulum
 # 1) Update src/agent.rs / src/config.rs / src/cli.rs to build the SAC config in §3.
 # 2) Build + run the 10×500 sweep:

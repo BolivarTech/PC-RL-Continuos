@@ -149,7 +149,7 @@ You might think: "we ran the loop 3 times, so we backprop through all 3 iteratio
 
 ### 5.2 The actual answer (snapshot the equilibrium)
 
-PC-RL-Core does something simpler: **treat the converged state as if it were a single feedforward output, and backprop normally from there.**
+PC-RL-Continuos does something simpler: **treat the converged state as if it were a single feedforward output, and backprop normally from there.**
 
 ```
 After convergence:                    For training:
@@ -276,7 +276,7 @@ PC was originally a model of perception (Rao & Ballard 1999). The Free Energy Pr
 
 The right read is: **PC pays roughly 2–3× compute cost during inference for benefits that are structural — not just empirical.** The structural benefits (built-in uncertainty, deliberation, latent exposure to the critic) compound: you don't have to re-engineer them; they are inherent to the architecture.
 
-The cost in compute is real and matters for very large models. The current `pc-rl-core` configurations (~1,900 parameters total) target environments where the deliberation gain dominates the compute cost. Whether PC scales to large language model regimes is an open empirical question (and beyond the scope of this codebase).
+The cost in compute is real and matters for very large models. The current `pc-rl-continuos` configurations (~1,900 parameters total) target environments where the deliberation gain dominates the compute cost. Whether PC scales to large language model regimes is an open empirical question (and beyond the scope of this codebase).
 
 ---
 
@@ -320,4 +320,4 @@ PC turns the actor into a **deliberator**: instead of computing the output in a 
 
 The key insight is that the iterative inference and the standard backprop are **decoupled**: deliberation happens during the forward pass, gradient computation operates on the converged snapshot. This decoupling is what makes the architecture both computationally tractable and empirically effective.
 
-For the formal version with proofs, equations, and full experimental tables, read `pc_actor_critic_paper.md`. For an even higher-level overview of why this matters for `pc-rl-core` as a whole, read the project README.
+For the formal version with proofs, equations, and full experimental tables, read `pc_actor_critic_paper.md`. For an even higher-level overview of why this matters for `pc-rl-continuos` as a whole, read the project README.

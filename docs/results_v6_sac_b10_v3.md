@@ -81,7 +81,7 @@ produce, but it's commitment to the wrong actions.
 Per work order v3 §2b: *"If the Pendulum `|∇_a Q|` vs `2α` and `var(μ_raw)` numbers match the
 bandit's working regime, no further harness tuning is on the table. The remaining structural lever
 — multi-step Q targets in the soft-Bellman backup — is internal to `sac_learn_step` and
-`sac_bellman_target` in the library (R1 forbids editing pc-rl-core). Upstream will start a SBTDD
+`sac_bellman_target` in the library (R1 forbids editing pc-rl-continuos). Upstream will start a SBTDD
 cycle for n-step (or λ-) returns in the SAC critic; v3 is the trigger."*
 
 Pendulum's numbers don't just match the working bandit's regime — they **exceed** it on
@@ -113,7 +113,7 @@ cargo run --release --bin multi_seed -- --config config_sac_warmup_te2.toml --se
 # Compare grad_mu vs 2*alpha and atten=grad_mu/grad_0 to the upstream bandit's working regime
 # (COMMIT_LOW: grad ~0.06, atten ~0.06, var(mu_raw) ~1.85).
 ```
-pc-rl-core v6.0.0 `536bad1` (no library code change — R1). Deterministic under fixed seeds.
+pc-rl-continuos v6.0.0 `536bad1` (no library code change — R1). Deterministic under fixed seeds.
 
 ## 6. Ladder
 

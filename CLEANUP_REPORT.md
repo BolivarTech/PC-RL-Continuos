@@ -1,8 +1,8 @@
-# Cleanup Report — pc-rl-core SAC-only
+# Cleanup Report — pc-rl-continuos SAC-only
 
 **Date:** 2026-05-26
 **Branch:** `feature/v6.0.0-sac-continuous`
-**Goal:** Strip the discrete code path from `pc-rl-core` so the library only
+**Goal:** Strip the discrete code path from `pc-rl-continuos` so the library only
 contains what is strictly necessary for continuous (canonical SAC v6.0.0)
 experiments.
 
@@ -274,7 +274,7 @@ $ cargo doc --no-deps
 
 $ cargo audit
     (1 informational advisory: RUSTSEC-2026-0097 on the transitive
-     rand 0.8.5 dependency — pre-existing, identical in PC-RL-Core,
+     rand 0.8.5 dependency — pre-existing, identical in PC-RL-Continuos,
      not introduced by this cleanup)
 ```
 

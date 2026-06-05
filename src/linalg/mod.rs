@@ -58,8 +58,8 @@ pub type SvdResult<L> = Result<
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
-/// use pc_rl_core::linalg::LinAlg;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::linalg::LinAlg;
 ///
 /// let backend = CpuLinAlg::new();
 /// let v = backend.zeros_vec(5);

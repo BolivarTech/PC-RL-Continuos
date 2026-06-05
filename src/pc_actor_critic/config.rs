@@ -306,12 +306,12 @@ fn default_critic_floor_replay() -> f64 {
 /// # Examples
 ///
 /// ```ignore
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::mlp_critic::MlpCriticConfig;
-/// use pc_rl_core::pc_actor::PcActorConfig;
-/// use pc_rl_core::pc_actor_critic::PcActorCriticConfig;
-/// use pc_rl_core::ActionSpace;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::mlp_critic::MlpCriticConfig;
+/// use pc_rl_continuos::pc_actor::PcActorConfig;
+/// use pc_rl_continuos::pc_actor_critic::PcActorCriticConfig;
+/// use pc_rl_continuos::ActionSpace;
 ///
 /// let config = PcActorCriticConfig {
 ///     actor: PcActorConfig {

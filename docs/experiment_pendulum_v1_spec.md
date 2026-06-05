@@ -1,8 +1,8 @@
 # PC-Pendulum — Experiment Specification
 
-**Project:** Standalone Rust binary that consumes `pc-rl-core v4.1.0` to train and evaluate a Predictive Coding agent on the Pendulum-v1 swing-up task.
+**Project:** Standalone Rust binary that consumes `pc-rl-continuos v4.1.0` to train and evaluate a Predictive Coding agent on the Pendulum-v1 swing-up task.
 
-**Status:** Spec — implementation pending. Standalone repository (separate from `pc-rl-core`), following the PC-TicTacToe pattern.
+**Status:** Spec — implementation pending. Standalone repository (separate from `pc-rl-continuos`), following the PC-TicTacToe pattern.
 
 **Target repository name:** `PC-Pendulum` (suggested) on `github.com/BolivarTech/`.
 
@@ -18,7 +18,7 @@ Train a Predictive Coding actor-critic agent to **swing up and balance** an inve
 2. PC inference + continuous output deliver competitive performance vs. a pure feedforward continuous baseline.
 3. Surprise-driven learning rate modulation (M1) behaves sensibly on a continuous-reward task.
 
-This is the canonical "hello world" of continuous control. If `pc-rl-core` v4.1.0 cannot solve Pendulum, the implementation has bugs not caught by synthetic tests.
+This is the canonical "hello world" of continuous control. If `pc-rl-continuos` v4.1.0 cannot solve Pendulum, the implementation has bugs not caught by synthetic tests.
 
 ---
 
@@ -83,7 +83,7 @@ This is intentional. Pendulum-v1 has no failure state; the agent simply accumula
 | Random policy | ~−1500 | N/A |
 | REINFORCE vanilla | ~−500 | 500-1000 |
 | DDPG / TD3 / SAC (replay) | ~−150 | 50-100 |
-| **PC-RL-Core v4.1.0 target** | **~−250 to −350** | **300-500** |
+| **PC-RL-Continuos v4.1.0 target** | **~−250 to −350** | **300-500** |
 
 Without replay (rejected in continuous mode), expect performance below DDPG but well above random. The point is **convergence**, not SOTA.
 
@@ -91,10 +91,10 @@ Without replay (rejected in continuous mode), expect performance below DDPG but 
 
 ## 3. Architecture
 
-### 3.1 pc-rl-core configuration
+### 3.1 pc-rl-continuos configuration
 
 ```rust
-use pc_rl_core::{
+use pc_rl_continuos::{
     PcActorCritic, PcActorCriticConfig, ActionSpace,
     pc_actor::PcActorConfig,
     mlp_critic::MlpCriticConfig,
@@ -300,7 +300,7 @@ PC-Pendulum/
 ├── README.md
 ├── src/
 │   ├── env.rs              # Pendulum physics
-│   ├── agent.rs            # pc-rl-core wrapper + config
+│   ├── agent.rs            # pc-rl-continuos wrapper + config
 │   ├── training.rs         # training loop
 │   ├── evaluation.rs       # Play-mode eval
 │   ├── metrics.rs          # CSV logging
@@ -330,7 +330,7 @@ edition = "2021"
 authors = ["Julian Bolivar"]
 
 [dependencies]
-pc-rl-core = "4"           # v4.0.0+
+pc-rl-continuos = "4"           # v4.0.0+
 rand = "0.8"
 chrono = "0.4"             # for metrics timestamps
 serde = { version = "1", features = ["derive"] }
@@ -440,7 +440,7 @@ This writeup is the empirical-validation deliverable that converts v4.0.0 from "
 
 ## 9. Out of scope
 
-- **Comparison with DDPG/SAC** — outside this experiment's scope. This is "does PC-RL-Core v4.0.0 work?", not "is it better than DDPG?".
+- **Comparison with DDPG/SAC** — outside this experiment's scope. This is "does PC-RL-Continuos v4.0.0 work?", not "is it better than DDPG?".
 - **Optimization for SOTA performance** — v4.0.0 lacks replay; matching DDPG is unrealistic without v4.x continuous-replay support.
 - **Deployed binary** — this is a validation experiment, not a production trading agent.
 - **Hyperparameter sweep beyond a few key knobs** — exhaustive HP search out of scope.
@@ -478,7 +478,7 @@ The experiment is a **failure** (and reveals real bugs in v4.0.0) if:
 - ✗ Most seeds NaN/Inf during training
 - ✗ Reward improves then catastrophically degrades
 
-If failure occurs, the failure mode is the diagnostic — file a bug report with seed, commit SHA, and metrics CSV. Investigation moves back to `pc-rl-core` repo.
+If failure occurs, the failure mode is the diagnostic — file a bug report with seed, commit SHA, and metrics CSV. Investigation moves back to `pc-rl-continuos` repo.
 
 ---
 

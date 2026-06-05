@@ -51,8 +51,8 @@ pub struct TrajectoryStep<L: LinAlg = CpuLinAlg> {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::pc_actor_critic::ActivationCache;
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::pc_actor_critic::ActivationCache;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
 ///
 /// let cache: ActivationCache<CpuLinAlg> = ActivationCache::new(2);
 /// assert_eq!(cache.batch_size(), 0);

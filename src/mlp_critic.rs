@@ -26,9 +26,9 @@ fn default_critic_lr() -> f64 {
 /// # Examples
 ///
 /// ```ignore
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::mlp_critic::MlpCriticConfig;
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::mlp_critic::MlpCriticConfig;
 ///
 /// let config = MlpCriticConfig {
 ///     input_size: 27,
@@ -71,10 +71,10 @@ pub struct MlpCriticWeights {
 /// # Examples
 ///
 /// ```ignore
-/// use pc_rl_core::activation::Activation;
-/// use pc_rl_core::layer::LayerDef;
-/// use pc_rl_core::linalg::cpu::CpuLinAlg;
-/// use pc_rl_core::mlp_critic::{MlpCritic, MlpCriticConfig};
+/// use pc_rl_continuos::activation::Activation;
+/// use pc_rl_continuos::layer::LayerDef;
+/// use pc_rl_continuos::linalg::cpu::CpuLinAlg;
+/// use pc_rl_continuos::mlp_critic::{MlpCritic, MlpCriticConfig};
 /// use rand::SeedableRng;
 /// use rand::rngs::StdRng;
 ///

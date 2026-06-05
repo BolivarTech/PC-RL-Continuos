@@ -3,7 +3,7 @@
 **Version:** 1.0
 **Date:** 2026-04-11
 **Author:** Julian Bolivar
-**Crate:** `pc-rl-core`
+**Crate:** `pc-rl-continuos`
 **Status:** Implemented on branch `TD_n`, pending merge to `main`
 
 ---
@@ -344,7 +344,7 @@ When `td_steps=0`:
 
 ## 8. Testing
 
-### 8.1 Unit Tests (11 tests in `pc-rl-core`)
+### 8.1 Unit Tests (11 tests in `pc-rl-continuos`)
 
 | Test | Purpose |
 |---|---|

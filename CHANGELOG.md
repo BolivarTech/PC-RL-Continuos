@@ -162,7 +162,7 @@
 
 ### Breaking changes
 
-- **Generic action space.** `pc-rl-core` now supports two action
+- **Generic action space.** `pc-rl-continuos` now supports two action
   spaces selected via `PcActorCriticConfig::action_space`:
   - `ActionSpace::Discrete` (default) — preserves v3.x behavior bit-
     for-bit. REINFORCE policy gradient on softmax(logits).
@@ -259,7 +259,7 @@
 
 - **SemVer rationale:** breaking changes (removed `step()`, replay
   schema migration, `act()` return type, `learn()` return type)
-  warrant the major bump per SemVer 2.0.0. Consumers `pc-rl-core = "3"`
+  warrant the major bump per SemVer 2.0.0. Consumers `pc-rl-continuos = "3"`
   do not auto-receive v4 — must explicitly bump `Cargo.toml`.
 
 ## [3.0.0] - 2026-04-25
@@ -345,8 +345,8 @@
 - **SemVer rationale:** because `critic_hysteresis = true` consumers
   observe a behavioural change in unchanged code, this release is
   major per SemVer 2.0.0. Cargo respects the major boundary —
-  downstream `pc-rl-core = "2"` users will NOT receive v3.0.0
-  automatically; they must update `Cargo.toml` to `pc-rl-core = "3"`
+  downstream `pc-rl-continuos = "2"` users will NOT receive v3.0.0
+  automatically; they must update `Cargo.toml` to `pc-rl-continuos = "3"`
   explicitly to adopt the breaking change.
 
 - **Internal refactor:** `is_replay_floor_sentinel` and

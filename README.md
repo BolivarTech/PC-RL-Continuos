@@ -8,7 +8,7 @@
 
 The policy is a **predictive-coding actor** that *deliberates before acting* — it runs an iterative top-down/bottom-up free-energy-minimization loop instead of a single feedforward pass. On continuous action spaces this actor is trained by **canonical Soft Actor-Critic (SAC)**: a reparameterized squashed-Gaussian policy driven by a twin action-value critic, with automatic entropy temperature and off-policy replay.
 
-> **Lineage.** This project is the continuous-control line of the DPC architecture. It is built on, and shares its foundation with, the discrete framework [**PC-RL-Core**](https://github.com/BolivarTech/PC-RL-Core) (Tic-Tac-Toe-validated, REINFORCE + V-critic). PC-RL-Continuos keeps the predictive-coding actor but replaces the discrete on-policy machinery with off-policy SAC for deterministic continuous-policy convergence.
+> **Scope.** PC-RL-Continuos is the continuous-control line of the DPC architecture: it keeps the predictive-coding actor and trains it with off-policy SAC for deterministic continuous-policy convergence. The discrete on-policy machinery (REINFORCE + V-critic) is intentionally out of scope.
 
 The library is **backend-agnostic**: all linear algebra is abstracted behind a `LinAlg` trait, enabling future GPU backends (CUDA/wgpu) without touching the RL logic.
 
@@ -28,17 +28,17 @@ The action-value critic `Q(s, a)` supplies a low-variance *directional* signal t
 
 ```toml
 [dependencies]
-pc-rl-core = "6.0"
+pc-rl-continuos = "1.0"
 ```
 
 ## Quick Start (continuous SAC)
 
 ```rust
-use pc_rl_core::{
+use pc_rl_continuos::{
     CpuLinAlg, PcActorCritic, PcActorCriticConfig, PcActorConfig,
     QCriticConfig, Activation, LayerDef, SelectionMode,
 };
-use pc_rl_core::pc_actor_critic::ActionSpace;
+use pc_rl_continuos::pc_actor_critic::ActionSpace;
 
 // --- Actor: a predictive-coding network emitting [μ_raw | log_σ_raw] ---
 // output_size = 2 * action_dim, output_activation = Linear (required for SAC).
@@ -100,7 +100,7 @@ loop {
 
 // --- Deterministic evaluation: Play returns tanh(μ_raw), no noise ---
 let (action, _infer) = agent.act_continuous(&state, SelectionMode::Play)?;
-# Ok::<(), pc_rl_core::PcError>(())
+# Ok::<(), pc_rl_continuos::PcError>(())
 ```
 
 ## Canonical SAC — design

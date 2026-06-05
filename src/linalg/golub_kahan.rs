@@ -18,7 +18,7 @@
 //! # Examples
 //!
 //! ```
-//! use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
+//! use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
 //!
 //! let svd = GolubKahanSvd::new()
 //!     .with_tolerance(1e-12)
@@ -40,7 +40,7 @@ use crate::matrix::Matrix;
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::linalg::golub_kahan::SvdError;
+/// use pc_rl_continuos::linalg::golub_kahan::SvdError;
 ///
 /// let err = SvdError::Convergence { size: 10, iterations: 300 };
 /// assert!(format!("{err}").contains("10"));
@@ -99,7 +99,7 @@ impl From<SvdError> for PcError {
 /// # Examples
 ///
 /// ```
-/// use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
+/// use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
 ///
 /// let svd = GolubKahanSvd::new();
 /// assert!((svd.tol - 1e-14).abs() < f64::EPSILON);
@@ -121,7 +121,7 @@ impl GolubKahanSvd {
     /// # Examples
     ///
     /// ```
-    /// use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
+    /// use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
     ///
     /// let svd = GolubKahanSvd::new();
     /// assert!((svd.tol - 1e-14).abs() < f64::EPSILON);
@@ -142,7 +142,7 @@ impl GolubKahanSvd {
     /// # Examples
     ///
     /// ```
-    /// use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
+    /// use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
     ///
     /// let svd = GolubKahanSvd::new().with_tolerance(1e-8);
     /// assert!((svd.tol - 1e-8).abs() < f64::EPSILON);
@@ -163,7 +163,7 @@ impl GolubKahanSvd {
     /// # Examples
     ///
     /// ```
-    /// use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
+    /// use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
     ///
     /// let svd = GolubKahanSvd::new().with_max_iter_factor(50);
     /// assert_eq!(svd.max_iter_factor, 50);
@@ -193,8 +193,8 @@ impl GolubKahanSvd {
     /// # Examples
     ///
     /// ```
-    /// use pc_rl_core::linalg::golub_kahan::GolubKahanSvd;
-    /// use pc_rl_core::matrix::Matrix;
+    /// use pc_rl_continuos::linalg::golub_kahan::GolubKahanSvd;
+    /// use pc_rl_continuos::matrix::Matrix;
     ///
     /// let svd = GolubKahanSvd::new();
     /// let empty = Matrix::zeros(0, 0);
