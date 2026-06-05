@@ -1,439 +1,228 @@
-# PC-RL-Core
+# PC-RL-Continuos
 
-[![CI](https://github.com/BolivarTech/PC-RL-Core/actions/workflows/ci.yml/badge.svg)](https://github.com/BolivarTech/PC-RL-Core/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/pc-rl-core.svg)](https://crates.io/crates/pc-rl-core)
-[![docs.rs](https://docs.rs/pc-rl-core/badge.svg)](https://docs.rs/pc-rl-core)
+[![CI](https://github.com/BolivarTech/PC-RL-Continuos/actions/workflows/ci.yml/badge.svg)](https://github.com/BolivarTech/PC-RL-Continuos/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
 
-A **Deliberative Predictive Coding (DPC)** reinforcement learning framework implemented entirely in Rust with zero ML framework dependencies.
+**Continuous-action** Deliberative Predictive Coding (DPC) reinforcement learning, implemented entirely in Rust with **zero ML-framework dependencies**.
 
-The actor **deliberates before acting** by running an iterative free energy minimization loop (predictive coding inference), and a **residual echo of that deliberation** feeds back into weight updates as a structured micro-regularizer. These two mechanisms form a coupled system: deliberation generates the signal, the signal improves learning, and better learning improves future deliberation.
+The policy is a **predictive-coding actor** that *deliberates before acting* — it runs an iterative top-down/bottom-up free-energy-minimization loop instead of a single feedforward pass. On continuous action spaces this actor is trained by **canonical Soft Actor-Critic (SAC)**: a reparameterized squashed-Gaussian policy driven by a twin action-value critic, with automatic entropy temperature and off-policy replay.
 
-The library is **backend-agnostic**: all linear algebra operations are abstracted behind a `LinAlg` trait, enabling future GPU backends (wgpu, CUDA) without changing the RL logic.
+> **Lineage.** This project is the continuous-control line of the DPC architecture. It is built on, and shares its foundation with, the discrete framework [**PC-RL-Core**](https://github.com/BolivarTech/PC-RL-Core) (Tic-Tac-Toe-validated, REINFORCE + V-critic). PC-RL-Continuos keeps the predictive-coding actor but replaces the discrete on-policy machinery with off-policy SAC for deterministic continuous-policy convergence.
+
+The library is **backend-agnostic**: all linear algebra is abstracted behind a `LinAlg` trait, enabling future GPU backends (CUDA/wgpu) without touching the RL logic.
+
+## Why SAC on a predictive-coding actor
+
+On continuous control, a deterministic policy `μ` must converge onto the optimum the exploration discovers. A score-function (REINFORCE) gradient is **degenerate at the saturated `tanh` squash boundary** where many control optima live (max torque, max force): `tanh` is flat there, so changing `μ_raw` does not change the action — the mean is decoupled from the advantage signal and never converges.
+
+SAC's **pathwise / reparameterization gradient** solves this:
+
+```
+∇_μ J = ∇_a Q(s, a) · ∂a/∂μ_raw
+```
+
+The action-value critic `Q(s, a)` supplies a low-variance *directional* signal that pins the mean to the value optimum — exactly what the score-function cannot. This requires the full canonical SAC recipe: twin Q critics, Polyak target networks, a replay buffer, a reparameterized squashed-Gaussian actor with learned per-state σ, and automatic entropy temperature.
 
 ## Installation
 
 ```toml
 [dependencies]
-pc-rl-core = "2.0"
+pc-rl-core = "6.0"
 ```
 
-## Quick Start
+## Quick Start (continuous SAC)
 
 ```rust
 use pc_rl_core::{
-    CpuLinAlg, PcActorCritic, PcActorCriticConfig, PcActorConfig, MlpCriticConfig,
-    Activation, LayerDef, SelectionMode,
+    CpuLinAlg, PcActorCritic, PcActorCriticConfig, PcActorConfig,
+    QCriticConfig, Activation, LayerDef, SelectionMode,
 };
+use pc_rl_core::pc_actor_critic::ActionSpace;
 
-// Configure the agent
-let actor_config = PcActorConfig {
-    input_size: 9,
-    output_size: 9,
-    hidden_layers: vec![LayerDef { size: 27, activation: Activation::Softsign }],
-    output_activation: Activation::Linear,
+// --- Actor: a predictive-coding network emitting [μ_raw | log_σ_raw] ---
+// output_size = 2 * action_dim, output_activation = Linear (required for SAC).
+let action_dim = 1; // e.g. Pendulum-v1 torque
+let state_dim  = 3;
+
+let actor = PcActorConfig {
+    input_size: state_dim,
+    output_size: 2 * action_dim,          // μ_raw and log_σ_raw heads
+    hidden_layers: vec![LayerDef { size: 64, activation: Activation::Softsign }],
+    output_activation: Activation::Linear, // MUST be Linear in SAC mode
     alpha: 0.03,
     tol: 0.01,
     min_steps: 1,
     max_steps: 5,
-    lr_weights: 0.005,
+    lr_weights: 3e-4,
     synchronous: true,
     temperature: 1.0,
-    local_lambda: 0.99,
+    local_lambda: 1.0,
     residual: false,
     rezero_init: 0.001,
 };
 
-let critic_config = MlpCriticConfig {
-    input_size: 36,  // state_dim + latent_dim
-    hidden_layers: vec![LayerDef { size: 36, activation: Activation::Softsign }],
-    output_activation: Activation::Linear,
-    lr: 0.005,
+// --- Twin Q action-value critics Q(s, a) → scalar ---
+let q_critic = QCriticConfig {
+    state_dim,
+    action_dim,
+    hidden_layers: vec![LayerDef { size: 64, activation: Activation::Tanh }],
+    lr: 3e-4,
 };
 
-let config = PcActorCriticConfig {
-    actor: actor_config,
-    critic: critic_config,
+let mut config = PcActorCriticConfig {
+    action_space: ActionSpace::Continuous, // ⇒ canonical SAC
+    q_critic: Some(q_critic),              // required when continuous
+    polyak_tau: 0.005,                     // soft target-network update rate
+    target_entropy: None,                  // None ⇒ −action_dim (standard SAC)
+    log_alpha_init: 0.0,                   // α₀ = exp(0) = 1.0
+    alpha_lr: 3e-4,                        // temperature learning rate
+    replay_training_capacity: 100_000,     // off-policy replay buffer (required > 0)
+    replay_batch_size: 256,
     gamma: 0.99,
-    surprise_low: 0.02,
-    surprise_high: 0.15,
-    adaptive_surprise: true,
-    surprise_buffer_size: 400,
-    entropy_coeff: 0.0,
-    td_steps: 0,       // TD(n) n-step returns (0 = default, >=2 for multi-step)
-    gae_lambda: Some(0.95), // GAE(λ) eligibility traces (None = disabled, recommended 0.95)
-    ..Default::default()  // CL features default to disabled
+    ..Default::default()
 };
 
 let backend = CpuLinAlg::new();
 let mut agent = PcActorCritic::new(backend, config, 42)?;
 
-// Continuous learning loop (step API — TD(0) or TD(n))
+// --- Training loop: one off-policy SAC step per environment step ---
+let mut state = env.reset();
 loop {
-    let action = agent.step(&state, reward, terminal);
-    // ... or with action masking:
-    let action = agent.step_masked(&state, &valid_actions, reward, terminal)?;
-
-    if terminal { break; }
-    // ... execute action in environment, get next state + reward ...
-}
-
-// Episodic learning (REINFORCE — alternative to step API)
-let (action, infer_result) = agent.act(&state, &valid_actions, SelectionMode::Training);
-// ... collect TrajectoryStep per timestep ...
-let avg_loss = agent.learn(&trajectory);
-
-// Evaluation (deterministic)
-let (action, _) = agent.act(&state, &valid_actions, SelectionMode::Play);
-```
-
-## Self-Recovery Workflow
-
-Self-recovery is the library's answer to catastrophic forgetting and
-policy cascades during continuous learning. It exposes three
-complementary mechanisms:
-
-- **Polyak-tracked target** (noise smoothing, `~1/polyak_tau` step lag).
-- **Frozen champion anchor** (cascade recovery, immutable between
-  explicit promotions).
-- **Dual-compartment replay buffer** (off-policy TD updates from stored
-  positive-reward trajectories).
-
-All three are **opt-in** (`lambda = 0` and `capacity = 0` defaults make
-them no-ops). The consumer drives the recovery pipeline — the library
-never calls `rollback_*` or `champion_update` on its own.
-
-### Enabling
-
-```rust
-use pc_rl_core::{CpuLinAlg, PcActorCritic, PcActorCriticConfig};
-
-let config = PcActorCriticConfig {
-    // ... existing actor/critic/gamma/... fields ...
-
-    // Phase 1: dual anchors
-    distillation_lambda_polyak: 0.05,   // KL weight toward Polyak target
-    polyak_tau:                 0.005,  // EMA rate (~200-step lag)
-    distillation_lambda_frozen: 0.05,   // KL weight toward frozen champion
-
-    // Phase 2: replay buffer
-    replay_training_capacity:   200,    // compartment A size (0 disables)
-    replay_recent_capacity:     100,    // compartment B size
-    replay_positive_only:       true,   // drop reward <= 0.0 transitions
-    replay_batch_size:          64,     // sample size per replay_learn call
-
-    // EWC regularization composes naturally with the anchors
-    ewc_lambda: 0.1,
-
-    ..Default::default()
-};
-
-let mut agent = PcActorCritic::new(CpuLinAlg::new(), config, 42)?;
-```
-
-### Typical consumer pipeline
-
-```rust
-// 1) Train normally — transitions auto-record into compartment A.
-for step in 0..n_warmup {
-    let action = agent.step_masked(&state, &valid, reward, terminal)?;
-    // ... environment step ...
-}
-
-// 2) Lock in a champion once fitness is acceptable. `champion_update`
-//    promotes the live actor into the frozen slot; `seal_replay...`
-//    freezes compartment A and routes further pushes to compartment B.
-agent.champion_update()?;
-agent.seal_replay_training_memories()?;
-
-// 3) Continue learning. Compartment B now collects recent successes.
-for step in 0..n_stress {
-    let action = agent.step_masked(&state, &valid, reward, terminal)?;
-}
-
-// 4) If a fitness regression is detected (consumer-side check):
-if consumer_detects_cascade(&agent) {
-    agent.clear_recent_memories()?;   // drop contaminated compartment B
-    agent.rollback_hard()?;           // live actor <- frozen champion
-    for _ in 0..50 {                  // critic warmup from stored A transitions
-        agent.replay_learn(64)?;
-    }
-}
-
-// 5) For short-horizon noise smoothing (NOT cascade recovery), use:
-agent.rollback_soft()?;               // live actor <- Polyak target
-```
-
-### When to use each method
-
-| Symptom observed by consumer | Recommended response |
-|---|---|
-| Policy oscillating around a local minimum | `rollback_soft` (undoes ~`1/polyak_tau` steps of noise) |
-| Fitness regression sustained over hundreds of steps | `clear_recent_memories` + `rollback_hard` + warmup |
-| Starting fresh recovery cycle with a new champion | `champion_update` + `seal_replay_training_memories` |
-| Monitoring off-policy stability | `agent.replay_clamp_count()` (monotonic counter) |
-
-`rollback_hard` enforces a cooldown window (default 100 steps) — calling
-it in a tight loop returns `Err(PcError::ConfigValidation)` without
-mutating state. Override via `set_rollback_hard_cooldown(n)`.
-
-### Observability
-
-- `replay_clamp_count() -> u64` — monotonic counter of replay updates
-  where the TD-error clamp bound (±5.0). Sustained incrementing is the
-  leading indicator that off-policy drift is close to its envelope; the
-  consumer can size warmup windows from the growth rate.
-- Save/load persists all self-recovery state: anchor weights, replay
-  buffer contents, clamp counter, and cooldown timers. Legacy
-  pre-Phase-1 save files load cleanly with anchors auto-initialized
-  from the live actor.
-
-See the `# When to use` sections on `rollback_soft` / `rollback_hard`
-and the "Stale V(s) batch semantics" rustdoc on `replay_learn` for the
-full design rationale and parameter-tuning guidance.
-
-### Replay under actor and critic hysteresis
-
-By default, when actor or critic hysteresis is enabled and the
-corresponding network is in FROZEN state, `replay_learn` updates
-the gated network at the `scale_floor` clamp (default 0.0 → no
-update). The protected network is shielded from off-policy
-gradients during stress; the un-gated network continues learning.
-
-To let replay reinforce a FROZEN network anyway, set the
-corresponding opt-in floor to a strict-positive value:
-
-- **Actor:** `scale_floor_replay = 0.3` (or higher; up to `10 ×
-  scale_ceil`). Actor opt-in also enables Polyak and Frozen KL
-  anchor gradients in the replay update.
-- **Critic (v3.0.0+):** `critic_floor_replay = 0.3` — parallel
-  knob for the critic. Same tri-state sentinel semantics, same
-  validation rule.
-
-Recommended pairs (set both fields together to keep
-actor-critic dynamics symmetric):
-
-- `(-1.0, -1.0)` (default) — both networks protected during
-  FROZEN-replay.
-- `(0.3, 0.3)` — mild symmetric recovery.
-- `(1.0, 1.0)` — aggressive symmetric recovery.
-
-Asymmetric pairs (one strict-positive, the other at sentinel)
-are allowed but produce desynchronization — the moving network
-learns from storage while the gated network stays frozen.
-
-### Migration from v3.x to v4.0.0 — generic action space
-
-In v4.0.0, `pc-rl-core` adds continuous-action support alongside
-the existing discrete pipeline. v3.x consumers:
-
-**Discrete (default) — minimal migration:**
-
-- Add `?` to `act()` calls (return type became `Result`).
-- Replace deprecated `step(state, reward, done)` with
-  `step_masked(state, &(0..output_size).collect::<Vec<_>>(), reward, done)?`.
-- All other API surface unchanged.
-
-**Adopting continuous:**
-
-```rust,ignore
-use pc_rl_core::{ActionSpace, PcActorCriticConfig};
-use pc_rl_core::activation::Activation;
-
-// Start from your existing v3.x config literal (PcActorCriticConfig
-// has no Default impl — replicate field-by-field or reload via serde).
-let mut config: PcActorCriticConfig = existing_v3_config;
-
-config.action_space = ActionSpace::Continuous;
-config.policy_sigma = 0.1;             // Gaussian std-dev
-config.distillation_lambda_polyak = 0.0;  // required: continuous mode
-config.distillation_lambda_frozen = 0.0;  // required: continuous mode
-config.actor.output_activation = Activation::Tanh;  // for bounded actions
-
-let mut agent = PcActorCritic::new(backend, config, seed)?;
-
-loop {
+    // Samples a ~ tanh(μ_raw + σ·ε), stores the transition, runs a SAC
+    // mini-batch update (twin-Q soft Bellman + pathwise actor + temperature),
+    // and Polyak-updates the target nets.
     let action = agent.step_continuous(&state, reward, done)?;
-    let next_state = env.apply(&action);
+    let (next_state, reward, done) = env.apply(&action);
     state = next_state;
+    if done { state = env.reset(); }
 }
+
+// --- Deterministic evaluation: Play returns tanh(μ_raw), no noise ---
+let (action, _infer) = agent.act_continuous(&state, SelectionMode::Play)?;
+# Ok::<(), pc_rl_core::PcError>(())
 ```
 
-**Self-recovery toolkit availability:**
+## Canonical SAC — design
 
-| Mode | rollback_soft | rollback_hard | champion_update |
-|---|---|---|---|
-| Discrete | ✓ | ✓ | ✓ |
-| Continuous | ✗ (Polyak distillation rejected) | ✗ (Frozen distillation rejected) | ✗ |
+| Component | Behavior |
+|---|---|
+| **Reparameterized squashed-Gaussian actor** | The PC actor's converged output `y_conv` (size `2·action_dim`) splits into `μ_raw` and `log_σ_raw` (clamped to `[−5, 2]`). σ is **learned per state**. Sample `a = tanh(μ_raw + σ·ε)`, `ε ~ N(0, I)`. Play returns `tanh(μ_raw)`. |
+| **Twin Q critics (`QCritic`)** | Two independent `Q(s, a)` networks. `min(Q1, Q2)` is used for both the actor update and the Bellman target (clipped double-Q, mitigates overestimation). |
+| **`∇_a Q` (backprop-to-input)** | New capability: the gradient of the scalar Q output w.r.t. the action input — the directional signal that drives the pathwise actor gradient. |
+| **Target networks (Polyak)** | `Q1ₜ, Q2ₜ` soft-updated each step: `θₜ ← (1−τ)·θₜ + τ·θ`, `τ = polyak_tau`. Used only for the soft-Bellman target. |
+| **Off-policy replay** | Uniform buffer of `(s, a_raw, r, s', done)` transitions. Each step samples a `replay_batch_size` mini-batch. `replay_training_capacity > 0` is **required** in SAC mode. |
+| **Automatic temperature α** | A learned scalar `log_α` tuned toward `H_target` (default `−action_dim`): `J(α) = −α·(logπ + H_target)`. Configurable via `log_alpha_init`, `alpha_lr`, `target_entropy`. |
+| **log-prob with tanh-Jacobian** | `logπ(a\|s) = log N(a_raw; μ, σ²) − Σ log(1 − tanh²(a_raw))` — the squashed-Gaussian correction, generalized to learned σ. |
 
-L2-anchored continuous distillation is experimental future work.
-For continuous training requiring self-recovery, evaluate via
-discrete intermediate or wait for the experimental branch.
-
-### Migration from v2.2.x to v3.0.0 — critic hysteresis enforcement
-
-In v3.0.0 the critic's `critic_hysteresis.state` is enforced on
-weight updates for the first time. Consumers running with
-`critic_hysteresis = true` who relied on the v2.2.x implicit
-"critic always updates" behavior will see changed dynamics. See
-`CHANGELOG.md` `[3.0.0] - Breaking changes` for the full
-migration table.
-
-**Recommended migration — paired opt-in.** Start from your existing
-v2.2.x `PcActorCriticConfig` literal (or your serde-loaded config)
-and override the four self-recovery fields below:
-
-```rust,ignore
-use pc_rl_core::PcActorCriticConfig;
-
-// `existing_v2_2_x_config` is your current full PcActorCriticConfig
-// literal (PcActorCriticConfig does NOT implement Default — replicate
-// your existing field-by-field literal here, or reload via serde).
-let mut config: PcActorCriticConfig = existing_v2_2_x_config;
-
-// Paired opt-in: both actor and critic learn during FROZEN-replay,
-// preserving the v2.2.x effective behaviour of "critic always
-// learning during stress" while also activating the actor side.
-// The two fields should be set TOGETHER to avoid actor-critic
-// desynchronization.
-config.actor_hysteresis = true;
-config.critic_hysteresis = true;
-
-// 0.3 is "mild recovery". For behavioural equivalence to the
-// v2.2.x dynamic surprise→scale band, use `config.scale_ceil`
-// (typically 2.0); see CHANGELOG [3.0.0] migration table.
-config.scale_floor_replay = 0.3;
-config.critic_floor_replay = 0.3;
-```
-
-Leaving both at their default `-1.0` sentinel is also valid and
-corresponds to "full stress protection" — neither network updates
-during FROZEN windows, and cross-wake coupling eventually
-re-activates learning. Partial opt-in (one field positive, the
-other `-1.0`) is allowed but produces asymmetric dynamics and is
-not recommended for most workloads.
+**Per-step update order:** collect transition → twin-Q soft-Bellman (MSE) → pathwise actor (`α·logπ − min Q`) → temperature → Polyak soft target update.
 
 ## Architecture
 
-### Core Components
+### Core components
 
-- **`PcActor<L: LinAlg>`** -- Policy network with predictive coding inference loop, residual skip connections, surprise scoring, and CCA crossover
-- **`MlpCritic<L: LinAlg>`** -- Standard MLP value function with MSE loss backpropagation and CCA crossover
-- **`PcActorCritic<L: LinAlg>`** -- Integrated agent combining actor and critic with surprise-based learning rate scheduling, continuous learning (CL), and TD(n) n-step returns
-- **`Layer<L: LinAlg>`** -- Dense layer with forward, transpose (PC top-down), and backward passes
-- **`LinAlg` trait** -- Backend-agnostic linear algebra interface (31 instance methods). Default implementation: `CpuLinAlg`
-- **`GolubKahanSvd`** -- O(n^3) SVD via bidiagonalization, used for CCA neuron alignment
+- **`PcActor<L: LinAlg>`** — policy network with the predictive-coding inference loop (top-down prediction / bottom-up error until convergence), residual skip connections, and surprise scoring. Emits `[μ_raw | log_σ_raw]` in SAC mode.
+- **`QCritic<L: LinAlg>`** — action-value critic `Q(s, a): (state ⊕ action) → scalar`. Exposes `forward`, `update` (MSE), and `∇_a Q` via backprop-to-input. Twin instances form the clipped double-Q.
+- **`PcActorCritic<L: LinAlg>`** — integrated agent. Continuous mode (`ActionSpace::Continuous`) runs canonical SAC; `step_continuous` / `act_continuous` are the entry points.
+- **`Layer<L: LinAlg>`** — dense layer with forward, transpose-forward (PC top-down), backward, and `input_gradient` (backprop-to-input).
+- **`LinAlg` trait** — backend-agnostic linear algebra (31 instance methods). Default: `CpuLinAlg`.
 
-### Key Mechanisms
+### Predictive-coding inference
 
-**Predictive Coding Inference**: Instead of a single feedforward pass, the actor runs an iterative inference loop where higher layers generate top-down predictions of lower layer states. The prediction error (surprise) between layers drives hidden state updates until convergence.
+Instead of a single feedforward pass, the actor runs an iterative loop where higher layers generate top-down predictions of lower-layer states. The inter-layer prediction error (*surprise*) drives hidden-state updates until convergence (`alpha`, `tol`, `max_steps`). The converged output is the policy's `(μ_raw, log_σ_raw)`. The PC actor is **never** replaced by a feedforward MLP — SAC adapts to it.
 
-**Residual Echo (local_lambda)**: A small fraction of prediction errors from deliberation is blended into backpropagation gradients: `delta = lambda * backprop_grad + (1-lambda) * pc_error`. This couples inference and learning into a synergistic system.
+### Key SAC config surface
 
-**Adaptive Surprise Scheduling**: A circular buffer of recent surprise scores dynamically calibrates learning rate thresholds. Low surprise reduces LR (familiar states), high surprise boosts LR (novel states). Buffer-mediated damping protects learned representations during environment transitions.
+| Field | Meaning |
+|---|---|
+| `action_space: ActionSpace::Continuous` | Selects the SAC path. |
+| `q_critic: Option<QCriticConfig>` | Twin-Q critic topology (`state_dim`, `action_dim`, hidden layers, lr). Required `Some` when continuous. |
+| `polyak_tau: f64` | Soft target-network update rate, `(0, 1]`. |
+| `target_entropy: Option<f64>` | `H_target`; `None` ⇒ `−action_dim`. |
+| `log_alpha_init: f64` | Initial log-temperature (`α₀ = exp(log_alpha_init)`). |
+| `alpha_lr: f64` | Temperature learning rate. |
+| `replay_training_capacity: usize` | Replay buffer size (must be `> 0`). |
+| `replay_batch_size: usize` | SAC mini-batch size. |
+| `gamma: f64` | Discount factor. |
 
-**CCA Crossover**: GA-ready crossover operator using Canonical Correlation Analysis to align neurons functionally before blending weights, solving the permutation problem. Supports dimension mismatches, layer count differences, and residual components.
-
-**Continuous Learning (v2.1.0)**: Surprise-driven plasticity modulation for non-stationary environments:
-- *M1 Scale Range*: Configurable surprise-to-learning-rate mapping (`scale_floor`/`scale_ceil`)
-- *M2 Dual-EWMA Hysteresis*: Automatic FROZEN/PLASTIC transitions via fast/slow surprise EWMAs
-- *M3 Consolidation Decay*: Per-layer exponential decay (fixed M3a) or adaptive sigmoid (M3b)
-- *M4 EWC Regularization*: Fisher diagonal with 3-step lifecycle (decay/accumulate/merge)
-- *Bidirectional Coupling*: `actor_wakes_critic` + `critic_wakes_actor` (both default true) with EWMA k reset to prevent re-freeze
-- *NaN Safety*: Guards in EwmaTracker, learn_continuous, push_surprise, push_td_error
-
-**TD(n) N-Step Returns (v2.1.0)**: Configurable n-step temporal difference learning via `td_steps`. Buffers n transitions before bootstrapping with V(s_{t+n}). Terminal flush uses pre-computed V(s) to avoid stale-estimate bias. `td_steps=0` (default) preserves exact TD(0) behavior with zero overhead. See [docs/td_n_spec.md](docs/td_n_spec.md).
-
-**GAE(λ) Eligibility Traces (v2.1.0)**: Output-level eligibility traces via `gae_lambda: Option<f64>`. Accumulates policy gradient direction across steps: `trace = γλ*trace + ∇log π`, then `delta = td_error * trace`. Smoothly interpolates between TD(0) (λ=0) and Monte Carlo (λ=1). Trace clipped at GRAD_CLIP=5.0. Mutually exclusive with `td_steps > 0`. Default `None` (disabled); recommended `Some(0.95)` for short episodes.
-
-### Type Aliases
+### Type aliases
 
 ```rust
-type PcActorCpu = PcActor<CpuLinAlg>;
-type MlpCriticCpu = MlpCritic<CpuLinAlg>;
+type PcActorCpu       = PcActor<CpuLinAlg>;
+type QCriticCpu       = QCritic<CpuLinAlg>;
 type PcActorCriticCpu = PcActorCritic<CpuLinAlg>;
-type LayerCpu = Layer<CpuLinAlg>;
+type LayerCpu         = Layer<CpuLinAlg>;
 ```
 
-## Project Structure
+## Project structure
 
 ```
-PC-RL-Core/
+PC-RL-Continuos/
 ├── src/
 │   ├── linalg/
-│   │   ├── mod.rs                  # LinAlg trait (31 methods, backend-agnostic)
+│   │   ├── mod.rs                  # LinAlg trait (backend-agnostic)
 │   │   ├── cpu.rs                  # CpuLinAlg (Vec<f64> + Matrix)
 │   │   └── golub_kahan.rs          # Golub-Kahan SVD (O(n^3))
 │   ├── activation.rs               # Tanh, ReLU, Sigmoid, ELU, Softsign, Linear
 │   ├── error.rs                    # PcError crate-wide error type
-│   ├── matrix.rs                   # Dense matrix, softmax, CCA alignment, Hungarian assignment
-│   ├── layer.rs                    # Layer<L: LinAlg> with PC top-down support
-│   ├── pc_actor.rs                 # PcActor<L> with inference loop, residual, crossover
-│   ├── mlp_critic.rs               # MlpCritic<L> value function, crossover
-│   ├── pc_actor_critic/            # PcActorCritic<L> directory submodule
-│   │   ├── mod.rs                  # Agent impl: act, step, learn, crossover, CL pipeline
-│   │   ├── config.rs               # PcActorCriticConfig + 31 serde defaults
-│   │   ├── ewma.rs                 # EwmaTracker + PlasticityState (with NaN guard)
-│   │   ├── hysteresis.rs           # HysteresisState dual-EWMA state machine
+│   ├── matrix.rs                   # Dense matrix, softmax, clipping helpers
+│   ├── layer.rs                    # Layer<L> with PC top-down + input_gradient
+│   ├── pc_actor.rs                 # PcActor<L> inference loop (policy network)
+│   ├── q_critic.rs                 # QCritic<L> action-value critic + ∇_a Q
+│   ├── mlp_critic.rs               # MlpCritic<L> (discrete V-critic, untouched)
+│   ├── pc_actor_critic/            # Integrated agent (directory submodule)
+│   │   ├── mod.rs                  # act/step, step_continuous, act_continuous
+│   │   ├── sac.rs                  # SAC learn step: twin-Q, pathwise actor, α, Polyak
+│   │   ├── replay.rs               # Off-policy replay buffer + continuous transitions
+│   │   ├── config.rs               # PcActorCriticConfig + ActionSpace + serde defaults
+│   │   ├── control.rs              # Plasticity / hysteresis control surface
+│   │   ├── ewma.rs                 # EwmaTracker + PlasticityState
+│   │   ├── hysteresis.rs           # Dual-EWMA FROZEN/PLASTIC state machine
 │   │   ├── fisher.rs               # FisherState<L> for EWC regularization
 │   │   └── trajectory.rs           # TrajectoryStep<L> + ActivationCache<L>
-│   └── serializer.rs               # JSON persistence, ClState with backward compat
+│   └── serializer.rs               # JSON persistence (Q nets, target nets, log_α)
 ├── docs/
-│   ├── experiment_analysis.md      # 20 experimental phases, ~3,800 runs
 │   ├── pc_actor_critic_paper.md    # DPC architecture paper
-│   ├── continuous_learning_spec.md # CL v2.1.0 specification
-│   └── td_n_spec.md               # TD(n) technical specification
+│   ├── pc_inference_intuitive_guide.md
+│   ├── experiment_pendulum_v1_spec.md
+│   └── continuous_space_test_harness_guide.md
 └── Cargo.toml
 ```
 
-## Research Findings
+## Validation
 
-Validated through 20 experimental phases (~3,800 training runs) on Tic-Tac-Toe ([PC-TicTacToe](https://github.com/BolivarTech/PC-TicTacToe)):
-
-- **Deliberation is the primary advantage** -- PC inference loop adds +2-3 depth levels over equivalent MLP
-- **Residual echo breaks performance ceilings** -- 1% PC error blend (lambda=0.99) is statistically significant (p<0.034)
-- **Depth-Lambda Scaling Law: `lambda = 1 - 10^(-(L+1))`** -- PC error must decrease exponentially with network depth
-- **Lambda and training budget interact** -- ultra-low PC error needs more episodes to accumulate its regularization effect
-- **Adaptive surprise eliminates catastrophic forgetting** -- buffer-mediated transition damping protects learned representations during curriculum transitions
-- **Optimal buffer ratio: 0.3-0.4 x environment transition window** -- too small resonates, too large over-damps
-- **Bounded activations required for PC** -- ReLU dies, ELU explodes; tanh and softsign work
-- **Softsign + residual + projection cooperate** -- three mechanisms enable gradient flow in deep networks
-- **Parameter efficiency** -- ~550 actor parameters matching networks 4-330x larger through iterative inference
+Deterministic continuous-policy convergence is validated **downstream** by the
+PC-Pendulum harness on **Pendulum-v1** (`multi_seed` 10×500): the deterministic
+evaluation mean clears ≈ −500 with ≥ 5/10 seeds > −400. In-library tests are
+directional/mechanism guards (pathwise gradient drives `μ_raw` toward saturated
+optima; `μ_raw` stays bounded; log-prob Jacobian; auto-temperature sign), not a
+convergence proof.
 
 ## Documentation
 
-| Document | Audience | Content |
-|---|---|---|
-| [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md) | Researchers, contributors | Formal architecture spec, mathematical justification (including §1.6 on equilibrium-snapshot backprop strategy), full empirical results, lessons learned |
-| [docs/pc_inference_intuitive_guide.md](docs/pc_inference_intuitive_guide.md) | New users, mental-model builders | Conversational walkthrough of PC inference + backprop with metaphors, numerical examples, FAQ — companion to the formal paper |
-| [docs/experiment_analysis.md](docs/experiment_analysis.md) | Anyone reproducing results | Complete experimental methodology, statistical validation across 35 seeds × 8 configurations |
-| [docs/generic_action_space_spec.md](docs/generic_action_space_spec.md) | v4.0.0 adopters | v4.0.0 generic action space spec — discrete vs continuous design, brainstorm decisions Q1-Q8 |
-| [docs/continuous_learning_spec.md](docs/continuous_learning_spec.md) | CL adopters | Continuous Learning (M1-M4) detailed spec |
-| [docs/td_n_spec.md](docs/td_n_spec.md) | TD(n) users | n-step temporal difference learning spec |
-| [docs/gae_spec.md](docs/gae_spec.md) | GAE users | Generalized Advantage Estimation spec |
-| [docs/crossover_technical_spec.md](docs/crossover_technical_spec.md) | GA evolution users | CCA-based neural network crossover for genetic algorithms |
-| [docs/apply_config_spec.md](docs/apply_config_spec.md) | Runtime config mutation | Hot-reload of config fields without rebuilding the agent |
-| [docs/experiment_pendulum_v1_spec.md](docs/experiment_pendulum_v1_spec.md) | Validators / contributors | Spec for `PC-Pendulum` standalone project — empirical validation of v4.0.0 continuous on Pendulum-v1 swing-up task |
-| [docs/experiment_cartpole_continuous_spec.md](docs/experiment_cartpole_continuous_spec.md) | Validators / contributors | Spec for `PC-CartPole-Continuous` standalone project — companion validation on cart-pole balance task |
-| [CHANGELOG.md](CHANGELOG.md) | Migration | Per-release breaking changes, migration tables, mitigation matrices |
+| Document | Content |
+|---|---|
+| [docs/pc_actor_critic_paper.md](docs/pc_actor_critic_paper.md) | Formal DPC architecture spec and mathematical justification |
+| [docs/pc_inference_intuitive_guide.md](docs/pc_inference_intuitive_guide.md) | Conversational walkthrough of PC inference + learning |
+| [docs/experiment_pendulum_v1_spec.md](docs/experiment_pendulum_v1_spec.md) | Spec for the PC-Pendulum validation harness (continuous, Pendulum-v1) |
+| [docs/continuous_space_test_harness_guide.md](docs/continuous_space_test_harness_guide.md) | Configuring and running the continuous harness |
+| [CHANGELOG.md](CHANGELOG.md) | Per-release changes and migration notes |
 
 ## Dependencies
 
-- `serde` / `serde_json` -- Serialization
-- `rand` -- Random number generation
-- `chrono` -- Timestamps
+- `serde` / `serde_json` — serialization
+- `rand` — random number generation
+- `chrono` — timestamps
 
 No PyTorch, TensorFlow, or any ML framework. Pure Rust from scratch.
 
 ## Testing
 
-538 unit tests + 21 doctests:
-
 ```bash
-cargo nextest run
-cargo test --doc
-cargo clippy --tests -- -D warnings
+cargo nextest run                          # fast suite
+cargo nextest run -- --ignored             # slow SAC learning guards
+cargo test --doc                           # doctests
+cargo clippy --all-targets -- -D warnings  # lint
 ```
 
 ## License
