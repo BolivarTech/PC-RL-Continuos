@@ -1,20 +1,22 @@
 // Author: Julian Bolivar
-// Version: 1.0.0
-// Date: 2026-03-25
+// Version: 2.0.0
+// Date: 2026-05-26
 
-//! Predictive Coding Actor-Critic framework.
+//! Predictive Coding Actor-Critic framework — continuous (SAC) only.
 //!
-//! A publishable reinforcement learning library implementing a novel architecture where the
-//! actor uses iterative top-down/bottom-up predictive coding inference loops instead of
-//! standard feedforward passes, combined with a standard MLP critic for value estimation.
+//! Canonical Soft Actor-Critic (SAC) reinforcement learning library where the
+//! actor uses iterative top-down/bottom-up predictive coding inference loops
+//! and emits the parameters of a tanh-squashed Gaussian policy
+//! (`[μ_raw | log_σ_raw]`). A twin Q critic with Polyak-averaged targets,
+//! automatic temperature tuning, and a replay buffer drive learning.
 //!
 //! # Key Components
 //!
-//! - [`PcActor`] — Predictive coding network with variable hidden topology, iterative
-//!   inference loop, and surprise scoring.
-//! - [`MlpCritic`] — Standard MLP value function with MSE loss backpropagation.
-//! - [`PcActorCritic`] — Integrated agent: act, learn (episodic/continuous), surprise-based
-//!   scheduling, save/load.
+//! - [`PcActor`] — Predictive coding policy network. Outputs
+//!   `2 * action_dim` values split into `μ_raw` and `log_σ_raw` heads.
+//! - [`QCritic`] — Twin Q(s, a) critic with backprop-to-input gradient.
+//! - [`PcActorCritic`] — Integrated SAC agent: `act_continuous`,
+//!   `step_continuous`, automatic temperature, replay, Polyak target updates.
 //! - [`serializer`] — JSON weight persistence with checkpointing support.
 
 pub mod activation;
@@ -22,7 +24,7 @@ pub mod error;
 pub mod layer;
 pub mod linalg;
 pub mod matrix;
-pub mod mlp_critic;
+pub(crate) mod mlp_critic;
 pub mod pc_actor;
 pub mod pc_actor_critic;
 pub mod q_critic;
@@ -34,16 +36,9 @@ pub use layer::{Layer, LayerDef};
 pub use linalg::cpu::CpuLinAlg;
 pub use linalg::golub_kahan::{GolubKahanSvd, SvdError};
 pub use linalg::LinAlg;
-pub use matrix::{
-    argmax_masked, cca_neuron_alignment, rms_error, sample_from_probs, softmax_masked, Matrix,
-    GRAD_CLIP, WEIGHT_CLIP,
-};
-pub use mlp_critic::{MlpCritic, MlpCriticConfig, MlpCriticWeights};
+pub use matrix::{rms_error, Matrix, GRAD_CLIP, WEIGHT_CLIP};
 pub use pc_actor::{InferResult, PcActor, PcActorConfig, SelectionMode};
-pub use pc_actor_critic::{
-    ActionSpace, ActivationCache, EwmaTracker, FisherState, HysteresisState, PcActorCritic,
-    PcActorCriticConfig, PlasticityState, TrajectoryStep,
-};
+pub use pc_actor_critic::{ActivationCache, PcActorCritic, PcActorCriticConfig, TrajectoryStep};
 pub use q_critic::{QCritic, QCriticConfig, QCriticWeights};
 pub use serializer::{
     checkpoint_filename, load_agent, load_agent_generic, save_agent, save_checkpoint,
@@ -54,8 +49,6 @@ pub use serializer::{
 pub type LayerCpu = Layer<CpuLinAlg>;
 /// Type alias: CPU-backed PC actor.
 pub type PcActorCpu = PcActor<CpuLinAlg>;
-/// Type alias: CPU-backed MLP critic.
-pub type MlpCriticCpu = MlpCritic<CpuLinAlg>;
 /// Type alias: CPU-backed Q-critic.
 pub type QCriticCpu = QCritic<CpuLinAlg>;
 /// Type alias: CPU-backed PC actor-critic agent.

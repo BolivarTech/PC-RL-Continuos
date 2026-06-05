@@ -111,15 +111,6 @@ impl<L: LinAlg> PcActorCritic<L> {
         }
     }
 
-    /// Test helper: returns current `α = exp(log_alpha)`.
-    ///
-    /// Thin wrapper around [`alpha`](Self::alpha) so tests can call it without
-    /// the `#[allow(dead_code)]` suppression.
-    #[cfg(test)]
-    pub(crate) fn alpha_for_test(&self) -> f64 {
-        self.alpha()
-    }
-
     /// SAC entropy temperature `α = exp(log_alpha)`, or `None` outside SAC mode.
     ///
     /// SAC mode is detected by the presence of the twin Q-critics

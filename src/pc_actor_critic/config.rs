@@ -305,7 +305,7 @@ fn default_critic_floor_replay() -> f64 {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::LayerDef;
 /// use pc_rl_core::mlp_critic::MlpCriticConfig;

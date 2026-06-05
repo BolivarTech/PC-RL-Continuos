@@ -25,7 +25,7 @@ fn default_critic_lr() -> f64 {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::LayerDef;
 /// use pc_rl_core::mlp_critic::MlpCriticConfig;
@@ -36,7 +36,7 @@ fn default_critic_lr() -> f64 {
 ///     output_activation: Activation::Linear,
 ///     lr: 0.005,
 /// };
-/// ```
+/// ```ignore
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MlpCriticConfig {
     /// Dimensionality of the input vector (board state + latent concat).
@@ -70,7 +70,7 @@ pub struct MlpCriticWeights {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use pc_rl_core::activation::Activation;
 /// use pc_rl_core::layer::LayerDef;
 /// use pc_rl_core::linalg::cpu::CpuLinAlg;
@@ -88,7 +88,7 @@ pub struct MlpCriticWeights {
 /// let critic: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng).unwrap();
 /// let value = critic.forward(&vec![0.0; 27]);
 /// assert!(value.is_finite());
-/// ```
+/// ```ignore
 #[derive(Debug)]
 pub struct MlpCritic<L: LinAlg = CpuLinAlg> {
     /// Dense layers: hidden layers followed by the output layer (1 neuron).
@@ -146,161 +146,6 @@ impl<L: LinAlg> MlpCritic<L> {
             layers,
             config,
             backend,
-        })
-    }
-
-    /// Creates a child critic by crossing over two parent critics using CCA neuron alignment.
-    ///
-    /// Same logic as `PcActor::crossover` but simpler: no residual components.
-    /// Input and output layers use positional crossover, hidden layers use CCA.
-    ///
-    /// # Arguments
-    ///
-    /// * `parent_a` - First parent critic.
-    /// * `parent_b` - Second parent critic.
-    /// * `caches_a` - Per-layer activation matrices for parent A.
-    /// * `caches_b` - Per-layer activation matrices for parent B.
-    /// * `alpha` - Blending weight: 1.0 = all A, 0.0 = all B.
-    /// * `child_config` - Topology configuration for the child.
-    /// * `rng` - Random number generator for Xavier initialization.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PcError::ConfigValidation` if `child_config` is invalid.
-    pub fn crossover(
-        parent_a: &MlpCritic<L>,
-        parent_b: &MlpCritic<L>,
-        caches_a: &[L::Matrix],
-        caches_b: &[L::Matrix],
-        alpha: f64,
-        child_config: MlpCriticConfig,
-        rng: &mut impl Rng,
-    ) -> Result<Self, PcError> {
-        use crate::pc_actor::{cca_align_and_blend_layer, permute_cols};
-
-        let num_child_hidden = child_config.hidden_layers.len();
-        if num_child_hidden == 0 {
-            return Err(PcError::ConfigValidation(
-                "crossover requires at least one hidden layer".into(),
-            ));
-        }
-        let num_a_hidden = parent_a.config.hidden_layers.len();
-        let num_b_hidden = parent_b.config.hidden_layers.len();
-
-        let mut layers: Vec<Layer<L>> = Vec::new();
-        let mut prev_perm: Option<Vec<usize>> = None;
-
-        // Input layer (layer 0): CCA-aligned crossover
-        let child_h0 = &child_config.hidden_layers[0];
-
-        if parent_a.config.input_size == child_config.input_size
-            && parent_b.config.input_size == child_config.input_size
-        {
-            let (layer, perm) = cca_align_and_blend_layer(
-                &parent_a.backend,
-                &parent_a.layers[0],
-                &parent_b.layers[0],
-                caches_a.first(),
-                caches_b.first(),
-                None,
-                child_h0.size,
-                parent_a.backend.mat_cols(&parent_a.layers[0].weights),
-                child_h0.activation,
-                alpha,
-                rng,
-            )?;
-            layers.push(layer);
-            prev_perm = perm;
-        } else {
-            layers.push(Layer::<L>::new(
-                child_config.input_size,
-                child_h0.size,
-                child_h0.activation,
-                &parent_a.backend,
-                rng,
-            ));
-        }
-
-        // Hidden layers 1..n
-        for h_idx in 1..num_child_hidden {
-            let child_def = &child_config.hidden_layers[h_idx];
-            let prev_child_size = child_config.hidden_layers[h_idx - 1].size;
-
-            if h_idx < num_a_hidden && h_idx < num_b_hidden {
-                let (layer, perm) = cca_align_and_blend_layer(
-                    &parent_a.backend,
-                    &parent_a.layers[h_idx],
-                    &parent_b.layers[h_idx],
-                    caches_a.get(h_idx),
-                    caches_b.get(h_idx),
-                    prev_perm.as_deref(),
-                    child_def.size,
-                    prev_child_size,
-                    child_def.activation,
-                    alpha,
-                    rng,
-                )?;
-                layers.push(layer);
-                prev_perm = perm;
-            } else {
-                layers.push(Layer::<L>::new(
-                    prev_child_size,
-                    child_def.size,
-                    child_def.activation,
-                    &parent_a.backend,
-                    rng,
-                ));
-                prev_perm = None;
-            }
-        }
-
-        // Output layer (1 neuron): positional crossover with column propagation
-        let last_child_hidden = child_config.hidden_layers.last().map(|d| d.size).unwrap();
-        let a_out = parent_a.layers.last().unwrap();
-        let b_out = parent_b.layers.last().unwrap();
-
-        if parent_a.backend.mat_cols(&a_out.weights) == last_child_hidden
-            && parent_a.backend.mat_cols(&b_out.weights) == last_child_hidden
-        {
-            let b_out_permuted = if let Some(ref pp) = prev_perm {
-                permute_cols(&parent_a.backend, &b_out.weights, pp)
-            } else {
-                b_out.weights.clone()
-            };
-            let mut weights = parent_a.backend.zeros_mat(1, last_child_hidden);
-            let mut biases = parent_a.backend.zeros_vec(1);
-            for c in 0..last_child_hidden {
-                let va = parent_a.backend.mat_get(&a_out.weights, 0, c);
-                let vb = parent_a.backend.mat_get(&b_out_permuted, 0, c);
-                parent_a
-                    .backend
-                    .mat_set(&mut weights, 0, c, alpha * va + (1.0 - alpha) * vb);
-            }
-            let ba = parent_a.backend.vec_get(&a_out.bias, 0);
-            let bb = parent_a.backend.vec_get(&b_out.bias, 0);
-            parent_a
-                .backend
-                .vec_set(&mut biases, 0, alpha * ba + (1.0 - alpha) * bb);
-            layers.push(Layer {
-                weights,
-                bias: biases,
-                activation: child_config.output_activation,
-                backend: parent_a.backend.clone(),
-            });
-        } else {
-            layers.push(Layer::<L>::new(
-                last_child_hidden,
-                1,
-                child_config.output_activation,
-                &parent_a.backend,
-                rng,
-            ));
-        }
-
-        Ok(Self {
-            layers,
-            config: child_config,
-            backend: parent_a.backend.clone(),
         })
     }
 
@@ -740,210 +585,7 @@ mod tests {
 
     // ── Phase 6 Cycle 6.1: MlpCritic crossover same topology ───
 
-    fn make_critic_cache(critic_input_size: usize, batch_size: usize) -> crate::matrix::Matrix {
-        use crate::linalg::LinAlg;
-        // Dummy cache: just random-ish activations
-        let backend = CpuLinAlg::new();
-        let mut mat = backend.zeros_mat(batch_size, critic_input_size);
-        for r in 0..batch_size {
-            for c in 0..critic_input_size {
-                let val = ((r * critic_input_size + c) as f64 * 0.037).sin();
-                backend.mat_set(&mut mat, r, c, val);
-            }
-        }
-        mat
-    }
-
-    #[test]
-    fn test_critic_crossover_same_config_produces_valid() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config = default_config();
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(36, 50)];
-        let cache_b = vec![make_critic_cache(36, 50)];
-
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let child: MlpCritic = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            0.5,
-            config,
-            &mut rng_child,
-        )
-        .unwrap();
-
-        // Same layer count
-        assert_eq!(child.layers.len(), critic_a.layers.len());
-        // Forward produces finite output
-        let input = vec![0.3; 27];
-        let v = child.forward(&input);
-        assert!(v.is_finite(), "child forward not finite: {v}");
-    }
-
-    #[test]
-    fn test_critic_crossover_child_blended() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config = default_config();
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(36, 50)];
-        let cache_b = vec![make_critic_cache(36, 50)];
-
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let child: MlpCritic = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            0.5,
-            config,
-            &mut rng_child,
-        )
-        .unwrap();
-
-        // Weights differ from both parents
-        assert_ne!(
-            child.layers[0].weights.data,
-            critic_a.layers[0].weights.data
-        );
-        assert_ne!(
-            child.layers[0].weights.data,
-            critic_b.layers[0].weights.data
-        );
-    }
-
-    #[test]
-    fn test_critic_crossover_alpha_one_equals_parent_a() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config = default_config();
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(36, 50)];
-        let cache_b = vec![make_critic_cache(36, 50)];
-
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let child: MlpCritic = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            1.0, // alpha=1.0 → child ≈ parent A
-            config,
-            &mut rng_child,
-        )
-        .unwrap();
-
-        // Input layer (positional) should match parent A exactly
-        let max_diff: f64 = critic_a.layers[0]
-            .weights
-            .data
-            .iter()
-            .zip(child.layers[0].weights.data.iter())
-            .map(|(a, c)| (a - c).abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            max_diff < 1e-10,
-            "alpha=1.0: input layer max diff = {max_diff}"
-        );
-    }
-
     // ── Phase 6 Cycle 6.2: MlpCritic crossover dimension mismatch ──
-
-    #[test]
-    fn test_critic_crossover_child_larger() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config_36 = default_config(); // hidden [36]
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config_36.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_36, &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(36, 50)];
-        let cache_b = vec![make_critic_cache(36, 50)];
-
-        // Child has [48] hidden
-        let child_config = MlpCriticConfig {
-            input_size: 27,
-            hidden_layers: vec![LayerDef {
-                size: 48,
-                activation: Activation::Tanh,
-            }],
-            output_activation: Activation::Linear,
-            lr: 0.005,
-        };
-
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let child: MlpCritic = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            0.5,
-            child_config,
-            &mut rng_child,
-        )
-        .unwrap();
-
-        use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 48);
-        let v = child.forward(&vec![0.3; 27]);
-        assert!(v.is_finite());
-    }
-
-    #[test]
-    fn test_critic_crossover_child_smaller() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config_48 = MlpCriticConfig {
-            input_size: 27,
-            hidden_layers: vec![LayerDef {
-                size: 48,
-                activation: Activation::Tanh,
-            }],
-            output_activation: Activation::Linear,
-            lr: 0.005,
-        };
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config_48.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config_48, &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(48, 50)];
-        let cache_b = vec![make_critic_cache(48, 50)];
-
-        // Child has [36] hidden → truncation
-        let child_config = default_config();
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let child: MlpCritic = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            0.5,
-            child_config,
-            &mut rng_child,
-        )
-        .unwrap();
-
-        use crate::linalg::LinAlg;
-        assert_eq!(CpuLinAlg::new().mat_rows(&child.layers[0].weights), 36);
-        let v = child.forward(&vec![0.3; 27]);
-        assert!(v.is_finite());
-    }
 
     // ── Fix #5: Empty hidden_layers guard ────────────────────────
 
@@ -1008,41 +650,6 @@ mod tests {
     }
 
     // ── Fix #5: Empty hidden_layers guard ────────────────────────
-
-    #[test]
-    fn test_critic_crossover_empty_hidden_layers_returns_error() {
-        let mut rng_a = StdRng::seed_from_u64(42);
-        let mut rng_b = StdRng::seed_from_u64(123);
-        let config = default_config();
-        let critic_a: MlpCritic =
-            MlpCritic::new(CpuLinAlg::new(), config.clone(), &mut rng_a).unwrap();
-        let critic_b: MlpCritic = MlpCritic::new(CpuLinAlg::new(), config, &mut rng_b).unwrap();
-
-        let cache_a = vec![make_critic_cache(36, 50)];
-        let cache_b = vec![make_critic_cache(36, 50)];
-
-        let empty_config = MlpCriticConfig {
-            input_size: 27,
-            hidden_layers: vec![],
-            output_activation: Activation::Linear,
-            lr: 0.005,
-        };
-
-        let mut rng_child = StdRng::seed_from_u64(99);
-        let result = MlpCritic::crossover(
-            &critic_a,
-            &critic_b,
-            &cache_a,
-            &cache_b,
-            0.5,
-            empty_config,
-            &mut rng_child,
-        );
-        assert!(
-            result.is_err(),
-            "Crossover with empty hidden_layers should return error"
-        );
-    }
 
     // ── from_weights dimension validation tests ──────────────────────
 

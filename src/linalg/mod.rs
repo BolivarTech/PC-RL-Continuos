@@ -177,15 +177,6 @@ pub trait LinAlg: Clone + Send + Sync + 'static {
 
     // ── Softmax / sampling ───────────────────────────────────────
 
-    /// Numerically stable masked softmax.
-    fn softmax_masked(&self, logits: &Self::Vector, mask: &[usize]) -> Self::Vector;
-
-    /// Returns the index of the maximum value among masked indices.
-    fn argmax_masked(&self, values: &Self::Vector, mask: &[usize]) -> usize;
-
-    /// Samples an action index from a probability distribution over masked indices.
-    fn sample_from_probs(&self, probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize;
-
     /// Combined RMS error across multiple error vectors.
     fn rms_error(&self, error_vecs: &[&Self::Vector]) -> f64;
 }

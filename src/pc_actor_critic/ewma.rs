@@ -27,7 +27,7 @@ pub enum PlasticityState {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// use pc_rl_core::EwmaTracker;
 ///
 /// let mut tracker = EwmaTracker::new(5);

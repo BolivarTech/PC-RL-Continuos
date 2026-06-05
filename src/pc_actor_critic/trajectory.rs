@@ -107,39 +107,6 @@ impl<L: LinAlg> ActivationCache<L> {
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
-/// Converts an `ActivationCache` into a vector of matrices `[batch × neurons]`,
-/// one per hidden layer, suitable for CCA alignment.
-pub(crate) fn cache_to_matrices<L: LinAlg>(
-    backend: &L,
-    cache: &ActivationCache<L>,
-) -> Vec<L::Matrix> {
-    let num_layers = cache.num_layers();
-    let batch_size = cache.batch_size();
-    let mut matrices = Vec::with_capacity(num_layers);
-
-    for layer_idx in 0..num_layers {
-        let samples = cache.layer(layer_idx);
-        if samples.is_empty() {
-            matrices.push(backend.zeros_mat(0, 0));
-            continue;
-        }
-        let n_neurons = backend.vec_len(&samples[0]);
-        let mut mat = backend.zeros_mat(batch_size, n_neurons);
-        for (r, sample) in samples.iter().enumerate() {
-            for c in 0..n_neurons {
-                backend.mat_set(&mut mat, r, c, backend.vec_get(sample, c));
-            }
-        }
-        matrices.push(mat);
-    }
-
-    matrices
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

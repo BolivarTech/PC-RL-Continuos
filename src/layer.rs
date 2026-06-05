@@ -6,7 +6,8 @@
 //!
 //! Provides forward propagation, transpose forward (PC top-down pass),
 //! and backward propagation with gradient/weight clipping. Building
-//! block for both [`crate::PcActor`] and [`crate::MlpCritic`].
+//! block for the [`crate::PcActor`] policy network and the [`crate::QCritic`]
+//! action-value critics.
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -117,7 +118,7 @@ pub struct LayerDef {
 /// used to fill the field. However, direct serde deserialization of
 /// `Layer<GpuLinAlg>` is **not** the intended usage path. Use
 /// [`PcActor::from_weights`](crate::pc_actor::PcActor::from_weights) or
-/// [`MlpCritic::from_weights`](crate::mlp_critic::MlpCritic::from_weights)
+/// [`QCritic::from_weights`](crate::q_critic::QCritic::from_weights)
 /// instead, which inject the correct backend instance into every layer.
 ///
 /// # Examples

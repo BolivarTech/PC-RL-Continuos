@@ -165,18 +165,6 @@ impl LinAlg for CpuLinAlg {
         v.iter().map(|&fx| act.derivative(fx)).collect()
     }
 
-    fn softmax_masked(&self, logits: &Self::Vector, mask: &[usize]) -> Self::Vector {
-        crate::matrix::softmax_masked(logits, mask)
-    }
-
-    fn argmax_masked(&self, values: &Self::Vector, mask: &[usize]) -> usize {
-        crate::matrix::argmax_masked(values, mask)
-    }
-
-    fn sample_from_probs(&self, probs: &Self::Vector, mask: &[usize], rng: &mut impl Rng) -> usize {
-        crate::matrix::sample_from_probs(probs, mask, rng)
-    }
-
     fn rms_error(&self, error_vecs: &[&Self::Vector]) -> f64 {
         let slices: Vec<&[f64]> = error_vecs.iter().map(|v| v.as_slice()).collect();
         crate::matrix::rms_error(&slices)
@@ -484,48 +472,6 @@ mod tests {
         let r = backend.apply_derivative(&v, Activation::Tanh);
         // derivative(0.5) = 1 - 0.25 = 0.75
         assert!((backend.vec_get(&r, 0) - 0.75).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_softmax_masked_sums_to_one() {
-        let backend = CpuLinAlg::new();
-        let logits = backend.vec_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-        let mask = vec![0, 1, 2, 3];
-        let probs = backend.softmax_masked(&logits, &mask);
-        let sum: f64 = backend.vec_to_vec(&probs).iter().sum();
-        assert!((sum - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_softmax_masked_unmasked_are_zero() {
-        let backend = CpuLinAlg::new();
-        let logits = backend.vec_from_slice(&[1.0, 2.0, 3.0, 4.0]);
-        let mask = vec![1, 3];
-        let probs = backend.softmax_masked(&logits, &mask);
-        assert_eq!(backend.vec_get(&probs, 0), 0.0);
-        assert_eq!(backend.vec_get(&probs, 2), 0.0);
-        assert!(backend.vec_get(&probs, 1) > 0.0);
-        assert!(backend.vec_get(&probs, 3) > 0.0);
-    }
-
-    #[test]
-    fn test_argmax_masked_returns_highest() {
-        let backend = CpuLinAlg::new();
-        let values = backend.vec_from_slice(&[1.0, 5.0, 3.0, 4.0]);
-        let mask = vec![0, 2, 3];
-        assert_eq!(backend.argmax_masked(&values, &mask), 3);
-    }
-
-    #[test]
-    fn test_sample_from_probs_in_mask() {
-        let backend = CpuLinAlg::new();
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let probs = backend.vec_from_slice(&[0.1, 0.2, 0.3, 0.4]);
-        let mask = vec![1, 3];
-        for _ in 0..20 {
-            let idx = backend.sample_from_probs(&probs, &mask, &mut rng);
-            assert!(mask.contains(&idx));
-        }
     }
 
     #[test]
