@@ -138,6 +138,24 @@ items. All were resolved:
   rewrite had also corrupted the closing fence (`` ```ignore `` as the
   terminator) were repaired.
 
+### Correction: SAC directional guards restored (CI gate)
+
+The first cleanup deleted the entire `mod tests` block in `mod.rs`, which
+also removed the five `#[ignore]` SAC directional learning guards
+(B2/B4/B5/B7/B8) that the `sac-learning-guards` CI job runs via
+`--run-ignored all`. With zero ignored tests, that job failed with
+`error: no tests to run` (nextest exit 4). These guards are mandated by the
+spec (the `--ignored` learning-test sweep is a merge-checklist step), so they
+were restored verbatim from `536bad1` into a dedicated
+`#[cfg(test)] mod sac_learning_guards` block, together with the four
+`#[cfg(test)]` shims they actually use — `q1_for_test`,
+`actor_mu_raw_for_test`, `actor_log_sigma_for_test` (`mod.rs`) and
+`alpha_for_test` (`sac.rs`) — and the `default_config` / `continuous_sac_config`
+builders. The other dead shims (`effective_actor_scale`, `train_q1_for_test`,
+`q1_target_probe`, `sac_bellman_target_for_test`) stay removed (no surviving
+caller). All five guards pass under `--run-ignored all`; the fast suite is
+unchanged (they remain `#[ignore]`).
+
 ## What stayed
 
 ### Crate public API (re-exported from `lib.rs`)
