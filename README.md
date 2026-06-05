@@ -129,7 +129,23 @@ let (action, _infer) = agent.act_continuous(&state, SelectionMode::Play)?;
 
 ### Predictive-coding inference
 
-Instead of a single feedforward pass, the actor runs an iterative loop where higher layers generate top-down predictions of lower-layer states. The inter-layer prediction error (*surprise*) drives hidden-state updates until convergence (`alpha`, `tol`, `max_steps`). The converged output is the policy's `(μ_raw, log_σ_raw)`. The PC actor is **never** replaced by a feedforward MLP — SAC adapts to it.
+Instead of a single feedforward pass, the actor runs an iterative loop where higher layers generate top-down predictions of lower-layer states. Each cycle updates the hidden state toward the top-down prediction (`h += alpha · error`) and measures the inter-layer prediction error (*surprise*, the free-energy proxy); the loop stops when `surprise < tol` or after `max_steps`. The converged output is the policy's `(μ_raw, log_σ_raw)`. The PC actor is **never** replaced by a feedforward MLP — SAC adapts to it.
+
+#### Free-energy reduction cycle parameters (`PcActorConfig`)
+
+These five fields control the inference loop (`PcActor::infer`). They are **distinct from** the SAC entropy temperature `alpha` (`log_alpha` / `sac_alpha()`) — same word, unrelated knob.
+
+| Field | Role | Default |
+|---|---|---|
+| `alpha` | Free-energy **descent rate** per cycle (`h += alpha · error`). Also gates convergence: `alpha == 0` disables the convergence check, so the loop always runs `max_steps` (feedforward-like, no PC refinement). | `0.1` |
+| `tol` | Convergence **target**: stop when `surprise < tol`. Lower ⇒ more cycles (or never converges). | `0.01` |
+| `min_steps` | **Floor** on cycles before the convergence check is allowed. | `1` |
+| `max_steps` | **Ceiling** on cycles. If `tol` is unreached, the loop ends here. | `20` |
+| `synchronous` | Update scheme: `true` = snapshot (all layers update from the frozen previous state); `false` = in-place (later layers see same-cycle updates). | `true` |
+
+> The defaults above are the per-field `#[serde(default)]` values (applied when a save file omits the field). `PcActorConfig` has **no** `Default` impl — build it field-by-field.
+>
+> **Note on the canonical defaults:** with `tol = 0.01` / `max_steps = 20` / `alpha = 0.1` the loop typically runs to the `max_steps` ceiling without reaching `tol`. To make the free-energy minimisation actually converge (and exhibit the "fewer cycles as training proceeds" amortisation property), raise `max_steps` and/or loosen `tol`, and keep `local_lambda = 1.0`. See [docs/pc_inference_amortization.md](docs/pc_inference_amortization.md) for the empirical study. (`local_lambda` is a weight-update blend, not an inference-loop knob, but it shapes convergence speed indirectly through learning.)
 
 ### Key SAC config surface
 
