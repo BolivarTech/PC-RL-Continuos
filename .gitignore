@@ -29,7 +29,7 @@ plans/
 Makefile
 run-tests.py
 prd.json
-scripts/ralph/runs/
+scripts/
 
 # MAGI review reports
 .magi-reports/
