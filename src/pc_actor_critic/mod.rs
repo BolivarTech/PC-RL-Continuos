@@ -3561,4 +3561,121 @@ mod sac_learning_guards {
              α_initial={alpha_initial2:.6}, α_after_rise={alpha_after_rise:.6}"
         );
     }
+
+    /// Diagnostic (not a Bx convergence guard): measures how many PC inference
+    /// cycles the actor needs to minimise free energy (surprise) **before vs
+    /// after** RL training, across several `(max_steps, tol, local_lambda)`
+    /// regimes, and prints a table.
+    ///
+    /// Verifies the predictive-coding "amortised inference" property: a more
+    /// trained actor whose feed-forward pass lands closer to the inference
+    /// fixed point should need fewer refinement cycles — but only when the loop
+    /// can actually converge (`tol`/`max_steps` headroom) and the weights are
+    /// trained by pure backprop (`local_lambda = 1.0`). Full analysis and the
+    /// reference table live in `docs/pc_inference_amortization.md`.
+    ///
+    /// Hard assertions cover only structural invariants (so this doubles as a
+    /// smoke test of the inference + SAC training pipeline); the magnitude of
+    /// the amortisation effect is seed/scale dependent and is NOT asserted.
+    #[test]
+    #[ignore = "slow PC-inference amortisation diagnostic (~200s); see docs/pc_inference_amortization.md"]
+    fn probe_pc_inference_steps_vs_training() {
+        use crate::pc_actor::SelectionMode;
+
+        // (avg_steps, avg_surprise, conv_rate) over the probe set.
+        fn measure(
+            agent: &mut PcActorCritic,
+            probes: &[Vec<f64>],
+            max_steps: usize,
+        ) -> (f64, f64, f64) {
+            let (mut steps, mut surp, mut conv) = (0.0, 0.0, 0.0);
+            for s in probes {
+                let (_a, ir) = agent.act_continuous(s, SelectionMode::Play).unwrap();
+                assert!(
+                    ir.steps_used >= 1 && ir.steps_used <= max_steps,
+                    "steps_used {} out of [1, {max_steps}]",
+                    ir.steps_used
+                );
+                assert!(ir.surprise_score.is_finite(), "surprise must be finite");
+                steps += ir.steps_used as f64;
+                surp += ir.surprise_score;
+                conv += if ir.converged { 1.0 } else { 0.0 };
+            }
+            let n = probes.len() as f64;
+            (steps / n, surp / n, conv / n)
+        }
+
+        // Build an agent for one regime, probe at init, train 20k online RL
+        // steps, re-probe. Returns (before, after) measurement triples.
+        fn run_regime(
+            max_steps: usize,
+            tol: f64,
+            local_lambda: f64,
+        ) -> ((f64, f64, f64), (f64, f64, f64)) {
+            let mut cfg = continuous_sac_config();
+            cfg.actor.max_steps = max_steps;
+            cfg.actor.tol = tol;
+            cfg.actor.local_lambda = local_lambda;
+            let input_size = cfg.actor.input_size;
+            let mut agent: PcActorCritic = PcActorCritic::new(CpuLinAlg::new(), cfg, 7).unwrap();
+
+            let probes: Vec<Vec<f64>> = (0..25)
+                .map(|i| {
+                    let p = i as f64 * 0.13 - 1.5;
+                    (0..input_size)
+                        .map(|k| ((p + k as f64 * 0.37).sin()) * 0.8)
+                        .collect()
+                })
+                .collect();
+
+            let before = measure(&mut agent, &probes, max_steps);
+
+            // Online RL training with a coherent reward (penalise |a0|).
+            let mut prev_reward = 0.0_f64;
+            let mut done = false;
+            for t in 0..20_000usize {
+                let s = &probes[t % probes.len()];
+                let action = agent.step_continuous(s, prev_reward, done).unwrap();
+                prev_reward = -(action[0] * action[0]);
+                done = t % 40 == 39;
+            }
+
+            let after = measure(&mut agent, &probes, max_steps);
+
+            println!(
+                "REGIME max_steps={max_steps:>3} tol={tol:<5} lambda={local_lambda:<5} | \
+                 before: steps={:.2} surp={:.5} conv={:.2} | \
+                 after: steps={:.2} surp={:.5} conv={:.2} | Dsteps={:+.2} Dsurp={:+.5}",
+                before.0,
+                before.1,
+                before.2,
+                after.0,
+                after.1,
+                after.2,
+                after.0 - before.0,
+                after.1 - before.1
+            );
+            (before, after)
+        }
+
+        let r1 = run_regime(20, 0.01, 1.0); // canonical helper config (never converges)
+        let r2 = run_regime(80, 0.01, 1.0); // more headroom, tol still tight
+        let r3 = run_regime(80, 0.05, 1.0); // convergent + pure backprop -> claim holds
+        let r4 = run_regime(80, 0.05, 0.9); // PC error in weights -> destabilises
+        let r5 = run_regime(200, 0.02, 0.9); // PC error + headroom -> destabilises
+
+        // Regression guard on the convergent regime: with tol=0.05 / max_steps=80
+        // / pure backprop the inference converges on every probe both before and
+        // after training. A change that breaks convergence here trips this.
+        assert!(
+            r3.0 .2 > 0.9 && r3.1 .2 > 0.9,
+            "R3 (convergent regime) must converge >90% before and after; got {} / {}",
+            r3.0 .2,
+            r3.1 .2
+        );
+        // conv_rate in [0, 1] for every measurement (sanity).
+        for (b, a) in [r1, r2, r3, r4, r5] {
+            assert!((0.0..=1.0).contains(&b.2) && (0.0..=1.0).contains(&a.2));
+        }
+    }
 }
